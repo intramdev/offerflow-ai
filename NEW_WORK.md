@@ -8,16 +8,17 @@ This file records work and provenance; it is not proof of competition eligibilit
 
 ## Pre-existing context
 
-- IN.TRA.M's commercial CatalogOps AI product existed before this hackathon.
+- IN.TRA.M had a separate commercial product before this hackathon. Its implementation is not part of this repository.
 - Prior business experience and problem discovery informed OfferFlow AI.
 - The initial project concept was discussed before these files were created.
-- No CatalogOps source code or historical commits are copied into this package.
+- No pre-existing proprietary source code or historical commits are copied into this package.
 
 ## Newly prepared here
 
 - Initial README.
 - This contribution record.
 - A draft ignore file.
+- The unmodified GNU AGPL version 3 license text, with the AGPL-3.0-only choice stated in the README.
 - A separate private product specification, outside the prospective repository.
 
 ## Contribution log
@@ -25,6 +26,7 @@ This file records work and provenance; it is not proof of competition eligibilit
 | Date | Contribution | Status | Tool/provenance |
 |---|---|---|---|
 | 2026-10-27 | Bootstrap documentation and internal specification | Draft | Prepared in Codex; no Muse implementation claimed |
+| 2026-10-27 | AGPL-3.0-only selection and README licensing notice | Prepared | License chosen by the project owner; official GNU license text downloaded unchanged |
 
 ## Future record
 

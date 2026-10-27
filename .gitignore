@@ -1,0 +1,29 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local data and generated outputs
+private/
+data/private/
+data/uploads/
+data/real/
+exports/
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Runtime caches
+.venv/
+__pycache__/
+.pytest_cache/
+node_modules/
+.DS_Store
+
+# Keep synthetic fixtures deliberately versioned in an explicit fixtures directory.
+# This ignore file is not a substitute for reviewing staged files before publishing.
+

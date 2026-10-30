@@ -1,0 +1,18 @@
+# OfferFlow AI — integration-mode overlay (NOT the default).
+#
+# Grants the worker external egress for explicitly authorized real-model
+# calls. (Backend already joins the public network in the base file, because
+# internal-only services lose their published ports.) Requires, in addition
+# to this file: OFFERFLOW_ALLOW_PAID, a Meta API key, a model id, and a token
+# budget (see backend/README.md).
+# Usage: docker compose -f compose.yaml -f compose.integration.yaml up
+# Returning to plain `docker compose up` removes worker egress again.
+services:
+  backend:
+    networks:
+      - internal
+      - public
+  worker:
+    networks:
+      - internal
+      - public

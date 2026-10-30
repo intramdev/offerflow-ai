@@ -1,0 +1,160 @@
+# OfferFlow AI — local development environment.
+#
+# Local-only. Loopback publishes, scoped volumes, bounded resources. Worker,
+# database, and broker live on an INTERNAL network with no route outside.
+# Backend and frontend join the public network too: an internal-only service
+# gets its published ports silently dropped, and direct host access is
+# required. Simulated-run isolation therefore rests on the application
+# controls (fixture default, fail-closed provider selection,
+# ALLOW_PAID=false, zero budgets). The frontend keeps external access
+# (package installs) plus internal access to proxy API calls. No credentials
+# are committed: copy
+# .env.example to .env (gitignored) and fill in secrets before the first
+# start. Real-model calls additionally need compose.integration.yaml (never
+# the default), an explicit switch, a key, a model id, and a token budget.
+name: offerflow
+
+services:
+  db:
+    image: postgres:17.11
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${OFFERFLOW_DB_NAME:-offerflow}
+      POSTGRES_USER: ${OFFERFLOW_DB_USER:-offerflow}
+      POSTGRES_PASSWORD: ${OFFERFLOW_DB_PASSWORD:?Create .env from .env.example and set OFFERFLOW_DB_PASSWORD}
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+    # No published ports: reachable only on the internal container network.
+
+  broker:
+    image: rabbitmq:4.4.0
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${OFFERFLOW_RABBITMQ_USER:-offerflow}
+      RABBITMQ_DEFAULT_PASS: ${OFFERFLOW_RABBITMQ_PASSWORD:?Create .env from .env.example and set OFFERFLOW_RABBITMQ_PASSWORD}
+    volumes:
+      - brokerdata:/var/lib/rabbitmq
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+        reservations:
+          memory: 128M
+    # No published ports: reachable only on the internal container network.
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    # Dev server only. Staging uses a production server (Package F).
+    # 0.0.0.0 binds inside the container; host exposure is loopback-only
+    # via the ports mapping below.
+    # Backend joins public as well as internal: an internal-only service
+    # gets its published ports silently dropped (observed: 8384 missing on
+    # the container while the file declares it). Simulated-run isolation
+    # therefore rests on the application controls (fixture default,
+    # fail-closed provider selection, ALLOW_PAID=false, zero budgets),
+    # not on backend egress blocking. Worker, database, and broker stay
+    # internal-only.
+    command: python manage.py runserver 0.0.0.0:8000
+    env_file:
+      - .env
+    environment:
+      OFFERFLOW_DB_HOST: db
+      OFFERFLOW_BROKER_URL: amqp://${OFFERFLOW_RABBITMQ_USER:-offerflow}:${OFFERFLOW_RABBITMQ_PASSWORD:?Create .env first}@broker:5672//
+    ports:
+      - "127.0.0.1:8384:8000"
+    volumes:
+      - ./backend:/app
+      - filestore:/var/offerflow/files
+    networks:
+      - internal
+      - public
+    depends_on:
+      - db
+      - broker
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    # No mingle/gossip: single worker, and RabbitMQ >= 4.3 rejects the
+    # transient non-exclusive pidbox/event queues those boot steps declare.
+    command: celery -A config worker --loglevel=info --concurrency=2 --without-mingle --without-gossip
+    env_file:
+      - .env
+    environment:
+      OFFERFLOW_DB_HOST: db
+      OFFERFLOW_BROKER_URL: amqp://${OFFERFLOW_RABBITMQ_USER:-offerflow}:${OFFERFLOW_RABBITMQ_PASSWORD:?Create .env first}@broker:5672//
+    volumes:
+      - ./backend:/app
+      - filestore:/var/offerflow/files
+    networks:
+      - internal
+    depends_on:
+      - db
+      - broker
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+    # No published ports: background execution only.
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    # Install on start so the named node_modules volume stays in sync with
+    # the bind-mounted sources; fast once satisfied.
+    command: sh -c "npm install --no-audit --no-fund && npm run dev -- --hostname 0.0.0.0 --port 3000"
+    environment:
+      OFFERFLOW_BACKEND_URL: http://backend:8000
+    ports:
+      - "127.0.0.1:4344:3000"
+    volumes:
+      - ./frontend:/srv/app
+      - frontend_modules:/srv/app/node_modules
+      - frontend_next:/srv/app/.next
+    networks:
+      - public
+      - internal
+    depends_on:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+        reservations:
+          memory: 512M
+
+networks:
+  public:
+  internal:
+    internal: true
+
+volumes:
+  dbdata:
+  brokerdata:
+  filestore:
+  frontend_modules:
+  frontend_next:

@@ -54,6 +54,22 @@ class ParserTests(SimpleTestCase):
         self.assertIsNone(parse_capacity(-5))
         self.assertIsNone(parse_capacity(99999))
 
+    def test_capacity_units(self):
+        self.assertEqual(parse_capacity("1TB"), 1024)
+        self.assertEqual(parse_capacity("1 TB"), 1024)
+        self.assertEqual(parse_capacity("2tb"), 2048)
+        self.assertEqual(parse_capacity("0.5TB"), 512)
+        self.assertEqual(parse_capacity("1T"), 1024)
+        self.assertEqual(parse_capacity("1024MB"), 1)
+        self.assertEqual(parse_capacity("2048 MB"), 2)
+        self.assertEqual(parse_capacity("128G"), 128)
+        self.assertEqual(parse_capacity("500G"), 500)
+        # Fractional gigabytes and sub-gigabyte values refuse, never round.
+        self.assertIsNone(parse_capacity("1.5GB"))
+        self.assertIsNone(parse_capacity("512MB"))
+        self.assertIsNone(parse_capacity("16TB"))
+        self.assertIsNone(parse_capacity("1PB"))
+
     def test_quantity(self):
         self.assertEqual(parse_quantity(5), 5)
         self.assertEqual(parse_quantity("5"), 5)
@@ -158,7 +174,17 @@ class StatusTests(SimpleTestCase):
         self.assertEqual(status, "ok")
 
     def test_unknown_lock_raises_choice(self):
-        status, gaps, _ = compute_offer_status(full_fields(lock_state="unknown"))
+        status, gaps, _ = compute_offer_status(
+            full_fields(lock_state="unknown", lock_raw="maybe")
+        )
         self.assertEqual(status, "needs_input")
         lock_gaps = [gap for gap in gaps if gap["field"] == "lock_state"]
         self.assertEqual(lock_gaps[0]["choices"], ["locked", "unlocked"])
+
+    def test_absent_lock_raises_no_gap(self):
+        for raw in (None, "", "  "):
+            status, gaps, _ = compute_offer_status(
+                full_fields(lock_state="unknown", lock_raw=raw)
+            )
+            self.assertEqual(status, "ok", f"lock_raw={raw!r}")
+            self.assertEqual(gaps, [], f"lock_raw={raw!r}")

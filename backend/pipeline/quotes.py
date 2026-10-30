@@ -15,6 +15,7 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError
 
 from pipeline.export import sanitize_cell
+from pipeline.fx import FxRateMissing
 from pipeline.models import OfferStatus, PricingRule, SupplierStrategy
 
 MATCHER_KEYS = ("brand", "model", "grade")
@@ -55,6 +56,8 @@ def _clean_op(op, index: int) -> dict:
         if len(currency) != 3 or not currency.isalpha():
             raise ValidationError(f"{label}: convert needs a 3-letter currency.")
         return {"op": "convert", "rate": str(rate), "to": currency}
+    if kind == "convert_to_destination":
+        return {"op": "convert_to_destination"}
     if kind == "percent":
         value = _decimal(op.get("value"), f"{label}: percent must be a number.")
         return {"op": "percent", "value": str(value)}
@@ -209,11 +212,31 @@ def _pick(candidates: list, strategy: str, preferred: str):
     return min(candidates, key=lambda offer: offer.unit_price)
 
 
-def _apply_ops(price: Decimal, currency: str, ops: list) -> tuple:
+def _apply_ops(price: Decimal, currency: str, ops: list, fx: dict) -> tuple:
+    rates = fx.get("rates") or {}
+    destination = (fx.get("destination") or "").strip().upper()
     for op in ops or []:
         if op["op"] == "convert":
             price = price * Decimal(op["rate"])
             currency = op["to"]
+        elif op["op"] == "convert_to_destination":
+            if not destination:
+                raise FxRateMissing(
+                    "no destination currency in Settings",
+                    detail="no destination currency in Settings",
+                )
+            if currency != destination:
+                rate = rates.get(currency)
+                if rate is None:
+                    raise FxRateMissing(
+                        f"no recorded {currency}->{destination} rate",
+                        detail=(
+                            f"no recorded {currency}->{destination} rate "
+                            "for this file (set the file's currency date)"
+                        ),
+                    )
+                price = price * Decimal(rate)
+                currency = destination
         elif op["op"] == "percent":
             price = price * (1 + Decimal(op["value"]) / 100)
         elif op["op"] == "round":
@@ -222,10 +245,27 @@ def _apply_ops(price: Decimal, currency: str, ops: list) -> tuple:
     return price, currency
 
 
+def _file_fx(run) -> dict:
+    """The file's recorded rate table plus display provenance."""
+    source = run.source_file
+    day = source.currency_date or source.created_at.date()
+    return {
+        "currency_date": day.isoformat(),
+        "destination": source.fx_destination or None,
+        "rates": dict(source.fx_rates or {}),
+        "source": source.fx_source or None,
+        "simulated": bool(source.fx_simulated),
+        "fetched_at": (
+            source.fx_fetched_at.isoformat() if source.fx_fetched_at else None
+        ),
+    }
+
+
 def build_quote(run) -> dict:
     """Group ok offers, pick one supplier per group, apply the winning rule."""
     offers = list(run.offers.filter(status=OfferStatus.OK).order_by("id"))
     rules = list(run.organization.pricing_rules.filter(active=True))
+    fx = _file_fx(run)
     groups: dict = {}
     for offer in offers:
         groups.setdefault(_group_key(offer), []).append(offer)
@@ -253,9 +293,13 @@ def build_quote(run) -> dict:
         if picked is None:
             notes.append(f"Skipped {label}: preferred supplier {preferred!r} not found.")
             continue
-        price, currency = _apply_ops(
-            picked.unit_price, first.currency, rule.ops if rule else []
-        )
+        try:
+            price, currency = _apply_ops(
+                picked.unit_price, first.currency, rule.ops if rule else [], fx
+            )
+        except FxRateMissing as exc:
+            notes.append(f"Skipped {label}: {exc.detail}.")
+            continue
         lines.append(
             {
                 "brand": attrs["brand"],
@@ -274,6 +318,7 @@ def build_quote(run) -> dict:
         "run_status": run.status,
         "lines": lines,
         "notes": notes,
+        "fx": fx,
     }
 
 

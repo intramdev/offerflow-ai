@@ -153,6 +153,7 @@ class SourceFileSerializer(serializers.ModelSerializer):
     run_id = serializers.SerializerMethodField()
     run_status = serializers.SerializerMethodField()
     uploaded_by_name = serializers.SerializerMethodField()
+    currency_date = serializers.SerializerMethodField()
 
     class Meta:
         model = SourceFile
@@ -166,9 +167,20 @@ class SourceFileSerializer(serializers.ModelSerializer):
             "run_id",
             "run_status",
             "uploaded_by_name",
+            "currency_date",
+            "fx_destination",
+            "fx_rates",
+            "fx_source",
+            "fx_simulated",
+            "fx_fetched_at",
             "created_at",
         ]
         read_only_fields = fields
+
+    def get_currency_date(self, obj):
+        if obj.currency_date is not None:
+            return obj.currency_date.isoformat()
+        return obj.created_at.date().isoformat()
 
     def get_run_id(self, obj):
         try:
@@ -188,8 +200,26 @@ class SourceFileSerializer(serializers.ModelSerializer):
         return None
 
 
+class FxDateSerializer(serializers.Serializer):
+    currency_date = serializers.DateField()
+
+
+class FileRenameSerializer(serializers.Serializer):
+    original_name = serializers.CharField(max_length=255)
+
+    def validate_original_name(self, value):
+        text = (value or "").strip()
+        if not text:
+            raise serializers.ValidationError("Name must not be blank.")
+        return text
+
+
 class MappingSerializer(serializers.Serializer):
     mapping = serializers.DictField(child=serializers.IntegerField(min_value=0))
+    constants = serializers.DictField(required=False, default=dict)
+    ignored = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list
+    )
 
 
 class PricingRuleSerializer(serializers.ModelSerializer):

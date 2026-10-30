@@ -182,3 +182,67 @@ class PipelineApiTests(TestCase):
         self.assertEqual(cancel.data["status"], RunStatus.CANCELLED)
         again = self.client.post(f"/api/pipeline/runs/{run_id}/cancel/")
         self.assertEqual(again.status_code, 400)
+
+    def _file_id(self, user, org):
+        self.client.force_authenticate(user)
+        files = self.client.get(f"/api/pipeline/files/?organization_id={org.id}")
+        self.assertEqual(files.status_code, 200)
+        return files.data[0]["id"]
+
+    def test_rename_file(self):
+        self.upload(self.alice, self.org_a, [HEADERS, complete_row()])
+        file_id = self._file_id(self.alice, self.org_a)
+        response = self.client.put(
+            f"/api/pipeline/files/{file_id}/",
+            {"original_name": "  March price list.xlsx "},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.data["original_name"], "March price list.xlsx")
+        from pipeline.models import AuditEvent
+
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                organization=self.org_a, action="file_renamed"
+            ).exists()
+        )
+
+    def test_rename_rejects_blank_and_long_names(self):
+        self.upload(self.alice, self.org_a, [HEADERS, complete_row()])
+        file_id = self._file_id(self.alice, self.org_a)
+        blank = self.client.put(
+            f"/api/pipeline/files/{file_id}/", {"original_name": "   "}, format="json"
+        )
+        self.assertEqual(blank.status_code, 400)
+        long = self.client.put(
+            f"/api/pipeline/files/{file_id}/",
+            {"original_name": "x" * 256},
+            format="json",
+        )
+        self.assertEqual(long.status_code, 400)
+
+    def test_rename_viewer_forbidden_and_other_org_hidden(self):
+        self.upload(self.alice, self.org_a, [HEADERS, complete_row()])
+        file_id = self._file_id(self.alice, self.org_a)
+        self.client.force_authenticate(self.bob)
+        self.assertEqual(
+            self.client.put(
+                f"/api/pipeline/files/{file_id}/",
+                {"original_name": "Bob.xlsx"},
+                format="json",
+            ).status_code,
+            404,
+        )
+        from organizations.models import Membership
+
+        Membership.objects.create(
+            user=self.bob, organization=self.org_a, role="viewer"
+        )
+        self.assertEqual(
+            self.client.put(
+                f"/api/pipeline/files/{file_id}/",
+                {"original_name": "Bob.xlsx"},
+                format="json",
+            ).status_code,
+            403,
+        )

@@ -52,14 +52,26 @@ def enqueue_run(run_id: int) -> None:
     transaction.on_commit(lambda: process_import_run.delay(run_id))
 
 
+class RunCancelled(Exception):
+    """Raised inside the worker when the run was cancelled mid-flight."""
+
+
 def cancel_run(*, run: ImportRun, user) -> ImportRun:
-    """Cancel a non-terminal run. A task already in flight may finish its
-    current step afterwards, but terminal status wins and the run stays
-    cancelled and unreleasable."""
+    """Stop an import that has not been approved yet.
+
+    Cancelling halts a running worker at the next chunk boundary (no
+    further paid calls) and shelves runs awaiting input or review.
+    Approved runs move forward to export instead; remap one to start
+    over with a different mapping.
+    """
     from django.core.exceptions import ValidationError
 
     if run.status in TERMINAL_STATUSES:
         raise ValidationError("That run is already finished.")
+    if run.status == RunStatus.APPROVED:
+        raise ValidationError(
+            "That run is already approved; remap it to start over."
+        )
     transition_run(run, RunStatus.CANCELLED)
     record_audit(run.organization_id, user, "run_cancelled", "run", run.id)
     return run
@@ -69,10 +81,13 @@ def _ask_mapping(run: ImportRun, exc) -> None:
     """Store the mapping report and ask one choice question per missing column."""
     from pipeline.review import mapping_choice_label
 
+    stored = run.mapping or {}
     run.mapping = {
         "headers": exc.headers,
         "detected": exc.column_map,
         "confirmed": {},
+        "constants": stored.get("constants") or {},
+        "ignored": stored.get("ignored") or [],
     }
     run.save(update_fields=["mapping", "updated_at"])
     ReviewRequest.objects.filter(run=run, offer__isnull=True).delete()
@@ -103,32 +118,20 @@ def _ask_mapping(run: ImportRun, exc) -> None:
     record_audit(run.organization_id, None, "run_needs_input", "run", run.id)
 
 
-def reprocess_run(run: ImportRun) -> str:
-    """Restart a waiting run after its mapping changed. Returns the new status."""
-    run.error = ""
-    run.save(update_fields=["error", "updated_at"])
-    transition_run(run, RunStatus.PARSING)
-    try:
-        if _parse_step(run):
-            return RunStatus.NEEDS_INPUT
-        _interpret_step(run)
-        _validate_step(run)
-    except Exception as exc:
-        run.refresh_from_db()
-        if run.status not in TERMINAL_STATUSES:
-            transition_run(run, RunStatus.FAILED)
-            run.error = str(exc)[:2000]
-            run.save(update_fields=["error", "updated_at"])
-        record_audit(run.organization_id, None, "run_failed", "run", run.id)
-        return RunStatus.FAILED
-    run.refresh_from_db()
-    return run.status
+def remap_run(*, run: ImportRun, user, mapping: dict,
+              constants=None, ignored=None) -> ImportRun:
+    """Replace a run's column mapping and reprocess the same file.
 
+    Approved and completed runs can be remapped too: their approval and
+    export artifacts are discarded so nothing stale survives, and the
+    audit trail records where the run came from.
+    """
+    import contextlib
 
-def remap_run(*, run: ImportRun, user, mapping: dict) -> ImportRun:
-    """Replace a run's column mapping and reprocess the same file."""
+    from django.conf import settings
     from django.core.exceptions import ValidationError
 
+    from common.storage import LocalFileAdapter
     from organizations.context import set_tenant_context
     from organizations.services import require_organization_role
     from pipeline.previews import _clean_positions, remember_mapping
@@ -136,10 +139,12 @@ def remap_run(*, run: ImportRun, user, mapping: dict) -> ImportRun:
     if run.status not in (
         RunStatus.NEEDS_INPUT,
         RunStatus.READY_FOR_REVIEW,
+        RunStatus.APPROVED,
+        RunStatus.COMPLETED,
         RunStatus.FAILED,
     ):
         raise ValidationError(
-            "Only waiting, reviewable, or failed runs can be remapped."
+            "Runs that are still processing or cancelled cannot be remapped."
         )
     require_organization_role(user, run.organization_id)
     set_tenant_context(run.organization_id, user.id)
@@ -147,23 +152,51 @@ def remap_run(*, run: ImportRun, user, mapping: dict) -> ImportRun:
     headers = stored.get("headers") or []
     if not headers:
         raise ValidationError("That run has no detected headers to remap.")
-    submitted, effective = _clean_positions(
-        mapping, headers, stored.get("detected") or {}, require_complete=True
+    submitted, effective, clean_constants, clean_ignored = _clean_positions(
+        mapping,
+        headers,
+        stored.get("detected") or {},
+        require_complete=True,
+        constants=constants,
+        ignored=ignored,
     )
     stored["confirmed"] = submitted
+    stored["constants"] = clean_constants
+    stored["ignored"] = clean_ignored
     run.mapping = stored
     run.save(update_fields=["mapping", "updated_at"])
     ReviewRequest.objects.filter(
         run=run, offer__isnull=True, status=ReviewStatus.OPEN
     ).delete()
+    from_status = run.status
+    if from_status in (RunStatus.APPROVED, RunStatus.COMPLETED):
+        artifact_keys = list(run.artifacts.values_list("storage_key", flat=True))
+        run.artifacts.all().delete()
+        adapter = LocalFileAdapter(settings.OFFERFLOW_FILE_ROOT)
+        for key in artifact_keys:
+            with contextlib.suppress(OSError):
+                adapter.delete(key)
     transition_run(run, RunStatus.UPLOADED)
-    reprocess_run(run)
+    run.error = ""
+    run.save(update_fields=["error", "updated_at"])
     remember_mapping(
-        organization=run.organization, headers=headers, mapping=effective
+        organization=run.organization,
+        headers=headers,
+        mapping=effective,
+        constants=clean_constants,
+        ignored=clean_ignored,
     )
     record_audit(
-        run.organization_id, user, "run_remapped", "run", run.id, {"mapping": submitted}
+        run.organization_id,
+        user,
+        "run_remapped",
+        "run",
+        run.id,
+        {"mapping": submitted, "from_status": from_status},
     )
+    # The worker reprocesses; the request returns at once so paid
+    # interpretation (minutes on large files) never blocks the browser.
+    enqueue_run(run.id)
     run.refresh_from_db()
     return run
 
@@ -192,6 +225,10 @@ def process_import_run(self, run_id: int):
             return "needs_input"
         _interpret_step(run)
         _validate_step(run)
+    except RunCancelled:
+        # The cancel action already audited; completed chunks keep their
+        # honest spend, and no further calls are made.
+        return "cancelled"
     except Exception as exc:
         run.refresh_from_db()
         if run.status not in TERMINAL_STATUSES:
@@ -229,7 +266,17 @@ def _parse_step(run: ImportRun) -> bool:
         max_bytes=settings.OFFERFLOW_UPLOAD_MAX_BYTES,
         max_uncompressed_bytes=settings.OFFERFLOW_MAX_UNCOMPRESSED_BYTES,
     )
-    confirmed = (run.mapping or {}).get("confirmed") or {}
+    from pipeline.previews import _with_currency_default
+
+    stored = run.mapping or {}
+    confirmed = stored.get("confirmed") or {}
+    constants = stored.get("constants") or {}
+    ignored = stored.get("ignored") or []
+    effective = dict(stored.get("detected") or {})
+    effective.update(confirmed)
+    merged, labels, applied = _with_currency_default(
+        effective, constants, run.organization.default_currency, ignored
+    )
     try:
         sheet = parse_upload(
             content,
@@ -238,6 +285,9 @@ def _parse_step(run: ImportRun) -> bool:
             max_cols=settings.OFFERFLOW_MAX_COLS,
             header_scan_rows=settings.OFFERFLOW_HEADER_SCAN_ROWS,
             column_overrides=confirmed or None,
+            column_constants=merged or None,
+            ignored_columns=ignored or None,
+            constant_sources=labels or None,
         )
     except MappingRequired as exc:
         _ask_mapping(run, exc)
@@ -246,6 +296,9 @@ def _parse_step(run: ImportRun) -> bool:
         "headers": sheet.headers,
         "detected": sheet.column_map,
         "confirmed": confirmed,
+        "constants": constants,
+        "ignored": ignored,
+        "applied_defaults": applied,
     }
     run.save(update_fields=["mapping", "updated_at"])
     SourceRow.objects.filter(run=run).delete()
@@ -267,59 +320,106 @@ def _parse_step(run: ImportRun) -> bool:
 
 
 def _interpret_step(run: ImportRun) -> None:
-    try:
-        provider = get_provider(organization_id=run.organization_id)
-    except ProviderNotConfigured as exc:
-        from pipeline.parsing import UnsupportedFile
+    from common.meta import ProviderError as MetaProviderError
 
-        raise UnsupportedFile(f"Provider refused: {exc}") from exc
     rows = list(run.source_rows.order_by("index"))
-    payload = {"rows": [{"index": row.index, "data": row.data} for row in rows]}
-    result = provider.interpret_table(payload)
-    run.provider_name = provider.name
-    run.simulated = provider.is_simulated
-    run.save(update_fields=["provider_name", "simulated", "updated_at"])
+    # Local-first: the model copies the same cells the localizer reads, so
+    # rows that normalize cleanly never need a paid call. Only gap rows go
+    # to the provider; fully clean files import with zero model spend.
+    local: dict = {}
+    gap_rows = []
+    for row in rows:
+        cells = dict(row.data or {})
+        fields = normalize_cells(cells)
+        status, gaps, reason = compute_offer_status(fields)
+        local[row.index] = (cells, fields, status, gaps, reason)
+        if gaps:
+            gap_rows.append(row)
+    interpreted = None
+    if not gap_rows:
+        provider_name, simulated = "local", True
+    else:
+        try:
+            provider = get_provider(organization_id=run.organization_id)
+        except ProviderNotConfigured as exc:
+            from pipeline.parsing import UnsupportedFile
+
+            raise UnsupportedFile(f"Provider refused: {exc}") from exc
+        provider_name, simulated = provider.name, provider.is_simulated
+        run.provider_name = provider_name
+        run.simulated = simulated
+        run.save(update_fields=["provider_name", "simulated", "updated_at"])
+        payload = {
+            "rows": [{"index": row.index, "data": row.data} for row in gap_rows]
+        }
+
+        provider_model = getattr(getattr(provider, "_config", None), "model", "")
+        if not isinstance(provider_model, str):
+            provider_model = ""
+
+        def _note_chunk(position, total, prompt_tokens, completion_tokens):
+            run.refresh_from_db(fields=["status"])
+            cancelled = run.status == RunStatus.CANCELLED
+            record_usage(
+                run.organization_id,
+                run,
+                "provider_call",
+                prompt_tokens + completion_tokens,
+                {
+                    "provider": provider.name,
+                    "model": provider_model,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "chunk": f"{position}/{total}",
+                },
+            )
+            stored = run.mapping or {}
+            stored["ai_progress"] = {"done": position, "total": total}
+            run.mapping = stored
+            run.save(update_fields=["mapping", "updated_at"])
+            if cancelled:
+                raise RunCancelled(f"Run {run.id} was cancelled.")
+
+        result = provider.interpret_table(payload, on_chunk=_note_chunk)
+        if not result.get("simulated", True):
+            interpreted = {
+                item["index"]: item.get("fields", {})
+                for item in result.get("rows", [])
+            }
+            for row in gap_rows:
+                if row.index not in interpreted:
+                    raise MetaProviderError(
+                        f"Model omitted row {row.index}; refusing partial use."
+                    )
+            # Spend and progress were recorded live per chunk via the
+            # callback, so even a later-failing run keeps its honest
+            # partial accounting.
+    if not gap_rows:
+        run.provider_name = provider_name
+        run.simulated = simulated
+        run.save(update_fields=["provider_name", "simulated", "updated_at"])
     record_usage(
         run.organization_id,
         run,
         "interpretation",
         len(rows),
-        {"provider": provider.name, "simulated": provider.is_simulated},
+        {
+            "provider": provider_name,
+            "simulated": simulated,
+            "model_rows": len(gap_rows),
+        },
     )
-    interpreted = None
-    if not result.get("simulated", True):
-        from common.meta import ProviderError as MetaProviderError
-
-        interpreted = {
-            item["index"]: item.get("fields", {}) for item in result.get("rows", [])
-        }
-        usage = result.get("usage", {})
-        record_usage(
-            run.organization_id,
-            run,
-            "provider_call",
-            usage.get("total_tokens", 0),
-            {
-                "provider": result.get("provider"),
-                "model": result.get("model"),
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-            },
-        )
     NormalizedOffer.objects.filter(run=run).delete()
     # File-wide mapping answers survive reprocessing as decided history;
     # only per-offer questions are rebuilt for the new columns.
     ReviewRequest.objects.filter(run=run, offer__isnull=False).delete()
     for row in rows:
-        cells = dict(row.data or {})
-        if interpreted is not None:
-            if row.index not in interpreted:
-                raise MetaProviderError(
-                    f"Model omitted row {row.index}; refusing partial use."
-                )
-            cells = interpreted[row.index]
-        fields = normalize_cells(cells)
-        status, gaps, reason = compute_offer_status(fields)
+        if interpreted is not None and row.index in interpreted:
+            cells = dict(interpreted[row.index])
+            fields = normalize_cells(cells)
+            status, gaps, reason = compute_offer_status(fields)
+        else:
+            cells, fields, status, gaps, reason = local[row.index]
         offer = NormalizedOffer.objects.create(
             organization_id=run.organization_id,
             run=run,
@@ -339,7 +439,11 @@ def _interpret_step(run: ImportRun) -> None:
             status=status,
             exclusion_reason=reason,
             provenance={"sheet": row.sheet, "row": row.index, "source_row": row.id},
-            interpreted=cells if interpreted is not None else None,
+            interpreted=(
+                dict(interpreted[row.index])
+                if interpreted is not None and row.index in interpreted
+                else None
+            ),
         )
         for gap in gaps:
             ReviewRequest.objects.create(

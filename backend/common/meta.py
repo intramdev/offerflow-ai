@@ -16,6 +16,12 @@ key, a configured model id, an organization with budget headroom, and a
 free in-flight slot. Anything missing refuses without touching the
 network. SDK retries are disabled; failures surface loudly and release
 their reservation. Nothing here silently falls back to fixtures.
+
+Large files are dispatched in chunks (bounded rows and input tokens per
+call) so no single call can time out or overflow its caps. Each chunk
+reserves and reconciles its own tokens; a failed chunk releases its own
+reservation and aborts the whole dispatch loudly — earlier reconciled
+chunks stay spent, because those tokens really were used.
 """
 
 from __future__ import annotations
@@ -89,6 +95,9 @@ class ProviderError(Exception):
     """A paid provider call failed or its output was unusable."""
 
 
+MAX_ROWS_PER_CALL = 32
+
+
 @dataclass(frozen=True)
 class MetaConfig:
     organization_id: int
@@ -121,25 +130,114 @@ class MetaProvider:
         self._config = config
         self._client_factory = client_factory or _default_client
 
-    def interpret_table(self, payload: dict) -> dict:
-        from pipeline.spending import BudgetRefused, reconcile, release, reserve
+    def interpret_table(self, payload: dict, on_chunk=None) -> dict:
+        """Interpret rows in chunks, reporting each completed call.
 
+        on_chunk(position, total, prompt_tokens, completion_tokens) fires
+        after a chunk reconciles, so callers can record spend and progress
+        live instead of only at the end.
+        """
         rows = payload.get("rows", []) if isinstance(payload, dict) else []
         if not isinstance(rows, list):
             raise ProviderError("Unusable payload for paid dispatch.")
-        user_content = json.dumps({"rows": rows}, separators=(",", ":"))
+        if not rows:
+            return {
+                "simulated": False,
+                "provider": "meta",
+                "model": self._config.model,
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "chunk_usages": [],
+                "rows": [],
+            }
+        chunks = self._split_chunks(rows)
+        client = self._client_factory(self._config)
+        merged: list = []
+        chunk_usages: list = []
+        prompt_total = 0
+        completion_total = 0
+        for position, chunk in enumerate(chunks, start=1):
+            prompt_tokens, completion_tokens, items = self._dispatch_chunk(
+                client, chunk, position, len(chunks)
+            )
+            if on_chunk is not None:
+                on_chunk(
+                    position, len(chunks), prompt_tokens, completion_tokens
+                )
+            prompt_total += prompt_tokens
+            completion_total += completion_tokens
+            chunk_usages.append(
+                {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                }
+            )
+            merged.extend(items)
+        return {
+            "simulated": False,
+            "provider": "meta",
+            "model": self._config.model,
+            "usage": {
+                "prompt_tokens": prompt_total,
+                "completion_tokens": completion_total,
+                "total_tokens": prompt_total + completion_total,
+            },
+            "chunk_usages": chunk_usages,
+            "rows": merged,
+        }
+
+    def _split_chunks(self, rows: list) -> list:
+        """Group rows so every call fits the input cap and a row bound."""
+        chunks: list = []
+        current: list = []
+        current_tokens = len(SYSTEM_PROMPT) // 4
+        for row in rows:
+            row_tokens = len(json.dumps(row, separators=(",", ":"))) // 4 + 1
+            if row_tokens + len(SYSTEM_PROMPT) // 4 > self._config.max_input_tokens:
+                raise ProviderError(
+                    "A single row exceeds the input cap; refusing dispatch."
+                )
+            if (
+                current
+                and (
+                    len(current) >= MAX_ROWS_PER_CALL
+                    or current_tokens + row_tokens > self._config.max_input_tokens
+                )
+            ):
+                chunks.append(current)
+                current = []
+                current_tokens = len(SYSTEM_PROMPT) // 4
+            current.append(row)
+            current_tokens += row_tokens
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _dispatch_chunk(self, client, chunk: list, position: int, total: int) -> tuple:
+        from pipeline.spending import BudgetRefused, reconcile, release, reserve
+
+        user_content = json.dumps({"rows": chunk}, separators=(",", ":"))
         estimated_input = len(user_content) // 4 + len(SYSTEM_PROMPT) // 4
         if estimated_input > self._config.max_input_tokens:
-            raise ProviderError("Payload exceeds the input cap; refusing dispatch.")
-        estimate = estimated_input + self._config.max_output_tokens
+            raise ProviderError(
+                f"Chunk {position}/{total} exceeds the input cap; refusing dispatch."
+            )
+        # The model copies visible values, so output tracks input size.
+        estimate = estimated_input + min(
+            self._config.max_output_tokens, estimated_input + 256
+        )
         try:
             reservation = reserve(
                 self._config.organization_id, estimate, self._config.max_in_flight
             )
         except BudgetRefused as exc:
-            raise ProviderError(f"Budget refused dispatch: {exc}") from exc
+            raise ProviderError(
+                f"Budget refused dispatch at chunk {position}/{total}: {exc}"
+            ) from exc
         try:
-            client = self._client_factory(self._config)
             response = client.chat.completions.create(
                 model=self._config.model,
                 messages=[
@@ -161,15 +259,20 @@ class MetaProvider:
             raise ProviderError("Provider rejected the API key.") from exc
         except RateLimitError as exc:
             release(reservation)
-            raise ProviderError("Provider rate limited the call; not retried.") from exc
+            raise ProviderError(
+                f"Provider rate limited chunk {position}/{total}; not retried."
+            ) from exc
         except APITimeoutError as exc:
             release(reservation)
-            raise ProviderError("Provider call timed out; not retried.") from exc
+            raise ProviderError(
+                f"Provider call timed out at chunk {position}/{total}; not retried."
+            ) from exc
         except (APIConnectionError, APIStatusError) as exc:
             release(reservation)
             status = getattr(exc, "status_code", None)
             raise ProviderError(
-                f"Provider error{f' ({status})' if status else ''}; not retried."
+                f"Provider error{f' ({status})' if status else ''} "
+                f"at chunk {position}/{total}; not retried."
             ) from exc
         except Exception as exc:
             release(reservation)
@@ -188,30 +291,28 @@ class MetaProvider:
         try:
             content = response.choices[0].message.content
         except (AttributeError, IndexError, TypeError) as exc:
-            raise ProviderError("Provider returned no content.") from exc
+            raise ProviderError(
+                f"Chunk {position}/{total} returned no content."
+            ) from exc
         if not content:
-            raise ProviderError("Provider returned empty content.")
+            raise ProviderError(f"Chunk {position}/{total} returned empty content.")
         try:
             parsed = json.loads(content)
         except ValueError as exc:
-            raise ProviderError("Provider returned invalid JSON.") from exc
+            raise ProviderError(
+                f"Chunk {position}/{total} returned invalid JSON."
+            ) from exc
         if not isinstance(parsed, dict) or not isinstance(parsed.get("rows"), list):
-            raise ProviderError("Provider returned an unusable envelope.")
+            raise ProviderError(
+                f"Chunk {position}/{total} returned an unusable envelope."
+            )
         for item in parsed["rows"]:
             if (
                 not isinstance(item, dict)
                 or not isinstance(item.get("index"), int)
                 or not isinstance(item.get("fields"), dict)
             ):
-                raise ProviderError("Provider returned a malformed row.")
-        return {
-            "simulated": False,
-            "provider": "meta",
-            "model": self._config.model,
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
-            "rows": parsed["rows"],
-        }
+                raise ProviderError(
+                    f"Chunk {position}/{total} returned a malformed row."
+                )
+        return prompt_tokens, completion_tokens, parsed["rows"]

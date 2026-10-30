@@ -18,7 +18,14 @@ from django.core.exceptions import ValidationError
 from common.storage import LocalFileAdapter
 from organizations.services import authorize_organization_access
 from pipeline.models import ColumnMappingMemory, SourceFile
-from pipeline.normalize import compute_offer_status, normalize_cells
+from pipeline.normalize import (
+    compute_offer_status,
+    normalize_cells,
+    parse_capacity,
+    parse_currency,
+    parse_price,
+    parse_quantity,
+)
 from pipeline.parsing import (
     HEADER_TOKENS,
     REQUIRED_COLUMNS,
@@ -32,6 +39,13 @@ from pipeline.parsing import (
 
 PREVIEW_TTL = timedelta(hours=24)
 SAMPLE_ROWS = 5
+
+CONSTANT_PARSERS = {
+    "price": (parse_price, "a valid price"),
+    "quantity": (parse_quantity, "a valid quantity"),
+    "capacity": (parse_capacity, "a valid capacity"),
+    "currency": (parse_currency, "a three-letter currency code"),
+}
 
 
 def _adapter() -> LocalFileAdapter:
@@ -93,15 +107,30 @@ def _load_preview(key: str) -> dict:
         raise ValidationError("Unknown or expired preview.") from None
 
 
-def remember_mapping(*, organization, headers: list, mapping: dict, supplier_hint=""):
+def remember_mapping(
+    *,
+    organization,
+    headers: list,
+    mapping: dict,
+    supplier_hint="",
+    constants=None,
+    ignored=None,
+):
     """Store a confirmed header-signature to mapping reuse record."""
     signature = header_signature(headers)
+    clean_constants = {str(k): v for k, v in (constants or {}).items()}
+    clean_ignored = [str(name) for name in (ignored or [])]
+    stored_mapping = {
+        str(k): v for k, v in mapping.items() if k not in clean_ignored
+    }
     memory, created = ColumnMappingMemory.objects.get_or_create(
         organization=organization,
         signature=signature,
         defaults={
             "headers": list(headers),
-            "mapping": {str(k): v for k, v in mapping.items()},
+            "mapping": stored_mapping,
+            "constants": clean_constants,
+            "ignored": clean_ignored,
             "supplier_hint": (supplier_hint or "")[:255],
         },
     )
@@ -109,7 +138,9 @@ def remember_mapping(*, organization, headers: list, mapping: dict, supplier_hin
         from django.db.models import F
 
         memory.headers = list(headers)
-        memory.mapping = {str(k): v for k, v in mapping.items()}
+        memory.mapping = stored_mapping
+        memory.constants = clean_constants
+        memory.ignored = clean_ignored
         if supplier_hint:
             memory.supplier_hint = supplier_hint[:255]
         memory.use_count = F("use_count") + 1
@@ -137,11 +168,59 @@ def _memory_usable(memory: ColumnMappingMemory, headers: list) -> bool:
         return False
     if len(set(positions)) != len(positions):
         return False
-    return all(name in mapping for name in REQUIRED_COLUMNS)
+    constants = memory.constants or {}
+    if not isinstance(constants, dict):
+        return False
+    if any(name not in HEADER_TOKENS for name in constants):
+        return False
+    ignored = memory.ignored or []
+    if not isinstance(ignored, list):
+        return False
+    if any(name not in HEADER_TOKENS for name in ignored):
+        return False
+    if set(mapping) & set(constants):
+        return False
+    covered = set(mapping) | set(constants)
+    return all(name in covered for name in REQUIRED_COLUMNS)
 
 
-def _clean_positions(mapping, headers: list, detected: dict, *, require_complete: bool):
-    """Validate submitted positions; merge over detected. Returns (submitted, effective)."""
+def _clean_constant(canonical: str, value):
+    """Validate one set value; numbers on numeric fields must parse."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValidationError(f"Value for {canonical!r} must be text or a number.")
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        raise ValidationError(f"Value for {canonical!r} must be a finite number.")
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            raise ValidationError(f"Value for {canonical!r} must not be blank.")
+        if len(value) > 255:
+            raise ValidationError(f"Value for {canonical!r} is too long.")
+    parser_spec = CONSTANT_PARSERS.get(canonical)
+    if parser_spec is not None:
+        parser, expectation = parser_spec
+        if parser(value) is None:
+            raise ValidationError(
+                f"Value for {canonical!r} must be {expectation}."
+            )
+    return value
+
+
+def _clean_positions(
+    mapping,
+    headers: list,
+    detected: dict,
+    *,
+    require_complete: bool,
+    constants=None,
+    ignored=None,
+):
+    """Validate positions, set values, and ignores.
+
+    Returns (submitted, effective, clean_constants, clean_ignored): the
+    positions the user set, the merged position map, and the validated
+    extras. A required column is satisfied by a column or a set value.
+    """
     if not isinstance(mapping, dict):
         raise ValidationError("Mapping must be an object.")
     cleaned = {}
@@ -161,17 +240,73 @@ def _clean_positions(mapping, headers: list, detected: dict, *, require_complete
     effective.update(cleaned)
     if len(set(effective.values())) != len(effective):
         raise ValidationError("The mapping assigns one column twice.")
+    if ignored is None:
+        ignored = []
+    if not isinstance(ignored, list):
+        raise ValidationError("Ignored fields must be a list.")
+    clean_ignored = []
+    for canonical in ignored:
+        if canonical not in HEADER_TOKENS:
+            raise ValidationError(f"Unknown column {canonical!r}.")
+        if canonical in cleaned:
+            raise ValidationError(
+                f"Column {canonical!r} is both mapped and ignored."
+            )
+        if canonical not in clean_ignored:
+            clean_ignored.append(canonical)
+    if constants is None:
+        constants = {}
+    if not isinstance(constants, dict):
+        raise ValidationError("Set values must be an object.")
+    clean_constants = {}
+    for canonical, value in constants.items():
+        if canonical not in HEADER_TOKENS:
+            raise ValidationError(f"Unknown column {canonical!r}.")
+        if canonical in effective and canonical not in clean_ignored:
+            raise ValidationError(
+                f"Column {canonical!r} has both a column and a set value."
+            )
+        clean_constants[canonical] = _clean_constant(canonical, value)
     if require_complete:
-        missing = [name for name in REQUIRED_COLUMNS if name not in effective]
+        missing = [
+            name
+            for name in REQUIRED_COLUMNS
+            if name not in effective and name not in clean_constants
+        ]
         if missing:
             raise ValidationError(
                 f"Mapping still misses required columns: {', '.join(missing)}."
             )
-    return cleaned, effective
+    return cleaned, effective, clean_constants, clean_ignored
 
 
-def _render_samples(content: bytes, filename: str, mapping: dict) -> dict:
+def _with_currency_default(mapping: dict, constants: dict, default_currency: str,
+                           ignored=None):
+    """Fill an unspecified currency from the organization default.
+
+    A mapped column or a set value counts as specified; an ignored field
+    does not, so the default still applies. Returns (constants, sources,
+    applied): the merged constants, per-value source labels, and the
+    defaults that were applied for the UI to show.
+    """
+    merged = dict(constants or {})
+    labels = {}
+    applied = {}
+    default = (default_currency or "").strip().upper()
+    positions = set(mapping or {}) - set(ignored or [])
+    if default and "currency" not in positions and "currency" not in merged:
+        merged["currency"] = default
+        labels["currency"] = "default"
+        applied["currency"] = default
+    return merged, labels, applied
+
+
+def _render_samples(content: bytes, filename: str, mapping: dict,
+                    constants=None, ignored=None, default_currency="") -> dict:
     limits = _limits()
+    merged, labels, applied = _with_currency_default(
+        mapping, constants, default_currency, ignored
+    )
     try:
         sheet = parse_upload(
             content,
@@ -180,6 +315,9 @@ def _render_samples(content: bytes, filename: str, mapping: dict) -> dict:
             max_cols=limits["max_cols"],
             header_scan_rows=limits["header_scan_rows"],
             column_overrides=mapping or None,
+            column_constants=merged or None,
+            ignored_columns=ignored or None,
+            constant_sources=labels or None,
         )
     except MappingRequired as exc:
         return {
@@ -187,6 +325,7 @@ def _render_samples(content: bytes, filename: str, mapping: dict) -> dict:
             "missing": exc.missing,
             "detected": exc.column_map,
             "sources": exc.sources,
+            "applied_defaults": applied,
             "rows": [
                 {"index": row.index, "cells": row.data}
                 for row in exc.rows[:SAMPLE_ROWS]
@@ -211,6 +350,7 @@ def _render_samples(content: bytes, filename: str, mapping: dict) -> dict:
         "missing": [],
         "detected": sheet.column_map,
         "sources": sheet.sources,
+        "applied_defaults": applied,
         "rows": rows,
     }
 
@@ -284,9 +424,13 @@ def create_preview(*, organization, user, uploaded_file) -> dict:
         )
     memory = lookup_memory(organization=organization, headers=headers)
     proposed = dict(detected)
+    proposed_constants: dict = {}
+    proposed_ignored: list = []
     memory_info = None
     if memory is not None and _memory_usable(memory, headers):
         proposed = {str(k): v for k, v in memory.mapping.items()}
+        proposed_constants = dict(memory.constants or {})
+        proposed_ignored = list(memory.ignored or [])
         memory_info = {
             "use_count": memory.use_count,
             "last_used_at": memory.last_used_at.isoformat(),
@@ -310,7 +454,14 @@ def create_preview(*, organization, user, uploaded_file) -> dict:
     }
     adapter.save_bytes(f"previews/{key}.json", json.dumps(meta).encode("utf-8"))
     _gc_previews()
-    samples = _render_samples(content, original_name, proposed)
+    samples = _render_samples(
+        content,
+        original_name,
+        proposed,
+        proposed_constants,
+        proposed_ignored,
+        organization.default_currency,
+    )
     record_audit(
         organization.id,
         user,
@@ -331,16 +482,24 @@ def create_preview(*, organization, user, uploaded_file) -> dict:
         "missing": missing,
         "memory": memory_info,
         "proposed": proposed,
+        "proposed_constants": proposed_constants,
+        "proposed_ignored": proposed_ignored,
         "samples": samples,
     }
 
 
-def render_preview(*, key: str, user, mapping: dict) -> dict:
+def render_preview(*, key: str, user, mapping: dict,
+                   constants=None, ignored=None) -> dict:
     """Re-render sample rows for an adjusted mapping."""
     meta = _load_preview(key)
-    authorize_organization_access(user, meta["organization_id"])
-    _submitted, effective = _clean_positions(
-        mapping, meta["headers"], meta["detected"], require_complete=False
+    organization = authorize_organization_access(user, meta["organization_id"])
+    _submitted, effective, clean_constants, clean_ignored = _clean_positions(
+        mapping,
+        meta["headers"],
+        meta["detected"],
+        require_complete=False,
+        constants=constants,
+        ignored=ignored,
     )
     try:
         content = _adapter().read_bytes(f"previews/{key}.bin")
@@ -348,11 +507,22 @@ def render_preview(*, key: str, user, mapping: dict) -> dict:
         raise ValidationError("Unknown or expired preview.") from None
     return {
         "mapping": effective,
-        "samples": _render_samples(content, meta["filename"], effective),
+        "constants": clean_constants,
+        "ignored": clean_ignored,
+        "samples": _render_samples(
+            content,
+            meta["filename"],
+            effective,
+            clean_constants,
+            clean_ignored,
+            organization.default_currency,
+        ),
     }
 
 
-def _supplier_hint(content: bytes, filename: str, mapping: dict) -> str:
+def _supplier_hint(content: bytes, filename: str, mapping: dict, constants: dict) -> str:
+    if "supplier" in (constants or {}):
+        return str(constants["supplier"]).strip()[:255]
     limits = _limits()
     try:
         sheet = parse_upload(
@@ -371,14 +541,20 @@ def _supplier_hint(content: bytes, filename: str, mapping: dict) -> str:
     return ("" if supplier is None else str(supplier).strip())[:255]
 
 
-def confirm_preview(*, key: str, user, mapping: dict):
+def confirm_preview(*, key: str, user, mapping: dict,
+                    constants=None, ignored=None):
     """Validate a full mapping and start the import run."""
     from pipeline.uploads import store_upload_run
 
     meta = _load_preview(key)
     organization = authorize_organization_access(user, meta["organization_id"])
-    submitted, effective = _clean_positions(
-        mapping, meta["headers"], meta["detected"], require_complete=True
+    submitted, effective, clean_constants, clean_ignored = _clean_positions(
+        mapping,
+        meta["headers"],
+        meta["detected"],
+        require_complete=True,
+        constants=constants,
+        ignored=ignored,
     )
     try:
         content = _adapter().read_bytes(f"previews/{key}.bin")
@@ -399,13 +575,19 @@ def confirm_preview(*, key: str, user, mapping: dict):
             "headers": meta["headers"],
             "detected": meta["detected"],
             "confirmed": submitted,
+            "constants": clean_constants,
+            "ignored": clean_ignored,
         },
     )
     remember_mapping(
         organization=organization,
         headers=meta["headers"],
         mapping=effective,
-        supplier_hint=_supplier_hint(content, meta["filename"], effective),
+        constants=clean_constants,
+        ignored=clean_ignored,
+        supplier_hint=_supplier_hint(
+            content, meta["filename"], effective, clean_constants
+        ),
     )
     adapter = _adapter()
     adapter.delete(f"previews/{key}.bin")

@@ -48,6 +48,8 @@ from pipeline.serializers import (
     AnswerSerializer,
     ArtifactSerializer,
     ExportRequestSerializer,
+    FileRenameSerializer,
+    FxDateSerializer,
     MappingSerializer,
     OfferSerializer,
     PricingRuleInputSerializer,
@@ -58,7 +60,7 @@ from pipeline.serializers import (
     UploadSerializer,
     ValidationSerializer,
 )
-from pipeline.uploads import create_upload, delete_upload
+from pipeline.uploads import create_upload, delete_upload, rename_upload
 
 DOWNLOAD_TYPES = {
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -191,6 +193,28 @@ class AnswerView(APIView):
         )
 
 
+class IgnoreView(APIView):
+    """Ignore one record instead of answering its question."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, review_id: int):
+        review = _review_for_user(request.user, review_id)
+        try:
+            offer = review_services.ignore_request(
+                review=review, user=request.user
+            )
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
+        return Response(
+            {
+                "review": review.id,
+                "offer": offer.id,
+                "run_status": review.run.status,
+            }
+        )
+
+
 class ApproveView(APIView):
     """Approve a releasable run, binding exact versions."""
 
@@ -281,6 +305,22 @@ class FileListView(APIView):
 class FileDetailView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    def put(self, request, file_id):
+        source_file = _file_for_user(request.user, file_id)
+        serializer = FileRenameSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            source_file = rename_upload(
+                source_file=source_file,
+                user=request.user,
+                original_name=serializer.validated_data["original_name"],
+            )
+        except DjangoPermissionDenied as error:
+            raise DRFPermissionDenied(str(error)) from error
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
+        return Response(SourceFileSerializer(source_file).data)
+
     def delete(self, request, file_id):
         source_file = _file_for_user(request.user, file_id)
         try:
@@ -288,6 +328,30 @@ class FileDetailView(APIView):
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class FileFxView(APIView):
+    """Re-fetch a file's recorded exchange rates for a picked date."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, file_id):
+        from pipeline.fx import refresh_file_rates
+
+        source_file = _file_for_user(request.user, file_id)
+        serializer = FxDateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            source_file = refresh_file_rates(
+                source_file=source_file,
+                user=request.user,
+                currency_date=serializer.validated_data["currency_date"],
+            )
+        except DjangoPermissionDenied as error:
+            raise DRFPermissionDenied(str(error)) from error
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
+        return Response(SourceFileSerializer(source_file).data)
 
 
 class RemapView(APIView):
@@ -302,6 +366,8 @@ class RemapView(APIView):
                 run=run,
                 user=request.user,
                 mapping=serializer.validated_data["mapping"],
+                constants=serializer.validated_data.get("constants"),
+                ignored=serializer.validated_data.get("ignored"),
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
@@ -343,6 +409,8 @@ class PreviewRenderView(APIView):
                 key=key,
                 user=request.user,
                 mapping=serializer.validated_data["mapping"],
+                constants=serializer.validated_data.get("constants"),
+                ignored=serializer.validated_data.get("ignored"),
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
@@ -360,6 +428,8 @@ class PreviewConfirmView(APIView):
                 key=key,
                 user=request.user,
                 mapping=serializer.validated_data["mapping"],
+                constants=serializer.validated_data.get("constants"),
+                ignored=serializer.validated_data.get("ignored"),
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error

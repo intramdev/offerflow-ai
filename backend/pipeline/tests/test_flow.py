@@ -140,6 +140,44 @@ class PipelineFlowTests(TestCase):
         self.assertEqual(len(lines), 4)
         self.assertTrue(lines[0].startswith("supplier,brand,model"))
 
+    def test_ignore_record_excludes_offer_and_advances(self):
+        from pipeline.review import ignore_request
+
+        run = self.upload_and_process(MIXED_ROWS)
+        by_field = {
+            review.field: review
+            for review in run.reviews.filter(status=ReviewStatus.OPEN)
+        }
+        offer = ignore_request(review=by_field["unit_price"], user=self.user)
+        self.assertEqual(offer.status, OfferStatus.EXCLUDED)
+        self.assertIn("u", offer.exclusion_reason)
+        self.assertFalse(
+            run.reviews.filter(
+                offer=offer, status=ReviewStatus.OPEN
+            ).exists()
+        )
+        decision = by_field["unit_price"].decision
+        self.assertEqual(decision.value, {"ignored": True})
+        run.refresh_from_db()
+        self.assertEqual(run.status, RunStatus.NEEDS_INPUT)
+        answer_request(review=by_field["grade"], user=self.user, choice="A")
+        run.refresh_from_db()
+        self.assertEqual(run.status, RunStatus.READY_FOR_REVIEW)
+        approve_run(run=run, user=self.user)
+        xlsx = create_export(run=run, user=self.user, format="xlsx")
+        adapter = LocalFileAdapter(settings.OFFERFLOW_FILE_ROOT)
+        workbook = load_workbook(
+            io.BytesIO(adapter.read_bytes(xlsx.storage_key)),
+            read_only=True,
+            data_only=True,
+        )
+        data_rows = list(workbook["offers"].iter_rows(min_row=2, values_only=True))
+        self.assertEqual(len(data_rows), 2)
+        excluded_rows = list(
+            workbook["excluded"].iter_rows(min_row=2, values_only=True)
+        )
+        self.assertEqual(len(excluded_rows), 2)
+
     def test_stale_approval_refuses_export(self):
         run = self.upload_and_process([HEADERS, row()])
         self.assertEqual(run.status, RunStatus.READY_FOR_REVIEW)
@@ -195,6 +233,164 @@ class PipelineFlowTests(TestCase):
         self.assertEqual(process_import_run(run.id), "noop:cancelled")
         run.refresh_from_db()
         self.assertEqual(run.status, RunStatus.CANCELLED)
+
+    def test_failed_run_keeps_attempted_provider_lane(self):
+        from unittest import mock
+
+        from common.meta import ProviderError
+
+        uploaded = SimpleUploadedFile(
+            "sup.xlsx",
+            make_workbook([HEADERS, row(price="")]),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        run = create_upload(
+            organization=self.org, user=self.user, uploaded_file=uploaded
+        )
+        failing = mock.Mock()
+        failing.name = "meta"
+        failing.is_simulated = False
+        failing.interpret_table.side_effect = ProviderError("boom; not retried.")
+        with mock.patch("pipeline.jobs.get_provider", return_value=failing):
+            self.assertEqual(process_import_run(run.id), "failed")
+        run.refresh_from_db()
+        self.assertEqual(run.status, RunStatus.FAILED)
+        self.assertEqual(run.provider_name, "meta")
+        self.assertFalse(run.simulated)
+        self.assertIn("not retried", run.error)
+
+    def test_chunked_usage_records_one_event_per_call(self):
+        from unittest import mock
+
+        from pipeline.models import UsageEvent
+        from pipeline.tests.test_spending import FIELDS
+
+        uploaded = SimpleUploadedFile(
+            "sup.xlsx",
+            make_workbook([HEADERS, row(), row(price="")]),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        run = create_upload(
+            organization=self.org, user=self.user, uploaded_file=uploaded
+        )
+        fake = mock.Mock()
+        fake.name = "meta"
+        fake.is_simulated = False
+        seen_payloads = []
+
+        def fake_interpret(payload, on_chunk=None):
+            seen_payloads.append(payload)
+            items = [
+                {"index": entry["index"], "fields": dict(FIELDS)}
+                for entry in payload["rows"]
+            ]
+            if on_chunk is not None:
+                on_chunk(1, 2, 10, 4)
+                on_chunk(2, 2, 20, 8)
+            return {
+                "simulated": False,
+                "provider": "meta",
+                "model": "test-model",
+                "usage": {
+                    "prompt_tokens": 30,
+                    "completion_tokens": 12,
+                    "total_tokens": 42,
+                },
+                "chunk_usages": [
+                    {"prompt_tokens": 10, "completion_tokens": 4},
+                    {"prompt_tokens": 20, "completion_tokens": 8},
+                ],
+                "rows": items,
+            }
+
+        fake.interpret_table.side_effect = fake_interpret
+        with mock.patch("pipeline.jobs.get_provider", return_value=fake):
+            self.assertEqual(process_import_run(run.id), "ok")
+        calls = list(
+            UsageEvent.objects.filter(
+                run_id=run.id, kind="provider_call"
+            ).order_by("id")
+        )
+        self.assertEqual([event.quantity for event in calls], [14, 28])
+        self.assertEqual(calls[0].detail["chunk"], "1/2")
+        self.assertEqual(calls[1].detail["chunk"], "2/2")
+        # Only the gap row reached the model; the clean row stayed local.
+        self.assertEqual(len(seen_payloads), 1)
+        self.assertEqual(len(seen_payloads[0]["rows"]), 1)
+        run.refresh_from_db()
+        self.assertEqual(run.mapping["ai_progress"], {"done": 2, "total": 2})
+        self.assertEqual(run.offers.count(), 2)
+
+    def test_clean_rows_skip_provider_entirely(self):
+        from unittest import mock
+
+        from pipeline.models import UsageEvent
+
+        uploaded = SimpleUploadedFile(
+            "sup.xlsx",
+            make_workbook([HEADERS, row()]),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        run = create_upload(
+            organization=self.org, user=self.user, uploaded_file=uploaded
+        )
+        fake = mock.Mock()
+        fake.name = "meta"
+        fake.is_simulated = False
+        with mock.patch("pipeline.jobs.get_provider", return_value=fake):
+            self.assertEqual(process_import_run(run.id), "ok")
+        fake.interpret_table.assert_not_called()
+        run.refresh_from_db()
+        self.assertEqual(run.status, RunStatus.READY_FOR_REVIEW)
+        self.assertEqual(run.provider_name, "local")
+        self.assertTrue(run.simulated)
+        self.assertFalse(
+            UsageEvent.objects.filter(
+                run_id=run.id, kind="provider_call"
+            ).exists()
+        )
+
+    def test_mid_flight_cancel_aborts_at_chunk_boundary(self):
+        from unittest import mock
+
+        from pipeline.models import UsageEvent, transition_run
+
+        uploaded = SimpleUploadedFile(
+            "sup.xlsx",
+            make_workbook([HEADERS, row(), row(price="")]),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        run = create_upload(
+            organization=self.org, user=self.user, uploaded_file=uploaded
+        )
+        fake = mock.Mock()
+        fake.name = "meta"
+        fake.is_simulated = False
+
+        def fake_interpret(payload, on_chunk=None):
+            transition_run(run, RunStatus.CANCELLED)
+            on_chunk(1, 2, 10, 4)
+            raise AssertionError("should have aborted before chunk 2")
+
+        fake.interpret_table.side_effect = fake_interpret
+        with mock.patch("pipeline.jobs.get_provider", return_value=fake):
+            self.assertEqual(process_import_run(run.id), "cancelled")
+        run.refresh_from_db()
+        self.assertEqual(run.status, RunStatus.CANCELLED)
+        self.assertEqual(run.error, "")
+        calls = UsageEvent.objects.filter(
+            run_id=run.id, kind="provider_call"
+        )
+        self.assertEqual(calls.count(), 1)
+        self.assertEqual(calls[0].quantity, 14)
+
+    def test_cancel_approved_run_refused(self):
+        run = self.upload_and_process([HEADERS, row()])
+        approve_run(run=run, user=self.user)
+        from django.core.exceptions import ValidationError
+
+        with self.assertRaisesRegex(ValidationError, "already approved"):
+            cancel_run(run=run, user=self.user)
 
     def test_missing_stored_bytes_fails_run(self):
         uploaded = SimpleUploadedFile(

@@ -10,7 +10,12 @@ from __future__ import annotations
 import re
 from decimal import Decimal, InvalidOperation
 
-CAPACITY_RE = re.compile(r"^\s*(\d{1,4})\s*(gb|g)?\s*$", re.IGNORECASE)
+CAPACITY_RE = re.compile(
+    r"^\s*(\d{1,4}(?:\.\d+)?)\s*(tb|t|gb|g|mb|m)?\s*$", re.IGNORECASE
+)
+# Gigabytes per unit. Binary units: 1 TB = 1024 GB.
+CAPACITY_UNIT_GB = {"tb": 1024, "t": 1024, "gb": 1, "g": 1, "mb": 1 / 1024, "m": 1 / 1024}
+MAX_CAPACITY_GB = 8192
 CURRENCY_RE = re.compile(r"^\s*([A-Za-z]{3})\s*$")
 INTEGER_RE = re.compile(r"^\d+$")
 
@@ -33,19 +38,30 @@ UNKNOWN = "unknown"
 
 
 def parse_capacity(raw) -> int | None:
-    """Read gigabytes from values like 128, "128", or "128GB"."""
+    """Read whole gigabytes from values like 128, "128GB", "1TB", "1024MB".
+
+    Bare numbers mean gigabytes. Terabyte and megabyte values convert to
+    gigabytes and must land on a whole gigabyte: "512MB" is refused
+    rather than rounded, and anything outside 1 GB..8192 GB asks the
+    reviewer instead of guessing.
+    """
     if raw is None or isinstance(raw, bool):
         return None
     if isinstance(raw, (int, float)):
-        if float(raw).is_integer() and 0 < raw <= 8192:
+        if float(raw).is_integer() and 0 < raw <= MAX_CAPACITY_GB:
             return int(raw)
         return None
     if isinstance(raw, str):
         match = CAPACITY_RE.match(raw)
         if match:
-            value = int(match.group(1))
-            if 0 < value <= 8192:
-                return value
+            try:
+                amount = Decimal(match.group(1))
+            except InvalidOperation:
+                return None
+            unit = (match.group(2) or "gb").lower()
+            gigabytes = amount * Decimal(str(CAPACITY_UNIT_GB[unit]))
+            if gigabytes == gigabytes.to_integral_value() and 0 < gigabytes <= MAX_CAPACITY_GB:
+                return int(gigabytes)
     return None
 
 
@@ -128,11 +144,31 @@ def parse_price(raw) -> Decimal | None:
     return value
 
 
+CURRENCY_ALIASES = {
+    "$": "USD",
+    "us$": "USD",
+    "€": "EUR",
+    "£": "GBP",
+    "kč": "CZK",
+    "czk": "CZK",
+}
+
+
 def parse_currency(raw) -> str | None:
-    """Read a three-letter currency code, uppercased."""
+    """Read a three-letter currency code, uppercased.
+
+    A small alias table covers unambiguous symbols (¥ is deliberately
+    absent: it means both JPY and CNY, so it stays a review question).
+    """
     if not isinstance(raw, str):
         return None
-    match = CURRENCY_RE.match(raw)
+    text = raw.strip()
+    if not text:
+        return None
+    alias = CURRENCY_ALIASES.get(text.lower())
+    if alias is not None:
+        return alias
+    match = CURRENCY_RE.match(text)
     if match:
         return match.group(1).upper()
     return None
@@ -181,6 +217,8 @@ def compute_offer_status(fields: dict) -> tuple[str, list, str]:
     Returns the status, the list of review gaps, and an exclusion reason.
     Locked offers are excluded without raising gaps for their other fields.
     Brand, color, and conditions are optional and never block release.
+    Lock info that is simply absent also blocks nothing; only lock text
+    that was provided but cannot be read asks for confirmation.
     """
     from pipeline.models import OfferStatus
 
@@ -243,7 +281,7 @@ def compute_offer_status(fields: dict) -> tuple[str, list, str]:
     lock_raw = fields.get("lock_raw")
     if lock_state == LOCKED:
         return OfferStatus.EXCLUDED, [], f"Locked device excluded ({_short(lock_raw)})."
-    if lock_state == UNKNOWN:
+    if lock_state == UNKNOWN and str(lock_raw or "").strip():
         gaps.append(
             {
                 "field": "lock_state",

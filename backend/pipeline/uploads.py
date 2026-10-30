@@ -71,6 +71,9 @@ def store_upload_run(
         sha256=digest,
         storage_key=key,
     )
+    from pipeline.fx import snapshot_upload_rates
+
+    snapshot_upload_rates(source_file=source_file, organization=organization)
     run = ImportRun.objects.create(
         organization=organization,
         source_file=source_file,
@@ -108,6 +111,29 @@ def create_upload(*, organization, user, uploaded_file) -> ImportRun:
         original_name=original_name,
         mapping={},
     )
+
+
+def rename_upload(*, source_file: SourceFile, user, original_name: str) -> SourceFile:
+    """Rename an upload's display name. Stored bytes are untouched: the
+    storage key never derives from this name, so history and artifacts
+    keep working under the new label."""
+    from organizations.context import set_tenant_context
+    from organizations.services import require_organization_role
+
+    require_organization_role(user, source_file.organization_id)
+    set_tenant_context(source_file.organization_id, user.id)
+    old_name = source_file.original_name
+    source_file.original_name = original_name[:255]
+    source_file.save(update_fields=["original_name"])
+    record_audit(
+        source_file.organization_id,
+        user,
+        "file_renamed",
+        "file",
+        source_file.id,
+        {"from": old_name, "to": source_file.original_name},
+    )
+    return source_file
 
 
 def delete_upload(*, source_file: SourceFile, user) -> None:

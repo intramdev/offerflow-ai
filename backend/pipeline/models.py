@@ -10,6 +10,7 @@ from __future__ import annotations
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.utils import timezone
 
 
 class RunStatus(models.TextChoices):
@@ -45,8 +46,10 @@ ALLOWED_TRANSITIONS = {
         RunStatus.FAILED,
         RunStatus.CANCELLED,
     },
-    # UPLOADED from NEEDS_INPUT or READY_FOR_REVIEW restarts processing
-    # after mapping answers or a remap replaces the column mapping.
+    # UPLOADED from NEEDS_INPUT, READY_FOR_REVIEW, APPROVED, or COMPLETED
+    # restarts processing after mapping answers or a remap replaces the
+    # column mapping. Remapping an approved or completed run discards its
+    # approval and export artifacts; the audit trail keeps the history.
     RunStatus.NEEDS_INPUT: {
         RunStatus.VALIDATION,
         RunStatus.UPLOADED,
@@ -59,9 +62,14 @@ ALLOWED_TRANSITIONS = {
         RunStatus.FAILED,
         RunStatus.CANCELLED,
     },
-    RunStatus.APPROVED: {RunStatus.EXPORTING, RunStatus.FAILED, RunStatus.CANCELLED},
+    RunStatus.APPROVED: {
+        RunStatus.EXPORTING,
+        RunStatus.UPLOADED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    },
     RunStatus.EXPORTING: {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED},
-    RunStatus.COMPLETED: {RunStatus.EXPORTING},
+    RunStatus.COMPLETED: {RunStatus.EXPORTING, RunStatus.UPLOADED},
     RunStatus.FAILED: {RunStatus.UPLOADED},
     RunStatus.CANCELLED: set(),
 }
@@ -136,6 +144,17 @@ class SourceFile(models.Model):
     size_bytes = models.PositiveIntegerField()
     sha256 = models.CharField(max_length=64)
     storage_key = models.CharField(max_length=512)
+    # Exchange-rate snapshot for this file: the calendar date the rates
+    # were fetched for (upload day by default), the destination they
+    # convert to, and the recorded FROM -> rate table. Quotes convert
+    # explicitly from this table; nothing here is ever re-fetched
+    # implicitly, so a file's numbers stay reproducible.
+    currency_date = models.DateField(null=True, blank=True)
+    fx_destination = models.CharField(max_length=3, blank=True, default="")
+    fx_rates = models.JSONField(default=dict)
+    fx_source = models.CharField(max_length=64, blank=True, default="")
+    fx_simulated = models.BooleanField(default=True)
+    fx_fetched_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -405,6 +424,8 @@ class ColumnMappingMemory(models.Model):
     signature = models.CharField(max_length=64)
     headers = models.JSONField(default=list)
     mapping = models.JSONField(default=dict)
+    constants = models.JSONField(default=dict)
+    ignored = models.JSONField(default=list)
     supplier_hint = models.CharField(max_length=255, blank=True)
     use_count = models.PositiveIntegerField(default=1)
     last_used_at = models.DateTimeField(auto_now=True)
@@ -474,6 +495,11 @@ class SpendAllowance(models.Model):
     Budgets start at zero, so paid dispatch is refused until an owner sets
     an explicit allowance. Reservation is atomic under row lock; reconcile
     converts reservations into spend after observed usage arrives.
+
+    Credits are tokens 1:1. Each company gets a monthly allowance that
+    resets on its own billing cycle (anchored at activation, so a company
+    activated on the 10th resets on the 10th). tokens_spent is the grand
+    total and is never reset; period_spent tracks the current cycle.
     """
 
     organization = models.OneToOneField(
@@ -486,4 +512,8 @@ class SpendAllowance(models.Model):
     tokens_spent = models.PositiveIntegerField(default=0)
     in_flight = models.PositiveIntegerField(default=0)
     paused = models.BooleanField(default=False)
+    monthly_credits = models.PositiveIntegerField(default=0)
+    cycle_anchor = models.DateField(default=timezone.localdate)
+    period_start = models.DateField(default=timezone.localdate)
+    period_spent = models.PositiveIntegerField(default=0)
     updated_at = models.DateTimeField(auto_now=True)

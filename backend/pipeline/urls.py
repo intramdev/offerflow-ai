@@ -4,11 +4,13 @@ from django.urls import path
 
 from pipeline.views import (
     AnswerView,
+    IgnoreView,
     ApproveView,
     CancelView,
     DownloadView,
     ExportView,
     FileDetailView,
+    FileFxView,
     FileListView,
     OfferListView,
     PreviewCancelView,
@@ -41,6 +43,7 @@ urlpatterns = [
     path("previews/<str:key>/", PreviewCancelView.as_view(), name="preview-cancel"),
     path("files/", FileListView.as_view(), name="files"),
     path("files/<int:file_id>/", FileDetailView.as_view(), name="file-detail"),
+    path("files/<int:file_id>/fx/", FileFxView.as_view(), name="file-fx"),
     path("rules/", RuleListView.as_view(), name="rules"),
     path("rules/<int:rule_id>/", RuleDetailView.as_view(), name="rule-detail"),
     path("runs/<int:run_id>/", RunDetailView.as_view(), name="run-detail"),
@@ -62,6 +65,7 @@ urlpatterns = [
         name="quote-download-format",
     ),
     path("reviews/<int:review_id>/answer/", AnswerView.as_view(), name="answer"),
+    path("reviews/<int:review_id>/ignore/", IgnoreView.as_view(), name="ignore"),
     path(
         "artifacts/<int:artifact_id>/download/",
         DownloadView.as_view(),

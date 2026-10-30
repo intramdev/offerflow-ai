@@ -18,6 +18,7 @@ from organizations.serializers import (
     InvitationCreateSerializer,
     MemberSerializer,
     MembershipSerializer,
+    OrganizationSettingsSerializer,
     PreferenceSerializer,
 )
 
@@ -35,6 +36,85 @@ class MembershipListView(APIView):
             "organization"
         )
         return Response(MembershipSerializer(memberships, many=True).data)
+
+
+class OrganizationUsageView(APIView):
+    """Credit dashboard data for one company (member read).
+
+    Credits are tokens 1:1 against the monthly allowance. Reading snaps
+    the billing period first, so the numbers always describe the current
+    cycle; the grand total is never reset.
+    """
+
+    def get(self, request, organization_id):
+        from pipeline.models import UsageEvent
+        from pipeline.spending import (
+            current_period_start,
+            get_allowance,
+            next_reset_date,
+        )
+
+        organization = services.authorize_organization_access(
+            request.user, organization_id
+        )
+        allowance = get_allowance(organization.id)
+        period = current_period_start(allowance.cycle_anchor)
+        if allowance.period_start != period:
+            allowance.period_start = period
+            allowance.period_spent = 0
+            allowance.save(
+                update_fields=["period_start", "period_spent", "updated_at"]
+            )
+        used = allowance.period_spent
+        calls = (
+            UsageEvent.objects.filter(
+                organization=organization, kind="provider_call", run__isnull=False
+            )
+            .select_related("run", "run__source_file")
+            .order_by("-created_at")[:500]
+        )
+        imports: list[dict] = []
+        for event in calls:
+            detail = event.detail or {}
+            entry = next(
+                (row for row in imports if row["run_id"] == event.run_id), None
+            )
+            if entry is None:
+                if len(imports) >= 50:
+                    continue
+                entry = {
+                    "run_id": event.run_id,
+                    "filename": event.run.source_file.original_name,
+                    "created_at": event.run.created_at.isoformat(),
+                    "run_status": event.run.status,
+                    "requests": 0,
+                    "tokens": 0,
+                    "calls": [],
+                }
+                imports.append(entry)
+            entry["requests"] += 1
+            entry["tokens"] += event.quantity
+            entry["calls"].append(
+                {
+                    "at": event.created_at.isoformat(),
+                    "prompt_tokens": detail.get("prompt_tokens", 0),
+                    "completion_tokens": detail.get("completion_tokens", 0),
+                    "total": event.quantity,
+                    "model": detail.get("model", ""),
+                }
+            )
+        return Response(
+            {
+                "allowance": allowance.monthly_credits,
+                "used": used,
+                "remaining": max(0, allowance.monthly_credits - used),
+                "period_start": period.isoformat(),
+                "reset_date": next_reset_date(allowance.cycle_anchor).isoformat(),
+                "grand_total": allowance.tokens_spent,
+                "paused": allowance.paused,
+                "imports": imports,
+            }
+        )
 
 
 class ActiveOrganizationView(APIView):
@@ -143,3 +223,50 @@ class PreferenceView(APIView):
             defaults={"datetime_format": serializer.validated_data["datetime_format"]},
         )
         return Response(PreferenceSerializer(preference).data)
+
+
+class OrganizationSettingsView(APIView):
+    """Read or update shared organization settings."""
+
+    def get(self, request, organization_id):
+        try:
+            organization = services.authorize_organization_access(
+                request.user, organization_id
+            )
+        except DjangoPermissionDenied as error:
+            from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
+
+            raise DRFPermissionDenied(str(error)) from error
+        return Response(OrganizationSettingsSerializer(organization).data)
+
+    def put(self, request, organization_id):
+        try:
+            organization = services.authorize_organization_access(
+                request.user, organization_id
+            )
+            services.require_organization_role(request.user, organization.id)
+        except DjangoPermissionDenied as error:
+            from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
+
+            raise DRFPermissionDenied(str(error)) from error
+        serializer = OrganizationSettingsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        updated = {}
+        for field in ("default_currency", "destination_currency"):
+            if field in request.data:
+                value = serializer.validated_data[field]
+                setattr(organization, field, value)
+                updated[field] = value
+        if updated:
+            organization.save(update_fields=list(updated))
+        from pipeline.jobs import record_audit
+
+        record_audit(
+            organization.id,
+            request.user,
+            "org_settings_updated",
+            "organization",
+            organization.id,
+            updated,
+        )
+        return Response(OrganizationSettingsSerializer(organization).data)

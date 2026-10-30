@@ -4,6 +4,7 @@
 # BSD, celery BSD, psycopg LGPL-3.0-only, openpyxl MIT, defusedxml PSFL,
 # openai SDK Apache-2.0 (Meta Model API is OpenAI-compatible).
 # xls reading: xlrd BSD; docx reading: python-docx MIT.
+# credential encryption at rest: cryptography Apache-2.0/BSD.
 Django==5.2.18
 djangorestframework==3.18.3
 celery==5.6.3
@@ -13,3 +14,4 @@ defusedxml==0.7.1
 openai==3.41.0
 xlrd==2.0.2
 python-docx==1.2.0
+cryptography==50.0.2

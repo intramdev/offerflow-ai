@@ -6,6 +6,10 @@ the explicit paid switch, a well-formed key, and a configured model id — and
 even then the token budget must approve every dispatch. A missing key, an
 unknown provider name, or a zero budget never silently selects a paid path,
 and a paid failure never silently falls back to fixtures.
+
+Credentials come from the admin-managed AI provider config when it is
+complete, so one model account serves every company; the OFFERFLOW_META_*
+environment variables remain as fallback for local work and tests.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ class BaseProvider:
     name = "base"
     is_simulated = True
 
-    def interpret_table(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def interpret_table(self, payload: Mapping[str, Any], on_chunk=None):
         """Interpret a table-like payload. Implemented per provider."""
         raise NotImplementedError
 
@@ -36,7 +40,7 @@ class FixtureProvider(BaseProvider):
     name = "fixture"
     is_simulated = True
 
-    def interpret_table(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def interpret_table(self, payload: Mapping[str, Any], on_chunk=None):
         rows = payload.get("rows", []) if isinstance(payload, Mapping) else []
         if not isinstance(rows, list):
             rows = []
@@ -58,6 +62,46 @@ def _env_int(name: str, default: int) -> int:
     return value
 
 
+def _resolve_credentials(key_prefix: str) -> tuple[str, str]:
+    """Return (api_key, model): admin config first, environment fallback.
+
+    A disabled admin config refuses outright (the kill switch must not be
+    bypassable through env). A missing or incomplete admin row falls back
+    to OFFERFLOW_META_API_KEY / OFFERFLOW_META_MODEL with the original
+    checks. Database errors (e.g. table not yet migrated) also fall back
+    to env rather than breaking local commands.
+    """
+    try:
+        from organizations.models import AIProviderConfig
+
+        config = AIProviderConfig.get_solo()
+    except Exception:
+        config = None
+    if config is not None and not config.enabled:
+        raise ProviderNotConfigured("Paid dispatch disabled in admin.")
+    if config is not None and config.is_complete:
+        try:
+            key, model = config.credentials()
+        except Exception as exc:
+            from common.crypto import StoredKeyError
+
+            if isinstance(exc, StoredKeyError):
+                raise ProviderNotConfigured(str(exc)) from exc
+            raise
+        if not key.startswith(key_prefix):
+            raise ProviderNotConfigured("Stored API key format unexpected.")
+        return key, model
+    key = os.environ.get("OFFERFLOW_META_API_KEY", "")
+    if not key:
+        raise ProviderNotConfigured("No Meta API key configured.")
+    if not key.startswith(key_prefix):
+        raise ProviderNotConfigured("Meta API key format unexpected.")
+    model = (os.environ.get("OFFERFLOW_META_MODEL", "") or "").strip()
+    if not model:
+        raise ProviderNotConfigured("No Meta model configured.")
+    return key, model
+
+
 def get_provider(organization_id: int | None = None):
     """Return the configured provider, refusing anything unapproved."""
     requested = (os.environ.get("OFFERFLOW_PROVIDER", "fixture") or "").strip().lower()
@@ -70,14 +114,7 @@ def get_provider(organization_id: int | None = None):
             raise ProviderNotConfigured("Paid dispatch needs an organization.")
         if (os.environ.get("OFFERFLOW_ALLOW_PAID", "false") or "").lower() != "true":
             raise ProviderNotConfigured("Paid dispatch switch is off.")
-        key = os.environ.get("OFFERFLOW_META_API_KEY", "")
-        if not key:
-            raise ProviderNotConfigured("No Meta API key configured.")
-        if not key.startswith(KEY_PREFIX):
-            raise ProviderNotConfigured("Meta API key format unexpected.")
-        model = (os.environ.get("OFFERFLOW_META_MODEL", "") or "").strip()
-        if not model:
-            raise ProviderNotConfigured("No Meta model configured.")
+        key, model = _resolve_credentials(KEY_PREFIX)
         return MetaProvider(
             MetaConfig(
                 organization_id=organization_id,

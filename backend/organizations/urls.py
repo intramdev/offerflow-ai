@@ -9,6 +9,8 @@ from organizations.views import (
     InvitationCreateView,
     MemberListView,
     MembershipListView,
+    OrganizationSettingsView,
+    OrganizationUsageView,
     PreferenceView,
 )
 
@@ -25,6 +27,16 @@ urlpatterns = [
         "<int:organization_id>/members/",
         MemberListView.as_view(),
         name="members",
+    ),
+    path(
+        "<int:organization_id>/settings/",
+        OrganizationSettingsView.as_view(),
+        name="org-settings",
+    ),
+    path(
+        "<int:organization_id>/usage/",
+        OrganizationUsageView.as_view(),
+        name="org-usage",
     ),
     path("preferences/me/", PreferenceView.as_view(), name="preferences"),
 ]

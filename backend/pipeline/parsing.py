@@ -275,12 +275,17 @@ def _table_to_sheet(
     max_cols: int,
     header_scan_rows: int,
     column_overrides: dict | None = None,
+    column_constants: dict | None = None,
+    ignored_columns: list | None = None,
+    constant_sources: dict | None = None,
 ) -> ParsedSheet:
     """Run header scan plus row extraction over plain value rows.
 
     Rows are lists of (value, is_formula) pairs so every container shares
     one mapping core. Overrides map canonical names to header positions
-    and win over automatic detection.
+    and win over automatic detection. Constants stamp one raw value onto
+    every row (recorded as a manual source); ignored names are dropped
+    from the detected map.
     """
     header_index = None
     headers: list = []
@@ -319,6 +324,31 @@ def _table_to_sheet(
             sources[canonical] = "confirmed"
         if len(set(column_map.values())) != len(column_map):
             raise UnsupportedFile("The column mapping assigns one column twice.")
+    ignored = list(ignored_columns or [])
+    for canonical in ignored:
+        if canonical not in HEADER_TOKENS:
+            raise UnsupportedFile(f"Unknown column {canonical!r}.")
+    constants = dict(column_constants or {})
+    for canonical, value in constants.items():
+        if canonical not in HEADER_TOKENS:
+            raise UnsupportedFile(f"Unknown column {canonical!r}.")
+        if canonical in column_map and canonical not in ignored:
+            raise UnsupportedFile(
+                f"Column {canonical!r} has both a column and a set value."
+            )
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise UnsupportedFile(
+                f"Value for {canonical!r} must be text or a number."
+            )
+        if isinstance(value, str) and not value.strip():
+            raise UnsupportedFile(f"Value for {canonical!r} must not be blank.")
+    for canonical in ignored:
+        column_map.pop(canonical, None)
+        sources.pop(canonical, None)
+    labels = constant_sources or {}
+    for canonical in constants:
+        sources[canonical] = labels.get(canonical, "manual")
+
     def _extract() -> list:
         """Extract data rows with the final mapping (partial maps allowed)."""
         found: list = []
@@ -336,6 +366,8 @@ def _table_to_sheet(
                 value, is_formula = row[position] if position < len(row) else (None, False)
                 if is_formula:
                     formulas.append(canonical)
+                cells[canonical] = _json_safe(value)
+            for canonical, value in constants.items():
                 cells[canonical] = _json_safe(value)
             mapped_positions = set(column_map.values())
             extra: dict = {}
@@ -363,7 +395,11 @@ def _table_to_sheet(
         return found
 
     data = _extract()
-    missing = [name for name in REQUIRED_COLUMNS if name not in column_map]
+    missing = [
+        name
+        for name in REQUIRED_COLUMNS
+        if name not in column_map and name not in constants
+    ]
     if missing:
         raise MappingRequired(
             headers=headers,
@@ -389,6 +425,9 @@ def parse_xlsx(
     max_cols: int,
     header_scan_rows: int,
     column_overrides: dict | None = None,
+    column_constants: dict | None = None,
+    ignored_columns: list | None = None,
+    constant_sources: dict | None = None,
 ) -> ParsedSheet:
     """Parse the first visible worksheet into canonical raw rows."""
     try:
@@ -417,6 +456,9 @@ def parse_xlsx(
         max_cols=max_cols,
         header_scan_rows=header_scan_rows,
         column_overrides=column_overrides,
+        column_constants=column_constants,
+        ignored_columns=ignored_columns,
+        constant_sources=constant_sources,
     )
 
 
@@ -427,6 +469,9 @@ def parse_xls(
     max_cols: int,
     header_scan_rows: int,
     column_overrides: dict | None = None,
+    column_constants: dict | None = None,
+    ignored_columns: list | None = None,
+    constant_sources: dict | None = None,
 ) -> ParsedSheet:
     """Parse a legacy .xls workbook. Cached values are read as plain data;
     nothing is ever evaluated."""
@@ -458,6 +503,9 @@ def parse_xls(
         max_cols=max_cols,
         header_scan_rows=header_scan_rows,
         column_overrides=column_overrides,
+        column_constants=column_constants,
+        ignored_columns=ignored_columns,
+        constant_sources=constant_sources,
     )
 
 
@@ -493,6 +541,9 @@ def parse_delimited(
     max_cols: int,
     header_scan_rows: int,
     column_overrides: dict | None = None,
+    column_constants: dict | None = None,
+    ignored_columns: list | None = None,
+    constant_sources: dict | None = None,
     forced_delimiter: str | None = None,
 ) -> ParsedSheet:
     """Parse csv/txt/tsv bytes with a sniffed (or forced) delimiter."""
@@ -511,6 +562,9 @@ def parse_delimited(
         max_cols=max_cols,
         header_scan_rows=header_scan_rows,
         column_overrides=column_overrides,
+        column_constants=column_constants,
+        ignored_columns=ignored_columns,
+        constant_sources=constant_sources,
     )
 
 
@@ -521,6 +575,9 @@ def parse_docx(
     max_cols: int,
     header_scan_rows: int,
     column_overrides: dict | None = None,
+    column_constants: dict | None = None,
+    ignored_columns: list | None = None,
+    constant_sources: dict | None = None,
 ) -> ParsedSheet:
     """Parse the richest table of a .docx document.
 
@@ -546,6 +603,9 @@ def parse_docx(
                 max_cols=max_cols,
                 header_scan_rows=header_scan_rows,
                 column_overrides=column_overrides,
+        column_constants=column_constants,
+        ignored_columns=ignored_columns,
+        constant_sources=constant_sources,
             )
         except MappingRequired as exc:
             if best is None or len(exc.column_map) > len(best.column_map):
@@ -565,6 +625,9 @@ def parse_upload(
     max_cols: int,
     header_scan_rows: int,
     column_overrides: dict | None = None,
+    column_constants: dict | None = None,
+    ignored_columns: list | None = None,
+    constant_sources: dict | None = None,
 ) -> ParsedSheet:
     """Dispatch bytes to the reader matching the filename extension.
 
@@ -577,6 +640,9 @@ def parse_upload(
         "max_cols": max_cols,
         "header_scan_rows": header_scan_rows,
         "column_overrides": column_overrides,
+        "column_constants": column_constants,
+        "ignored_columns": ignored_columns,
+        "constant_sources": constant_sources,
     }
     if extension == ".xlsx":
         return parse_xlsx(content, **options)

@@ -7,6 +7,7 @@ from django.utils import timezone
 
 from pipeline.export import normalized_digest
 from pipeline.models import (
+    OfferStatus,
     ReviewDecision,
     ReviewKind,
     ReviewRequest,
@@ -122,7 +123,7 @@ def _answer_mapping(*, review: ReviewRequest, user, choice: str):
     """Record a column-mapping answer; reprocess once mapping is complete."""
     from organizations.context import set_tenant_context
 
-    from pipeline.jobs import record_audit, reprocess_run
+    from pipeline.jobs import enqueue_run, record_audit
     from pipeline.parsing import HEADER_TOKENS
 
     run = review.run
@@ -169,7 +170,7 @@ def _answer_mapping(*, review: ReviewRequest, user, choice: str):
     ).exists()
     if not still_open:
         transition_run(run, RunStatus.UPLOADED)
-        reprocess_run(run)
+        enqueue_run(run.id)
     return decision
 
 
@@ -243,6 +244,18 @@ def answer_request(*, review: ReviewRequest, user, choice: str = "", value=_MISS
             evidence={"provenance": provenance, "raw": raw_cells},
             choices=gap.get("choices", []),
         )
+    _settle_run(run, user)
+    record_audit(
+        run.organization_id, user, "review_answered", "review", review.id,
+        {"field": review.field},
+    )
+    return decision
+
+
+def _settle_run(run, user) -> None:
+    """Re-validate and park the run at ready or back at needs-input."""
+    from pipeline.jobs import record_audit
+
     transition_run(run, RunStatus.VALIDATION)
     passed, _results = run_validations(run)
     still_open = run.reviews.filter(status=ReviewStatus.OPEN).exists()
@@ -251,11 +264,56 @@ def answer_request(*, review: ReviewRequest, user, choice: str = "", value=_MISS
         record_audit(run.organization_id, user, "run_ready", "run", run.id)
     else:
         transition_run(run, RunStatus.NEEDS_INPUT)
+
+
+def ignore_request(*, review: ReviewRequest, user):
+    """Drop one record from the quote instead of answering its question.
+
+    The offer is excluded (it lands in the excluded export sheet, never
+    the quote) and every open question on that record is resolved as
+    ignored. File-wide mapping questions cannot be ignored: without a
+    mapping there is no import at all.
+    """
+    from pipeline.jobs import record_audit
+
+    if review.status != ReviewStatus.OPEN:
+        raise ValidationError("That review request is already answered.")
+    if review.offer_id is None:
+        raise ValidationError(
+            "Mapping questions cannot be ignored; the import needs a mapping."
+        )
+    run = review.run
+    from organizations.context import set_tenant_context
+
+    set_tenant_context(run.organization_id, user.id if user is not None else 0)
+    if run.status != RunStatus.NEEDS_INPUT:
+        raise ValidationError("That run is not awaiting input.")
+    offer = review.offer
+    actor = getattr(user, "username", None) or "reviewer"
+    offer.status = OfferStatus.EXCLUDED
+    offer.exclusion_reason = f"Record ignored by {actor}."
+    offer.save()
+    resolved = 0
+    for open_review in run.reviews.filter(
+        offer=offer, status=ReviewStatus.OPEN
+    ):
+        open_review.status = ReviewStatus.ANSWERED
+        open_review.resolved_at = timezone.now()
+        open_review.save(update_fields=["status", "resolved_at"])
+        ReviewDecision.objects.create(
+            organization_id=run.organization_id,
+            request=open_review,
+            decided_by=user,
+            choice="",
+            value={"ignored": True},
+        )
+        resolved += 1
+    _settle_run(run, user)
     record_audit(
-        run.organization_id, user, "review_answered", "review", review.id,
-        {"field": review.field},
+        run.organization_id, user, "review_ignored", "offer", offer.id,
+        {"resolved": resolved},
     )
-    return decision
+    return offer
 
 
 def approve_run(*, run, user):

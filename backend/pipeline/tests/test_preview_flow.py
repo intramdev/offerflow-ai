@@ -184,23 +184,56 @@ class PreviewFlowTests(TestCase):
         self.assertTrue(all(review.offer_id is None for review in reviews))
         self.assertIn("Fornitore (A)", reviews[1].choices)
 
-        answer1 = self.client.post(
-            f"/api/pipeline/reviews/{reviews[1].id}/answer/",
-            {"choice": "Fornitore (A)"},
-            format="json",
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            answer1 = self.client.post(
+                f"/api/pipeline/reviews/{reviews[1].id}/answer/",
+                {"choice": "Fornitore (A)"},
+                format="json",
+            )
         self.assertEqual(answer1.status_code, 200, answer1.content)
-        answer2 = self.client.post(
-            f"/api/pipeline/reviews/{reviews[0].id}/answer/",
-            {"choice": "Prezzo (C)"},
-            format="json",
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            answer2 = self.client.post(
+                f"/api/pipeline/reviews/{reviews[0].id}/answer/",
+                {"choice": "Prezzo (C)"},
+                format="json",
+            )
         self.assertEqual(answer2.status_code, 200, answer2.content)
         detail = self.client.get(f"/api/pipeline/runs/{run_id}/")
         self.assertEqual(detail.data["status"], RunStatus.NEEDS_INPUT)
         offers = self.client.get(f"/api/pipeline/runs/{run_id}/offers/")
         self.assertEqual(len(offers.data), 1)
         self.assertEqual(offers.data[0]["supplier"], "Acme")
+
+    def test_ignore_endpoint_drops_record(self):
+        from pipeline.models import OfferStatus
+        from pipeline.tests.test_flow import MIXED_ROWS
+
+        upload = self._upload(self.alice, self.org_a, MIXED_ROWS)
+        run_id = upload.data["id"]
+        reviews = self.client.get(f"/api/pipeline/runs/{run_id}/reviews/")
+        target = next(
+            item for item in reviews.data if item["field"] == "unit_price"
+        )
+        self.assertIsNotNone(target["offer"])
+        response = self.client.post(
+            f"/api/pipeline/reviews/{target['id']}/ignore/"
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.data["offer"], target["offer"])
+        remaining = self.client.get(f"/api/pipeline/runs/{run_id}/reviews/")
+        self.assertEqual(len(remaining.data), 1)
+        offer = ReviewRequest.objects.get(pk=target["id"]).offer
+        self.assertEqual(offer.status, OfferStatus.EXCLUDED)
+
+    def test_ignore_endpoint_refuses_mapping_questions(self):
+        upload = self._upload(self.alice, self.org_a, [ODD_HEADERS, odd_row()])
+        run_id = upload.data["id"]
+        review = ReviewRequest.objects.get(
+            run_id=run_id, field="mapping:supplier"
+        )
+        response = self.client.post(f"/api/pipeline/reviews/{review.id}/ignore/")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Mapping", response.data["detail"])
 
     def test_mapping_answer_rejects_double_booking(self):
         upload = self._upload(self.alice, self.org_a, [ODD_HEADERS, odd_row()])
@@ -221,16 +254,102 @@ class PreviewFlowTests(TestCase):
         run_id = confirm.data["id"]
         detail = self.client.get(f"/api/pipeline/runs/{run_id}/")
         self.assertEqual(detail.data["status"], RunStatus.READY_FOR_REVIEW)
-        response = self.client.post(
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/pipeline/runs/{run_id}/remap/",
+                {"mapping": {"supplier": 0, "model": 2, "price": 8}},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.data["id"], run_id)
+        # The request returns at once; the worker reprocesses after commit.
+        self.assertEqual(response.data["status"], RunStatus.UPLOADED)
+        detail = self.client.get(f"/api/pipeline/runs/{run_id}/")
+        self.assertEqual(detail.data["status"], RunStatus.READY_FOR_REVIEW)
+        memory = ColumnMappingMemory.objects.get()
+        self.assertEqual(memory.mapping["price"], 8)
+
+    def test_remap_completed_run_discards_exports(self):
+        preview = self._preview(self.alice, self.org_a, [HEADERS, complete_row()])
+        confirm = self._confirm(preview.data["key"], {})
+        run_id = confirm.data["id"]
+        self.assertEqual(
+            self.client.post(f"/api/pipeline/runs/{run_id}/approve/").status_code, 200
+        )
+        export = self.client.post(
+            f"/api/pipeline/runs/{run_id}/export/", {"format": "csv"}, format="json"
+        )
+        self.assertEqual(export.status_code, 201, export.content)
+        artifact_id = export.data["id"]
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/pipeline/runs/{run_id}/remap/",
+                {
+                    "mapping": {},
+                    "constants": {"supplier": "Fixed Co"},
+                    "ignored": ["supplier"],
+                },
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.data["status"], RunStatus.UPLOADED)
+        detail = self.client.get(f"/api/pipeline/runs/{run_id}/")
+        self.assertEqual(detail.data["status"], RunStatus.READY_FOR_REVIEW)
+        from pipeline.models import AuditEvent, ExportArtifact
+
+        self.assertEqual(ExportArtifact.objects.count(), 0)
+        self.assertEqual(
+            self.client.get(
+                f"/api/pipeline/artifacts/{artifact_id}/download/"
+            ).status_code,
+            404,
+        )
+        offers = self.client.get(f"/api/pipeline/runs/{run_id}/offers/")
+        self.assertEqual(offers.data[0]["supplier"], "Fixed Co")
+        audit = AuditEvent.objects.get(
+            organization=self.org_a, action="run_remapped"
+        )
+        self.assertEqual(audit.metadata["from_status"], RunStatus.COMPLETED)
+
+    def test_remap_approved_run_restarts_review(self):
+        preview = self._preview(self.alice, self.org_a, [HEADERS, complete_row()])
+        confirm = self._confirm(preview.data["key"], {})
+        run_id = confirm.data["id"]
+        self.client.post(f"/api/pipeline/runs/{run_id}/approve/")
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/pipeline/runs/{run_id}/remap/",
+                {"mapping": {"supplier": 0, "model": 2, "price": 8}},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.data["status"], RunStatus.UPLOADED)
+        detail = self.client.get(f"/api/pipeline/runs/{run_id}/")
+        self.assertEqual(detail.data["status"], RunStatus.READY_FOR_REVIEW)
+
+    def test_remap_refused_while_processing_or_cancelled(self):
+        from pipeline.models import ImportRun
+
+        preview = self._preview(self.alice, self.org_a, [HEADERS, complete_row()])
+        run_id = self._confirm(preview.data["key"], {}).data["id"]
+        run = ImportRun.objects.get(pk=run_id)
+        run.status = RunStatus.PARSING
+        run.save(update_fields=["status"])
+        refused = self.client.post(
             f"/api/pipeline/runs/{run_id}/remap/",
             {"mapping": {"supplier": 0, "model": 2, "price": 8}},
             format="json",
         )
-        self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(response.data["id"], run_id)
-        self.assertEqual(response.data["status"], RunStatus.READY_FOR_REVIEW)
-        memory = ColumnMappingMemory.objects.get()
-        self.assertEqual(memory.mapping["price"], 8)
+        self.assertEqual(refused.status_code, 400)
+        run.status = RunStatus.READY_FOR_REVIEW
+        run.save(update_fields=["status"])
+        self.client.post(f"/api/pipeline/runs/{run_id}/cancel/")
+        refused = self.client.post(
+            f"/api/pipeline/runs/{run_id}/remap/",
+            {"mapping": {"supplier": 0, "model": 2, "price": 8}},
+            format="json",
+        )
+        self.assertEqual(refused.status_code, 400)
 
     def test_remap_requires_complete_mapping(self):
         preview = self._preview(self.alice, self.org_a, [HEADERS, complete_row()])
@@ -262,7 +381,7 @@ class PreviewFlowTests(TestCase):
 
     def test_delete_removes_file_run_and_bytes(self):
         preview = self._preview(self.alice, self.org_a, [HEADERS, complete_row()])
-        confirm = self._confirm(preview.data["key"], {})
+        self._confirm(preview.data["key"], {})
         source_file = SourceFile.objects.get()
         import os
 

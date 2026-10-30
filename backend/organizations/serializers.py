@@ -48,3 +48,34 @@ class PreferenceSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserPreference
         fields = ["datetime_format"]
+
+
+def _clean_currency_code(value) -> str:
+    from pipeline.normalize import parse_currency
+
+    text = (value or "").strip()
+    if not text:
+        return ""
+    code = parse_currency(text)
+    if code is None:
+        raise serializers.ValidationError(
+            "Enter a three-letter currency code such as USD, EUR, or CZK."
+        )
+    return code
+
+
+class OrganizationSettingsSerializer(serializers.Serializer):
+    """Shared organization settings (member read, operating write)."""
+
+    default_currency = serializers.CharField(
+        max_length=3, allow_blank=True, required=False, default=""
+    )
+    destination_currency = serializers.CharField(
+        max_length=3, allow_blank=True, required=False, default=""
+    )
+
+    def validate_default_currency(self, value):
+        return _clean_currency_code(value)
+
+    def validate_destination_currency(self, value):
+        return _clean_currency_code(value)

@@ -36,6 +36,8 @@ class Organization(models.Model):
     """An independent customer organization (the tenant)."""
 
     name = models.CharField(max_length=255)
+    default_currency = models.CharField(max_length=3, blank=True, default="")
+    destination_currency = models.CharField(max_length=3, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -127,6 +129,49 @@ class Invitation(models.Model):
 class DateTimeFormat(models.TextChoices):
     US = "us", "US (MM/DD/YYYY)"
     EUROPEAN = "eu", "European (DD/MM/YYYY)"
+
+
+class AIProviderConfig(models.Model):
+    """Singleton: the shared model account for every company.
+
+    The API key is Fernet-encrypted at rest (see common.crypto) and is
+    never rendered back; admin only reports whether one is stored. When
+    this row is complete and enabled it takes precedence over the
+    OFFERFLOW_META_* environment variables, which remain as fallback so
+    local development and tests keep working without a database row.
+    """
+
+    enabled = models.BooleanField(default=True)
+    api_key_encrypted = models.TextField(blank=True, default="")
+    model = models.CharField(max_length=128, blank=True, default="")
+    default_monthly_credits = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "AI provider config"
+
+    def __str__(self):  # pragma: no cover - display only
+        return f"AI provider config (model={self.model or 'unset'})"
+
+    @classmethod
+    def get_solo(cls):
+        return cls.objects.order_by("pk").first()
+
+    @property
+    def has_key(self) -> bool:
+        return bool(self.api_key_encrypted)
+
+    @property
+    def is_complete(self) -> bool:
+        return bool(self.api_key_encrypted and self.model.strip())
+
+    def credentials(self):
+        """Return (api_key, model), decrypting only at dispatch time."""
+        from common.crypto import StoredKeyError, decrypt_key
+
+        if not self.is_complete:
+            raise StoredKeyError("AI provider config is incomplete.")
+        return decrypt_key(self.api_key_encrypted), self.model.strip()
 
 
 class UserPreference(models.Model):

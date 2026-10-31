@@ -153,9 +153,20 @@ export default function HelpPage() {
       <Section id="quotes" title="Quotes & export">
         <P>
           A quote is generated from the latest approved supplier data with
-          your rules applied. Download it as XLSX or CSV, copy the
-          per-category message for Telegram, or send both together.
+          your rules applied. The list shows the newest first, 50 per page.
+          Open a ready quote to rewrite any product&apos;s customer-facing
+          text — delete stray words from supplier names — or hide whole
+          lines; prices and sources stay frozen. Download it as XLSX or CSV,
+          copy the per-category message for Telegram, or send both together.
         </P>
+        <Note>
+          <strong>Settings → Quote exports</strong> decides what customers
+          see: the file columns, which details appear in each message row,
+          and a custom header and footer. Supplier names are sourcing
+          intelligence and stay out of customer files and messages unless
+          you opt them back in. Changes apply to existing quotes too, at
+          download and message time.
+        </Note>
       </Section>
 
       <Section id="suppliers" title="Suppliers">

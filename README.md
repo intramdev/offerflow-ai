@@ -1,6 +1,6 @@
 # OfferFlow AI
 
-**Beta — version 0.3.0.** Simulated-first and fully usable with no model
+**Beta — version 0.4.0.** Simulated-first and fully usable with no model
 key; paid Muse features activate per company with credits.
 
 Supplier information arrives in messy spreadsheets and documents. OfferFlow AI
@@ -76,6 +76,14 @@ for it.
 - **Password recovery** — email links, single-use, 30 minutes, throttled;
   super admins can also reset a user password from the backend.
 - **Help center** — the in-app Help item documents every screen.
+- **Quote line editing** — rewrite any ready quote's customer-facing
+  product text or hide whole lines; labels apply to files and the
+  Telegram message while prices and sources stay frozen.
+- **Quote export template** — per-company settings choose the XLSX/CSV
+  columns, the message rows' details, and a custom header and footer.
+  Supplier names stay out of customer outputs unless opted back in.
+- **Quote pagination** — the quote list shows the newest first, 50 per
+  page, with first/previous/numbered/next/last navigation.
 
 ## Without AI vs with a Muse key
 

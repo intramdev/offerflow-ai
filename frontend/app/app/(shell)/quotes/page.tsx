@@ -6,12 +6,13 @@ import * as React from "react";
 
 import { ErrorNotice } from "@/components/app/error-notice";
 import { useOrg } from "@/components/app/org-context";
+import { Pager } from "@/components/app/pager";
 import { StatusBadge } from "@/components/app/status-badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   ApiError,
-  listCustomerQuotes,
+  listCustomerQuotesPage,
   startCustomerQuote,
   type CustomerQuote,
 } from "@/lib/api";
@@ -21,20 +22,36 @@ export default function QuotesPage() {
   const { active, prefs, canOperate } = useOrg();
   const router = useRouter();
   const [quotes, setQuotes] = React.useState<CustomerQuote[] | null>(null);
+  const [page, setPage] = React.useState(1);
+  const [pages, setPages] = React.useState(1);
+  const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
   const [busy, setBusy] = React.useState(false);
 
-  const reload = React.useCallback(async () => {
-    if (!active) return;
-    try {
-      setQuotes(await listCustomerQuotes(active.organization));
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not load quotes.");
-    }
-  }, [active]);
+  const reload = React.useCallback(
+    async (wanted: number) => {
+      if (!active) return;
+      setLoading(true);
+      try {
+        const paged = await listCustomerQuotesPage(
+          active.organization,
+          wanted,
+        );
+        setQuotes(paged.results);
+        setPage(paged.page);
+        setPages(paged.pages);
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : "Could not load quotes.");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [active],
+  );
 
   React.useEffect(() => {
-    void reload();
+    setPage(1);
+    void reload(1);
   }, [reload]);
 
   async function generate() {
@@ -58,7 +75,7 @@ export default function QuotesPage() {
           <p className="mt-1 text-sm text-muted-foreground">
             Match the latest approved run per supplier into products, reconcile
             the uncertain ones, then generate the price list and its Telegram
-            message.
+            message. Newest first, 50 per page.
           </p>
         </div>
         {canOperate ? (
@@ -74,7 +91,7 @@ export default function QuotesPage() {
         <CardHeader>
           <CardTitle>Quotes</CardTitle>
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-4">
           {quotes === null ? (
             <p className="text-sm text-muted-foreground">Loading quotes…</p>
           ) : quotes.length === 0 ? (
@@ -111,6 +128,15 @@ export default function QuotesPage() {
               ))}
             </ul>
           )}
+          {quotes !== null && quotes.length > 0 ? (
+            <Pager
+              page={page}
+              total={pages}
+              onPage={(wanted) => void reload(wanted)}
+              label="Quotes pages"
+              busy={loading}
+            />
+          ) : null}
         </CardContent>
       </Card>
     </div>

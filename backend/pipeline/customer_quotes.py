@@ -38,9 +38,205 @@ from pipeline.models import (
     SourceFile,
     SupplierStrategy,
 )
-from pipeline.quotes import _apply_ops, _file_fx, _winning_rule
+from pipeline.quotes import (
+    DEFAULT_EXPORT_COLUMNS,
+    QUOTE_COLUMN_KEYS,
+    _apply_ops,
+    _file_fx,
+    _winning_rule,
+)
 
 QUOTEABLE_STATUSES = (RunStatus.APPROVED, RunStatus.COMPLETED)
+
+#: Columns a customer price list cannot drop: without a product or a
+#: price the file is not a quote.
+REQUIRED_EXPORT_COLUMNS = ("model", "price")
+
+#: Longest customer-facing label or message header/footer line.
+MAX_LABEL_CHARS = 200
+
+#: Per-company export template when nothing was customized yet: the
+#: sourcing (supplier) column is intelligence and stays out of
+#: customer files and messages until the company opts it back in.
+DEFAULT_QUOTE_TEMPLATE = {
+    "file_columns": list(DEFAULT_EXPORT_COLUMNS),
+    "message_show_capacity": True,
+    "message_show_grade": True,
+    "message_show_quantity": False,
+    "message_show_categories": True,
+    "message_header": "",
+    "message_footer": "",
+}
+
+
+def effective_template(organization) -> dict:
+    """The company's export template with defaults filled in.
+
+    Unknown stored keys are ignored (older templates keep working);
+    callers validating user input want clean_quote_export instead.
+    """
+    stored = getattr(organization, "quote_export", None) or {}
+    merged = dict(DEFAULT_QUOTE_TEMPLATE)
+    if isinstance(stored, dict):
+        for key, value in stored.items():
+            if key in merged:
+                merged[key] = value
+    raw_columns = merged["file_columns"]
+    if not isinstance(raw_columns, list):
+        raw_columns = []
+    columns = [key for key in raw_columns if key in QUOTE_COLUMN_KEYS]
+    for required in REQUIRED_EXPORT_COLUMNS:
+        if required not in columns:
+            columns.append(required)
+    merged["file_columns"] = columns
+    for key in (
+        "message_show_capacity",
+        "message_show_grade",
+        "message_show_quantity",
+        "message_show_categories",
+    ):
+        merged[key] = bool(merged[key])
+    for key in ("message_header", "message_footer"):
+        text = merged[key]
+        merged[key] = text if isinstance(text, str) else ""
+    return merged
+
+
+def _clean_template_text(value, *, label: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValidationError(f"{label} must be text.")
+    text = " ".join(value.split())
+    if len(text) > MAX_LABEL_CHARS:
+        raise ValidationError(
+            f"{label} must be {MAX_LABEL_CHARS} characters or fewer."
+        )
+    return text
+
+
+def clean_quote_export(value) -> dict:
+    """Validate a full export template from the settings form.
+
+    Loud about every problem: unknown keys, unknown/duplicated
+    columns, a dropped required column, non-boolean toggles.
+    """
+    if not isinstance(value, dict):
+        raise ValidationError("The export template must be an object.")
+    unknown = sorted(set(value) - set(DEFAULT_QUOTE_TEMPLATE))
+    if unknown:
+        raise ValidationError(
+            f"Unknown template keys: {', '.join(unknown)}."
+        )
+    columns = value.get("file_columns", DEFAULT_QUOTE_TEMPLATE["file_columns"])
+    if not isinstance(columns, list) or not columns:
+        raise ValidationError("Pick at least one file column.")
+    unknown_columns = sorted(
+        {key for key in columns if key not in QUOTE_COLUMN_KEYS}
+    )
+    if unknown_columns:
+        raise ValidationError(
+            f"Unknown file columns: {', '.join(unknown_columns)}."
+        )
+    if len(set(columns)) != len(columns):
+        raise ValidationError("File columns must not repeat.")
+    missing = [key for key in REQUIRED_EXPORT_COLUMNS if key not in columns]
+    if missing:
+        raise ValidationError(
+            f"A quote file needs these columns: {', '.join(missing)}."
+        )
+    cleaned = {"file_columns": list(columns)}
+    for key in (
+        "message_show_capacity",
+        "message_show_grade",
+        "message_show_quantity",
+        "message_show_categories",
+    ):
+        flag = value.get(key, DEFAULT_QUOTE_TEMPLATE[key])
+        if not isinstance(flag, bool):
+            raise ValidationError(f"{key} must be true or false.")
+        cleaned[key] = flag
+    cleaned["message_header"] = _clean_template_text(
+        value.get("message_header", ""), label="The message header"
+    )
+    cleaned["message_footer"] = _clean_template_text(
+        value.get("message_footer", ""), label="The message footer"
+    )
+    return cleaned
+
+
+def clean_line_edits(value, *, line_count: int) -> dict:
+    """Validate per-line presentation overrides for a ready quote.
+
+    Shape: {"0": {"label": "iPhone 15", "hidden": false}}. Indexes
+    must point at frozen lines; labels rename the customer-facing
+    product text (empty labels are refused — hide the line instead).
+    Returns the normalized edits map.
+    """
+    if not isinstance(value, dict):
+        raise ValidationError("Line edits must be an object.")
+    cleaned = {}
+    for raw_index, edit in value.items():
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            raise ValidationError(
+                f"Line {raw_index!r} is not a line number."
+            ) from None
+        if index < 0 or index >= line_count:
+            raise ValidationError(f"Line {index} does not exist.")
+        if not isinstance(edit, dict):
+            raise ValidationError(f"Line {index} must be an object.")
+        unknown = sorted(set(edit) - {"label", "hidden"})
+        if unknown:
+            raise ValidationError(
+                f"Line {index}: unknown keys {', '.join(unknown)}."
+            )
+        label = edit.get("label")
+        if label is None:
+            label = None
+        elif not isinstance(label, str) or not label.strip():
+            raise ValidationError(
+                f"Line {index}: the label needs words, or hide the line."
+            )
+        elif len(label.strip()) > MAX_LABEL_CHARS:
+            raise ValidationError(
+                f"Line {index}: the label must be "
+                f"{MAX_LABEL_CHARS} characters or fewer."
+            )
+        else:
+            label = " ".join(label.split())
+        hidden = edit.get("hidden", False)
+        if not isinstance(hidden, bool):
+            raise ValidationError(f"Line {index}: hidden must be true or false.")
+        if label is None and not hidden:
+            continue
+        cleaned[str(index)] = {"label": label, "hidden": hidden}
+    return cleaned
+
+
+def present_lines(*, lines: list, edits: dict | None) -> list:
+    """Frozen lines as the customer sees them: labels applied.
+
+    Hidden lines stay in place with hidden=True so callers can show
+    them greyed out (internal view) or drop them (files/messages).
+    """
+    edits = edits if isinstance(edits, dict) else {}
+    presented = []
+    for index, line in enumerate(lines):
+        edit = edits.get(str(index)) or {}
+        shown = dict(line)
+        label = edit.get("label")
+        if label:
+            shown["model"] = label
+        shown["hidden"] = bool(edit.get("hidden", False))
+        presented.append(shown)
+    return presented
+
+
+def export_lines(*, lines: list, edits: dict | None) -> list:
+    """Lines for files and messages: labels applied, hidden dropped."""
+    return [line for line in present_lines(lines=lines, edits=edits) if not line["hidden"]]
 
 
 def collect_quote_offers(organization) -> tuple[list, list[int]]:
@@ -148,6 +344,7 @@ def build_customer_quote(*, organization, decisions: list) -> dict:
             organization_name=organization.name,
             day=timezone.localdate(),
             lines=lines,
+            template=effective_template(organization),
         ),
     }
 
@@ -340,14 +537,24 @@ def _display_price(value: str) -> str:
         return value
 
 
-def render_message(*, organization_name: str, day, lines: list) -> str:
+def render_message(
+    *, organization_name: str, day, lines: list, template: dict | None = None
+) -> str:
     """Render quote lines as plain Telegram-ready message text.
 
     Lines carrying categories group under one header per category
     (uncategorized lines trail under "Other"); without categories
-    the message stays the familiar flat list.
+    the message stays the familiar flat list. template carries the
+    company's toggles (capacity/grade/quantity parts, category
+    sections, custom header/footer); None renders the classic shape.
     """
-    head = f"Quote — {organization_name} — {day.isoformat()}"
+    template = template or {}
+    show_capacity = template.get("message_show_capacity", True)
+    show_grade = template.get("message_show_grade", True)
+    show_quantity = template.get("message_show_quantity", False)
+    show_sections = template.get("message_show_categories", True)
+    head = template.get("message_header") or f"Quote — {organization_name} — {day.isoformat()}"
+    footer = template.get("message_footer") or ""
     rows = [head]
 
     def _row(line) -> str:
@@ -356,25 +563,35 @@ def render_message(*, organization_name: str, day, lines: list) -> str:
             for part in (
                 line["brand"],
                 line["model"],
-                f"{line['capacity_gb']}GB" if line["capacity_gb"] is not None else "",
+                (
+                    f"{line['capacity_gb']}GB"
+                    if show_capacity and line["capacity_gb"] is not None
+                    else ""
+                ),
             )
             if part
         )
-        if line["grade"]:
+        if show_grade and line["grade"]:
             title += f" ({line['grade']})"
-        return f"{title} — {line['currency']} {_display_price(line['unit_price'])}"
+        text = f"{title} — {line['currency']} {_display_price(line['unit_price'])}"
+        if show_quantity and line.get("quantity") is not None:
+            text += f" ×{line['quantity']}"
+        return text
 
-    if not any(line.get("category_name") for line in lines):
+    if show_sections and any(line.get("category_name") for line in lines):
+        section = None
+        for line in lines:
+            name = line.get("category_name") or "Other"
+            if name != section:
+                section = name
+                rows.append("")
+                rows.append(f"{section}:")
+            rows.append(_row(line))
+    else:
         rows.extend(_row(line) for line in lines)
-        return "\n".join(rows)
-    section = None
-    for line in lines:
-        name = line.get("category_name") or "Other"
-        if name != section:
-            section = name
-            rows.append("")
-            rows.append(f"{section}:")
-        rows.append(_row(line))
+    if footer:
+        rows.append("")
+        rows.append(footer)
     return "\n".join(rows)
 
 
@@ -448,6 +665,37 @@ def confirm_customer_quote(*, quote: CustomerQuote, user, decisions: list) -> Cu
         "quote",
         quote.id,
         {"groups": learned["groups"], "lines": len(result["lines"])},
+    )
+    return quote
+
+
+def update_quote_lines(*, quote: CustomerQuote, user, edits: dict) -> CustomerQuote:
+    """Replace a ready quote's line presentation overrides.
+
+    Operating roles only; audited. Labels and hidden flags change
+    what customers see in files and messages; frozen prices and
+    sources are untouched.
+    """
+    from organizations.services import require_organization_role
+
+    from pipeline.jobs import record_audit
+
+    require_organization_role(user, quote.organization_id)
+    if quote.status != QuoteStatus.READY:
+        raise ValidationError(
+            "Confirm the product groups before editing lines."
+        )
+    quote.line_edits = clean_line_edits(
+        edits, line_count=len(quote.lines or [])
+    )
+    quote.save(update_fields=["line_edits"])
+    record_audit(
+        quote.organization_id,
+        user,
+        "quote_lines_edited",
+        "quote",
+        quote.id,
+        {"edited": len(quote.line_edits)},
     )
     return quote
 

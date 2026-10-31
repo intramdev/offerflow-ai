@@ -629,8 +629,10 @@ class CustomerQuote(models.Model):
 
     source_run_ids freezes which supplier runs fed the quote; groups
     snapshots the confirmed product groups; lines/notes/message are the
-    rendered outputs. Files and messages render from the stored lines,
-    so a quote never changes under a customer after generation.
+    rendered outputs. line_edits holds per-line presentation overrides
+    (customer-facing label, hidden flag) keyed by frozen line index;
+    files and messages apply them live, while prices and sources stay
+    frozen.
     """
 
     organization = models.ForeignKey(
@@ -655,6 +657,7 @@ class CustomerQuote(models.Model):
         blank=True,
         related_name="created_quotes",
     )
+    line_edits = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

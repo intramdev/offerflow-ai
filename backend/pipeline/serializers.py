@@ -295,6 +295,12 @@ class QuoteConfirmSerializer(serializers.Serializer):
     )
 
 
+class QuoteLinesSerializer(serializers.Serializer):
+    edits = serializers.DictField(
+        child=serializers.DictField(), allow_empty=True
+    )
+
+
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
@@ -404,6 +410,7 @@ class CustomerQuoteSerializer(serializers.ModelSerializer):
             "sources",
             "groups",
             "lines",
+            "line_edits",
             "notes",
             "message",
             "provider_name",

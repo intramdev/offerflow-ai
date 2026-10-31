@@ -32,6 +32,36 @@ QUOTE_COLUMNS = [
     "Rule",
 ]
 
+#: Customer-facing column vocabulary for export templates: key -> header.
+#: Order here is the default column order; the "supplier" column
+#: carries sourcing intelligence and ships hidden in the default
+#: template (the company can re-enable it explicitly).
+QUOTE_COLUMN_KEYS = (
+    "brand",
+    "model",
+    "capacity",
+    "grade",
+    "supplier",
+    "quantity",
+    "price",
+    "currency",
+    "rule",
+    "category",
+)
+QUOTE_COLUMN_HEADERS = {
+    "brand": "Brand",
+    "model": "Model",
+    "capacity": "Capacity GB",
+    "grade": "Grade",
+    "supplier": "Supplier",
+    "quantity": "Quantity",
+    "price": "Unit Price",
+    "currency": "Currency",
+    "rule": "Rule",
+    "category": "Category",
+}
+DEFAULT_EXPORT_COLUMNS = [key for key in QUOTE_COLUMN_KEYS if key != "supplier"]
+
 
 def _decimal(value, message: str) -> Decimal:
     try:
@@ -344,61 +374,95 @@ def _cell(value):
     return value
 
 
-def render_quote_csv(quote: dict, *, include_category: bool = False) -> bytes:
+def _quote_cells(line: dict, *, numbers: bool) -> dict:
+    """One quote line as template column key -> rendered cell."""
+    price = line["unit_price"]
+    capacity = line["capacity_gb"]
+    quantity = line["quantity"]
+    if numbers:
+        price = float(price)
+    else:
+        capacity = _cell(capacity)
+        quantity = _cell(quantity)
+    return {
+        "brand": sanitize_cell(line["brand"]),
+        "model": sanitize_cell(line["model"]),
+        "capacity": capacity,
+        "grade": sanitize_cell(line["grade"]),
+        "supplier": sanitize_cell(line["supplier"]),
+        "quantity": quantity,
+        "price": price,
+        "currency": sanitize_cell(line["currency"]),
+        "rule": sanitize_cell(line["rule"] or ""),
+        "category": sanitize_cell(line.get("category_name") or ""),
+    }
+
+
+def _render_columns(columns: list | None, *, include_category: bool) -> list:
+    """Resolve the header keys for a render.
+
+    None keeps the legacy layout (QUOTE_COLUMNS plus an optional
+    trailing Category); an explicit key list is used as given.
+    Unknown keys are refused loudly — never dropped silently.
+    """
+    if columns is None:
+        keys = ["brand", "model", "capacity", "grade", "supplier",
+                "quantity", "price", "currency", "rule"]
+        if include_category:
+            keys.append("category")
+        return keys
+    unknown = [key for key in columns if key not in QUOTE_COLUMN_HEADERS]
+    if unknown:
+        raise ValidationError(
+            f"Unknown quote columns: {', '.join(sorted(set(unknown)))}."
+        )
+    return list(columns)
+
+
+def render_quote_csv(
+    quote: dict,
+    *,
+    include_category: bool = False,
+    columns: list | None = None,
+) -> bytes:
     """Render quote lines as CSV bytes.
 
     include_category appends a trailing Category column for quotes
     whose lines carry categories; per-run quotes stay untouched.
+    columns selects an explicit template key list instead.
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    columns = QUOTE_COLUMNS + (["Category"] if include_category else [])
-    writer.writerow(columns)
+    keys = _render_columns(columns, include_category=include_category)
+    writer.writerow([QUOTE_COLUMN_HEADERS[key] for key in keys])
     for line in quote["lines"]:
-        row = [
-            sanitize_cell(line["brand"]),
-            sanitize_cell(line["model"]),
-            _cell(line["capacity_gb"]),
-            sanitize_cell(line["grade"]),
-            sanitize_cell(line["supplier"]),
-            _cell(line["quantity"]),
-            line["unit_price"],
-            sanitize_cell(line["currency"]),
-            sanitize_cell(line["rule"] or ""),
-        ]
-        if include_category:
-            row.append(sanitize_cell(line.get("category_name") or ""))
-        writer.writerow(row)
+        cells = _quote_cells(line, numbers=False)
+        writer.writerow([cells[key] for key in keys])
     return buffer.getvalue().encode("utf-8")
 
 
-def render_quote_xlsx(quote: dict, *, include_category: bool = False) -> bytes:
+def render_quote_xlsx(
+    quote: dict,
+    *,
+    include_category: bool = False,
+    columns: list | None = None,
+) -> bytes:
     """Render quote lines as xlsx bytes (prices as numbers).
 
     include_category appends a trailing Category column for quotes
     whose lines carry categories; per-run quotes stay untouched.
+    columns selects an explicit template key list instead.
     """
     from openpyxl import Workbook
 
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Quote"
-    sheet.append(QUOTE_COLUMNS + (["Category"] if include_category else []))
+    keys = _render_columns(columns, include_category=include_category)
+    sheet.append([QUOTE_COLUMN_HEADERS[key] for key in keys])
     for line in quote["lines"]:
-        row = [
-            sanitize_cell(line["brand"]),
-            sanitize_cell(line["model"]),
-            line["capacity_gb"],
-            sanitize_cell(line["grade"]),
-            sanitize_cell(line["supplier"]),
-            line["quantity"],
-            float(line["unit_price"]),
-            sanitize_cell(line["currency"]),
-            sanitize_cell(line["rule"] or ""),
-        ]
-        if include_category:
-            row.append(sanitize_cell(line.get("category_name") or ""))
-        sheet.append(row)
+        cells = _quote_cells(line, numbers=True)
+        sheet.append([cells[key] for key in keys])
     buffer = io.BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()

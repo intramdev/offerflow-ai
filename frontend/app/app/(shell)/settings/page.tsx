@@ -16,10 +16,37 @@ import {
   saveBlob,
   updateOrgSettings,
   updatePreferences,
+  type QuoteExportTemplate,
 } from "@/lib/api";
 import { formatDateTime, type DateTimeFormat } from "@/lib/format";
 
 const EXAMPLE = "2026-10-30T16:54:00+00:00";
+
+const FILE_COLUMNS: { key: string; label: string; locked?: boolean; hint?: string }[] = [
+  { key: "brand", label: "Brand" },
+  { key: "model", label: "Model", locked: true },
+  { key: "capacity", label: "Capacity GB" },
+  { key: "grade", label: "Grade" },
+  { key: "supplier", label: "Supplier", hint: "Sourcing intelligence — hidden by default" },
+  { key: "quantity", label: "Quantity" },
+  { key: "price", label: "Unit Price", locked: true },
+  { key: "currency", label: "Currency" },
+  { key: "rule", label: "Rule" },
+  { key: "category", label: "Category", hint: "Only in files that span categories" },
+];
+
+type MessageToggleKey =
+  | "message_show_capacity"
+  | "message_show_grade"
+  | "message_show_quantity"
+  | "message_show_categories";
+
+const MESSAGE_TOGGLES: { key: MessageToggleKey; label: string; hint: string }[] = [
+  { key: "message_show_capacity", label: "Capacity in rows", hint: "“128GB” after the product name" },
+  { key: "message_show_grade", label: "Grade in rows", hint: "“(A)” after the product name" },
+  { key: "message_show_quantity", label: "Quantity in rows", hint: "“×5” after the price" },
+  { key: "message_show_categories", label: "Category sections", hint: "Group rows under one header per category" },
+];
 
 function OrgCurrencyCard() {
   const { active, canOperate } = useOrg();
@@ -146,6 +173,222 @@ function OrgCurrencyCard() {
           ) : (
             <span className="text-sm text-muted-foreground">
               Only operators can change organization currency.
+            </span>
+          )}
+          {saved ? <span className="text-sm text-muted-foreground">Saved.</span> : null}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function QuoteExportCard() {
+  const { active, canOperate } = useOrg();
+  const [template, setTemplate] = React.useState<QuoteExportTemplate | null>(null);
+  const [saving, setSaving] = React.useState(false);
+  const [saved, setSaved] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!active) {
+      setTemplate(null);
+      return;
+    }
+    let cancelled = false;
+    setTemplate(null);
+    setError(null);
+    setSaved(false);
+    void getOrgSettings(active.organization)
+      .then((settings) => {
+        if (!cancelled) setTemplate(settings.quote_export);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setError(
+            err instanceof ApiError
+              ? err.message
+              : "Could not load export settings.",
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [active]);
+
+  if (!active) return null;
+
+  function toggleColumn(key: string) {
+    setTemplate((prev) => {
+      if (!prev) return prev;
+      const has = prev.file_columns.includes(key);
+      const columns = has
+        ? prev.file_columns.filter((column) => column !== key)
+        : [...FILE_COLUMNS.map((c) => c.key).filter((c) => c === key || prev.file_columns.includes(c))];
+      return { ...prev, file_columns: columns };
+    });
+    setSaved(false);
+  }
+
+  function toggleMessage(key: MessageToggleKey) {
+    setTemplate((prev) =>
+      prev ? { ...prev, [key]: !prev[key] } : prev,
+    );
+    setSaved(false);
+  }
+
+  async function save() {
+    if (!active || !template) return;
+    setSaving(true);
+    setError(null);
+    setSaved(false);
+    try {
+      const settings = await updateOrgSettings(active.organization, {
+        quote_export: template,
+      });
+      setTemplate(settings.quote_export);
+      setSaved(true);
+    } catch (err) {
+      setError(
+        err instanceof ApiError ? err.message : "Could not save exports.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Quote exports</CardTitle>
+        <CardDescription>
+          Shared by {active.organization_name}. Chooses what customers see in
+          the XLSX/CSV files and the Telegram message — for new quotes and
+          existing ones alike.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        {template === null && !error ? (
+          <p className="text-sm text-muted-foreground">
+            Loading export settings…
+          </p>
+        ) : template === null ? null : (
+          <>
+            <fieldset disabled={!canOperate}>
+              <legend className="text-sm font-medium">File columns</legend>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Model and Unit Price are always included — without them the
+                file is not a quote.
+              </p>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                {FILE_COLUMNS.map((column) => (
+                  <label
+                    key={column.key}
+                    className="flex cursor-pointer items-start gap-2 rounded-md border border-border px-3 py-2 text-sm"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={template.file_columns.includes(column.key)}
+                      onChange={() => toggleColumn(column.key)}
+                      disabled={!canOperate || column.locked === true}
+                      className="mt-0.5 h-4 w-4 accent-primary"
+                    />
+                    <span>
+                      <span className="font-medium">{column.label}</span>
+                      {column.locked === true ? (
+                        <span className="text-muted-foreground"> · required</span>
+                      ) : null}
+                      {column.hint ? (
+                        <span className="block text-xs text-muted-foreground">
+                          {column.hint}
+                        </span>
+                      ) : null}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+            <fieldset disabled={!canOperate}>
+              <legend className="text-sm font-medium">Telegram message</legend>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                {MESSAGE_TOGGLES.map((toggle) => (
+                  <label
+                    key={toggle.key}
+                    className="flex cursor-pointer items-start gap-2 rounded-md border border-border px-3 py-2 text-sm"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={template[toggle.key]}
+                      onChange={() => toggleMessage(toggle.key)}
+                      disabled={!canOperate}
+                      className="mt-0.5 h-4 w-4 accent-primary"
+                    />
+                    <span>
+                      <span className="font-medium">{toggle.label}</span>
+                      <span className="block text-xs text-muted-foreground">
+                        {toggle.hint}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                <label className="block text-sm font-medium">
+                  Header
+                  <input
+                    value={template.message_header}
+                    onChange={(event) => {
+                      setSaved(false);
+                      const value = event.target.value;
+                      setTemplate((prev) =>
+                        prev ? { ...prev, message_header: value } : prev,
+                      );
+                    }}
+                    disabled={!canOperate}
+                    placeholder="Ex. Fresh stock — October"
+                    maxLength={200}
+                    className="mt-1.5 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-normal text-foreground placeholder:text-muted-foreground/60"
+                  />
+                  <span className="mt-1 block text-xs font-normal text-muted-foreground">
+                    Blank keeps “Quote — company — date”.
+                  </span>
+                </label>
+                <label className="block text-sm font-medium">
+                  Footer
+                  <input
+                    value={template.message_footer}
+                    onChange={(event) => {
+                      setSaved(false);
+                      const value = event.target.value;
+                      setTemplate((prev) =>
+                        prev ? { ...prev, message_footer: value } : prev,
+                      );
+                    }}
+                    disabled={!canOperate}
+                    placeholder="Ex. Reply to order"
+                    maxLength={200}
+                    className="mt-1.5 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-normal text-foreground placeholder:text-muted-foreground/60"
+                  />
+                  <span className="mt-1 block text-xs font-normal text-muted-foreground">
+                    Blank adds no closing line.
+                  </span>
+                </label>
+              </div>
+            </fieldset>
+          </>
+        )}
+        {error ? <ErrorNotice message={error} /> : null}
+        <div className="flex items-center gap-3">
+          {canOperate ? (
+            <Button
+              onClick={() => void save()}
+              disabled={saving || template === null}
+            >
+              {saving ? "Saving…" : "Save exports"}
+            </Button>
+          ) : (
+            <span className="text-sm text-muted-foreground">
+              Only operators can change export settings.
             </span>
           )}
           {saved ? <span className="text-sm text-muted-foreground">Saved.</span> : null}
@@ -367,6 +610,8 @@ export default function SettingsPage() {
       </Card>
 
       <OrgCurrencyCard />
+
+      <QuoteExportCard />
 
       <GdprCard />
 

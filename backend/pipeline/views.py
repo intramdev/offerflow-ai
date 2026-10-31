@@ -61,6 +61,7 @@ from pipeline.serializers import (
     ExportRequestSerializer,
     FileCategorySerializer,
     QuoteConfirmSerializer,
+    QuoteLinesSerializer,
     SupplierInputSerializer,
     SupplierNoteInputSerializer,
     SupplierNoteSerializer,
@@ -85,6 +86,8 @@ DOWNLOAD_TYPES = {
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "csv": "text/csv",
 }
+
+QUOTE_LIST_PAGE_SIZE = 50
 
 
 def _as_drf_error(error: DjangoValidationError) -> DRFValidationError:
@@ -1089,7 +1092,37 @@ class CustomerQuoteListView(APIView):
             except DjangoPermissionDenied as error:
                 raise DRFPermissionDenied(str(error)) from error
             quotes = quotes.filter(organization=organization)
-        return Response(CustomerQuoteSerializer(quotes, many=True).data)
+        raw_page = request.query_params.get("page")
+        if raw_page is None:
+            return Response(CustomerQuoteSerializer(quotes, many=True).data)
+        try:
+            page = int(raw_page)
+        except ValueError:
+            return Response(
+                {"detail": "page must be a positive integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if page < 1:
+            return Response(
+                {"detail": "page must be a positive integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        import math
+
+        rows = list(quotes)
+        pages = max(1, math.ceil(len(rows) / QUOTE_LIST_PAGE_SIZE))
+        start = (page - 1) * QUOTE_LIST_PAGE_SIZE
+        return Response(
+            {
+                "page": page,
+                "pages": pages,
+                "count": len(rows),
+                "page_size": QUOTE_LIST_PAGE_SIZE,
+                "results": CustomerQuoteSerializer(
+                    rows[start : start + QUOTE_LIST_PAGE_SIZE], many=True
+                ).data,
+            }
+        )
 
     def post(self, request):
         from common.meta import ProviderError
@@ -1160,6 +1193,43 @@ class CustomerQuoteConfirmView(APIView):
         return Response(CustomerQuoteSerializer(quote).data)
 
 
+class CustomerQuoteLinesView(APIView):
+    """Replace a ready quote's line labels and hidden flags."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def put(self, request, quote_id):
+        from pipeline.customer_quotes import update_quote_lines
+
+        quote = _quote_for_user(request.user, quote_id)
+        serializer = QuoteLinesSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            quote = update_quote_lines(
+                quote=quote,
+                user=request.user,
+                edits=serializer.validated_data["edits"],
+            )
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
+        except DjangoPermissionDenied as error:
+            raise DRFPermissionDenied(str(error)) from error
+        return Response(CustomerQuoteSerializer(quote).data)
+
+
+def _quote_export_columns(*, template: dict, include_category: bool) -> list:
+    """Template file columns with the Category column conditional.
+
+    The full quote keeps its Category column whenever shelves exist
+    and the template lists it; a per-category file names the shelf in
+    the filename instead.
+    """
+    keys = [key for key in template["file_columns"] if key != "category"]
+    if include_category and "category" in template["file_columns"]:
+        keys.append("category")
+    return keys
+
+
 class CustomerQuoteDownloadView(APIView):
     """Download a ready quote's lines as xlsx or csv."""
 
@@ -1179,7 +1249,11 @@ class CustomerQuoteDownloadView(APIView):
                 {"detail": "Confirm the product groups before downloading."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        from pipeline.customer_quotes import quote_lines_for_category
+        from pipeline.customer_quotes import (
+            effective_template,
+            export_lines,
+            quote_lines_for_category,
+        )
 
         wanted = request.query_params.get("category_id")
         try:
@@ -1188,17 +1262,20 @@ class CustomerQuoteDownloadView(APIView):
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
-        payload = {"lines": lines, "notes": quote.notes}
-        # The full quote keeps its Category column whenever shelves
-        # exist; a per-category file names the shelf in the filename.
+        shown = export_lines(lines=lines, edits=quote.line_edits)
+        payload = {"lines": shown, "notes": quote.notes}
         include_category = wanted is None and any(
             isinstance(line, dict) and line.get("category_name")
-            for line in lines
+            for line in shown
+        )
+        template = effective_template(quote.organization)
+        columns = _quote_export_columns(
+            template=template, include_category=include_category
         )
         if file_format == "xlsx":
-            content = render_quote_xlsx(payload, include_category=include_category)
+            content = render_quote_xlsx(payload, columns=columns)
         else:
-            content = render_quote_csv(payload, include_category=include_category)
+            content = render_quote_csv(payload, columns=columns)
         return FileResponse(
             io.BytesIO(content),
             content_type=DOWNLOAD_TYPES[file_format],
@@ -1208,12 +1285,19 @@ class CustomerQuoteDownloadView(APIView):
 
 
 class CustomerQuoteMessageView(APIView):
-    """Read the Telegram message whole or for one category (member read)."""
+    """Read the Telegram message whole or for one category (member read).
+
+    The message renders live from the frozen lines, the line edits,
+    and the company's current export template, so labels, hidden
+    lines, and format choices always match the latest save.
+    """
 
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, quote_id):
         from pipeline.customer_quotes import (
+            effective_template,
+            export_lines,
             quote_lines_for_category,
             render_message,
         )
@@ -1225,8 +1309,6 @@ class CustomerQuoteMessageView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         wanted = request.query_params.get("category_id")
-        if wanted is None:
-            return Response({"message": quote.message})
         try:
             lines, _ = quote_lines_for_category(
                 lines=quote.lines, category_id=wanted
@@ -1238,7 +1320,8 @@ class CustomerQuoteMessageView(APIView):
                 "message": render_message(
                     organization_name=quote.organization.name,
                     day=quote.created_at.date(),
-                    lines=lines,
+                    lines=export_lines(lines=lines, edits=quote.line_edits),
+                    template=effective_template(quote.organization),
                 )
             }
         )

@@ -209,7 +209,7 @@ LOGGING = {
     "root": {"handlers": ["console"], "level": "INFO"},
 }
 
-APP_VERSION = _env("OFFERFLOW_APP_VERSION", "0.3.0-beta")
+APP_VERSION = _env("OFFERFLOW_APP_VERSION", "0.4.0-beta")
 OFFERFLOW_FILE_ROOT = _env("OFFERFLOW_FILE_ROOT", "/var/offerflow/files")
 
 # Public frontend base used for absolute links in emails.

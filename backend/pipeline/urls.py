@@ -14,6 +14,7 @@ from pipeline.views import (
     CustomerQuoteConfirmView,
     CustomerQuoteDetailView,
     CustomerQuoteDownloadView,
+    CustomerQuoteLinesView,
     CustomerQuoteListView,
     CustomerQuoteMessageView,
     DownloadView,
@@ -105,6 +106,11 @@ urlpatterns = [
         "quotes/<int:quote_id>/confirm/",
         CustomerQuoteConfirmView.as_view(),
         name="quote-confirm",
+    ),
+    path(
+        "quotes/<int:quote_id>/lines/",
+        CustomerQuoteLinesView.as_view(),
+        name="quote-lines",
     ),
     path(
         "quotes/<int:quote_id>/download/",

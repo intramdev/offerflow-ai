@@ -87,11 +87,17 @@ class OrganizationSettingsSerializer(serializers.Serializer):
         max_length=3, allow_blank=True, required=False, default=""
     )
     supported_currencies = serializers.SerializerMethodField()
+    quote_export = serializers.SerializerMethodField()
 
     def get_supported_currencies(self, _obj) -> list:
         from pipeline.fx import SUPPORTED_CURRENCIES
 
         return list(SUPPORTED_CURRENCIES)
+
+    def get_quote_export(self, obj) -> dict:
+        from pipeline.customer_quotes import effective_template
+
+        return effective_template(obj)
 
     def validate_default_currency(self, value):
         return _clean_currency_code(value)

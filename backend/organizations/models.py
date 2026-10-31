@@ -40,6 +40,7 @@ class Organization(models.Model):
     destination_currency = models.CharField(
         max_length=3, blank=True, default="USD"
     )
+    quote_export = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

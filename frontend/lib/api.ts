@@ -284,10 +284,21 @@ export async function getUsageLog(
   );
 }
 
+export interface QuoteExportTemplate {
+  file_columns: string[];
+  message_show_capacity: boolean;
+  message_show_grade: boolean;
+  message_show_quantity: boolean;
+  message_show_categories: boolean;
+  message_header: string;
+  message_footer: string;
+}
+
 export interface OrgSettings {
   default_currency: string;
   destination_currency: string;
   supported_currencies: string[];
+  quote_export: QuoteExportTemplate;
 }
 
 export async function getOrgSettings(organizationId: number): Promise<OrgSettings> {
@@ -297,7 +308,10 @@ export async function getOrgSettings(organizationId: number): Promise<OrgSetting
 export async function updateOrgSettings(
   organizationId: number,
   settings: Partial<
-    Pick<OrgSettings, "default_currency" | "destination_currency">
+    Pick<
+      OrgSettings,
+      "default_currency" | "destination_currency" | "quote_export"
+    >
   >,
 ): Promise<OrgSettings> {
   return api<OrgSettings>(`/api/orgs/${organizationId}/settings/`, {
@@ -860,6 +874,11 @@ export interface CustomerQuoteLine extends QuoteLine {
   category_name: string;
 }
 
+export interface QuoteLineEdit {
+  label: string | null;
+  hidden: boolean;
+}
+
 export interface CustomerQuote {
   id: number;
   organization: number;
@@ -868,6 +887,7 @@ export interface CustomerQuote {
   sources: { run_id: number; filename: string }[];
   groups: QuoteGroup[];
   lines: CustomerQuoteLine[];
+  line_edits: Record<string, QuoteLineEdit>;
   notes: string[];
   message: string;
   provider_name: string;
@@ -880,6 +900,34 @@ export async function listCustomerQuotes(
 ): Promise<CustomerQuote[]> {
   const query = organizationId ? `?organization_id=${organizationId}` : "";
   return api<CustomerQuote[]>(`/api/pipeline/quotes/${query}`);
+}
+
+export interface PagedQuotes {
+  page: number;
+  pages: number;
+  count: number;
+  page_size: number;
+  results: CustomerQuote[];
+}
+
+export async function listCustomerQuotesPage(
+  organizationId: number,
+  page: number,
+): Promise<PagedQuotes> {
+  return api<PagedQuotes>(
+    `/api/pipeline/quotes/?organization_id=${organizationId}&page=${page}`,
+  );
+}
+
+export async function updateQuoteLines(
+  quoteId: number,
+  edits: Record<string, QuoteLineEdit>,
+): Promise<CustomerQuote> {
+  return api<CustomerQuote>(`/api/pipeline/quotes/${quoteId}/lines/`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ edits }),
+  });
 }
 
 export async function startCustomerQuote(

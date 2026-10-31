@@ -421,6 +421,15 @@ class OrganizationSettingsView(APIView):
                 value = serializer.validated_data[field]
                 setattr(organization, field, value)
                 updated[field] = value
+        if "quote_export" in request.data:
+            from pipeline.customer_quotes import clean_quote_export
+
+            try:
+                template = clean_quote_export(request.data["quote_export"])
+            except DjangoValidationError as error:
+                raise _as_drf_error(error) from error
+            organization.quote_export = template
+            updated["quote_export"] = template
         if updated:
             organization.save(update_fields=list(updated))
         from pipeline.jobs import record_audit

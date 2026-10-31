@@ -9,6 +9,7 @@ from rest_framework.test import APIClient
 
 from organizations.models import Membership, Organization
 from pipeline.models import (
+    CustomerQuote,
     ImportRun,
     NormalizedOffer,
     OfferStatus,
@@ -259,3 +260,266 @@ class CustomerQuoteApiTests(TestCase):
         self.assertIn("iPhone 15", body)
         bad = self.client.get(f"/api/pipeline/quotes/{quote_id}/download/pdf/")
         self.assertEqual(bad.status_code, 400)
+
+
+@override_settings(PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])
+class QuotePresentationApiTests(CustomerQuoteApiTests):
+    """Quote pagination, line edits, and export templates."""
+
+    def _seed_two_products(self):
+        run_a = self._run(original_name="a.xlsx")
+        iphone_a = self._offer(run_a, supplier="Acme", model_name="iPhone 15")
+        galaxy_a = self._offer(
+            run_a,
+            supplier="Acme",
+            brand="Samsung",
+            model_name="Galaxy S24",
+            grade="B",
+            unit_price=Decimal("200.0000"),
+        )
+        run_b = self._run(original_name="b.xlsx")
+        iphone_b = self._offer(run_b, supplier="Globex", model_name="IPHONE-15")
+        galaxy_b = self._offer(
+            run_b,
+            supplier="Globex",
+            brand="Samsung",
+            model_name="GALAXY-S24",
+            grade="B",
+            unit_price=Decimal("210.0000"),
+        )
+        return iphone_a, galaxy_a, iphone_b, galaxy_b
+
+    def _ready_quote_id(self):
+        iphone_a, galaxy_a, iphone_b, galaxy_b = self._seed_two_products()
+        started = self.client.post(
+            "/api/pipeline/quotes/", {"organization_id": self.org.id}, format="json"
+        )
+        quote_id = started.data["id"]
+        response = self.client.post(
+            f"/api/pipeline/quotes/{quote_id}/confirm/",
+            {
+                "groups": [
+                    {
+                        "canonical_model": "iPhone 15",
+                        "offer_ids": [iphone_a.id, iphone_b.id],
+                    },
+                    {
+                        "canonical_model": "Galaxy S24",
+                        "offer_ids": [galaxy_a.id, galaxy_b.id],
+                    },
+                ]
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        return quote_id
+
+    def _csv_body(self, quote_id):
+        response = self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/download/csv/"
+        )
+        self.assertEqual(response.status_code, 200)
+        return b"".join(response.streaming_content).decode("utf-8-sig")
+
+    def test_list_paginates_fifty_newest_first(self):
+        ids = [
+            CustomerQuote.objects.create(
+                organization=self.org, status="needs_review"
+            ).id
+            for _ in range(52)
+        ]
+        first = self.client.get(
+            f"/api/pipeline/quotes/?organization_id={self.org.id}&page=1"
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.data["page"], 1)
+        self.assertEqual(first.data["pages"], 2)
+        self.assertEqual(first.data["count"], 52)
+        self.assertEqual(first.data["page_size"], 50)
+        self.assertEqual(len(first.data["results"]), 50)
+        self.assertEqual(
+            {row["id"] for row in first.data["results"]}, set(ids[2:])
+        )
+        second = self.client.get(
+            f"/api/pipeline/quotes/?organization_id={self.org.id}&page=2"
+        )
+        self.assertEqual(len(second.data["results"]), 2)
+        self.assertEqual(
+            {row["id"] for row in second.data["results"]}, set(ids[:2])
+        )
+        self.assertEqual(
+            [row["id"] for row in second.data["results"]],
+            sorted(ids[:2], reverse=True),
+        )
+
+    def test_list_page_validates(self):
+        for bad in ("0", "-1", "soon"):
+            response = self.client.get(f"/api/pipeline/quotes/?page={bad}")
+            self.assertEqual(response.status_code, 400, bad)
+            self.assertIn("positive integer", str(response.data))
+
+    def test_line_edits_relabel_and_hide(self):
+        quote_id = self._ready_quote_id()
+        response = self.client.put(
+            f"/api/pipeline/quotes/{quote_id}/lines/",
+            {
+                "edits": {
+                    "0": {"label": "iPhone 15 Pro Max", "hidden": False},
+                    "1": {"hidden": True},
+                }
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(
+            response.data["line_edits"],
+            {
+                "0": {"label": "iPhone 15 Pro Max", "hidden": False},
+                "1": {"label": None, "hidden": True},
+            },
+        )
+        # Frozen prices and sources stay untouched.
+        self.assertEqual(response.data["lines"][0]["model"], "iPhone 15")
+        body = self._csv_body(quote_id)
+        self.assertIn("iPhone 15 Pro Max", body)
+        self.assertNotIn("Galaxy S24", body)
+        message = self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/message/"
+        ).data["message"]
+        self.assertIn("iPhone 15 Pro Max", message)
+        self.assertNotIn("Galaxy S24", message)
+
+    def test_line_edits_refused_loudly(self):
+        quote_id = self._ready_quote_id()
+        unknown = self.client.put(
+            f"/api/pipeline/quotes/{quote_id}/lines/",
+            {"edits": {"7": {"hidden": True}}},
+            format="json",
+        )
+        self.assertEqual(unknown.status_code, 400)
+        self.assertIn("does not exist", str(unknown.data))
+        blank = self.client.put(
+            f"/api/pipeline/quotes/{quote_id}/lines/",
+            {"edits": {"0": {"label": "  "}}},
+            format="json",
+        )
+        self.assertEqual(blank.status_code, 400)
+        self.assertIn("hide the line", str(blank.data))
+
+    def test_line_edits_need_ready_quote_and_role(self):
+        self._seed_two_suppliers()
+        started = self.client.post(
+            "/api/pipeline/quotes/", {"organization_id": self.org.id}, format="json"
+        )
+        draft_id = started.data["id"]
+        early = self.client.put(
+            f"/api/pipeline/quotes/{draft_id}/lines/",
+            {"edits": {}},
+            format="json",
+        )
+        self.assertEqual(early.status_code, 400)
+        self.assertIn("Confirm the product groups", str(early.data))
+        quote_id = self._ready_quote_id()
+        self.client.force_authenticate(self.viewer)
+        denied = self.client.put(
+            f"/api/pipeline/quotes/{quote_id}/lines/",
+            {"edits": {}},
+            format="json",
+        )
+        self.assertEqual(denied.status_code, 403)
+
+    def test_default_template_hides_supplier(self):
+        quote_id = self._ready_quote_id()
+        body = self._csv_body(quote_id)
+        header = body.splitlines()[0]
+        self.assertNotIn("Supplier", header)
+        self.assertIn("Acme", self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/"
+        ).data["lines"][0]["supplier"])
+        self.assertTrue(body.startswith("Brand,Model,Capacity GB,Grade,"))
+
+    def test_template_customizes_file_and_message(self):
+        quote_id = self._ready_quote_id()
+        saved = self.client.put(
+            f"/api/orgs/{self.org.id}/settings/",
+            {
+                "quote_export": {
+                    "file_columns": ["brand", "model", "price", "currency"],
+                    "message_show_capacity": False,
+                    "message_show_grade": False,
+                    "message_show_quantity": True,
+                    "message_show_categories": True,
+                    "message_header": "Fresh stock today",
+                    "message_footer": "Reply to order",
+                }
+            },
+            format="json",
+        )
+        self.assertEqual(saved.status_code, 200, saved.content)
+        self.assertEqual(
+            saved.data["quote_export"]["file_columns"],
+            ["brand", "model", "price", "currency"],
+        )
+        body = self._csv_body(quote_id)
+        self.assertTrue(body.startswith("Brand,Model,Unit Price,Currency"))
+        message = self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/message/"
+        ).data["message"]
+        self.assertTrue(message.startswith("Fresh stock today\n"))
+        self.assertTrue(message.endswith("\nReply to order"))
+        self.assertIn("Apple iPhone 15 — USD 100 ×5", message)
+        self.assertNotIn("(A)", message)
+        self.assertNotIn("128GB", message)
+
+    def test_supplier_opts_back_into_files(self):
+        quote_id = self._ready_quote_id()
+        saved = self.client.put(
+            f"/api/orgs/{self.org.id}/settings/",
+            {
+                "quote_export": {
+                    "file_columns": [
+                        "brand",
+                        "model",
+                        "supplier",
+                        "price",
+                        "currency",
+                    ]
+                }
+            },
+            format="json",
+        )
+        self.assertEqual(saved.status_code, 200, saved.content)
+        body = self._csv_body(quote_id)
+        self.assertTrue(body.startswith("Brand,Model,Supplier,Unit Price,Currency"))
+        self.assertIn("Acme", body)
+
+    def test_template_validates_loudly(self):
+        unknown = self.client.put(
+            f"/api/orgs/{self.org.id}/settings/",
+            {"quote_export": {"file_columns": ["model", "price", "margin"]}},
+            format="json",
+        )
+        self.assertEqual(unknown.status_code, 400)
+        self.assertIn("margin", str(unknown.data))
+        missing = self.client.put(
+            f"/api/orgs/{self.org.id}/settings/",
+            {"quote_export": {"file_columns": ["brand", "model"]}},
+            format="json",
+        )
+        self.assertEqual(missing.status_code, 400)
+        self.assertIn("price", str(missing.data))
+        shape = self.client.put(
+            f"/api/orgs/{self.org.id}/settings/",
+            {"quote_export": ["model", "price"]},
+            format="json",
+        )
+        self.assertEqual(shape.status_code, 400)
+        self.assertIn("must be an object", str(shape.data))
+
+    def test_settings_reports_effective_template(self):
+        response = self.client.get(f"/api/orgs/{self.org.id}/settings/")
+        self.assertEqual(response.status_code, 200)
+        template = response.data["quote_export"]
+        self.assertNotIn("supplier", template["file_columns"])
+        self.assertIn("price", template["file_columns"])
+        self.assertTrue(template["message_show_grade"])

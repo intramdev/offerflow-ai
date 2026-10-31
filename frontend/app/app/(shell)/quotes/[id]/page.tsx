@@ -28,6 +28,7 @@ import {
   getCustomerQuoteMessage,
   listCategories,
   saveBlob,
+  updateQuoteLines,
   type Category,
   type CustomerQuote,
   type QuoteGroup,
@@ -421,12 +422,37 @@ function shelfSlug(name: string): string {
   return slug || "category";
 }
 
-function ReadyView({ quote }: { quote: CustomerQuote }) {
+interface LineDraft {
+  label: string;
+  hidden: boolean;
+}
+
+function toDrafts(quote: CustomerQuote): LineDraft[] {
+  return quote.lines.map((line, index) => {
+    const edit = quote.line_edits?.[String(index)];
+    return {
+      label: edit?.label ?? line.model,
+      hidden: edit?.hidden ?? false,
+    };
+  });
+}
+
+function ReadyView({
+  quote,
+  onChanged,
+}: {
+  quote: CustomerQuote;
+  onChanged: (quote: CustomerQuote) => void;
+}) {
+  const { canOperate } = useOrg();
   const [error, setError] = React.useState("");
   const [copied, setCopied] = React.useState(false);
   const [shelf, setShelf] = React.useState("");
-  const [shelfMessage, setShelfMessage] = React.useState<string | null>(null);
+  const [liveMessage, setLiveMessage] = React.useState<string | null>(null);
   const [messageLoading, setMessageLoading] = React.useState(false);
+  const [drafts, setDrafts] = React.useState<LineDraft[]>(() => toDrafts(quote));
+  const [saving, setSaving] = React.useState(false);
+  const [saved, setSaved] = React.useState(false);
   const categorized = quote.lines.some((line) => line.category_name);
   const shelves = React.useMemo(() => {
     const seen = new Map<number, string>();
@@ -442,27 +468,34 @@ function ReadyView({ quote }: { quote: CustomerQuote }) {
   );
   const showShelfPicker =
     shelves.length > 1 || (shelves.length === 1 && hasUncategorized);
-  const visibleLines =
+  const visibleIndexes =
     shelf === ""
-      ? quote.lines
+      ? quote.lines.map((_, index) => index)
       : shelf === "none"
-        ? quote.lines.filter((line) => line.category_id === null)
-        : quote.lines.filter((line) => line.category_id === Number(shelf));
-  const message = shelf === "" ? quote.message : (shelfMessage ?? "");
+        ? quote.lines
+            .map((line, index) => (line.category_id === null ? index : -1))
+            .filter((index) => index >= 0)
+        : quote.lines
+            .map((line, index) =>
+              line.category_id === Number(shelf) ? index : -1,
+            )
+            .filter((index) => index >= 0);
+  const message = liveMessage ?? "";
 
   React.useEffect(() => {
-    if (shelf === "") {
-      setShelfMessage(null);
-      return;
-    }
+    setDrafts(toDrafts(quote));
+  }, [quote]);
+
+  React.useEffect(() => {
     let cancelled = false;
     setMessageLoading(true);
-    setShelfMessage(null);
-    const target = shelf === "none" ? "none" : Number(shelf);
+    setLiveMessage(null);
+    const target =
+      shelf === "" ? undefined : shelf === "none" ? "none" : Number(shelf);
     void getCustomerQuoteMessage(quote.id, target).then(
       (loaded) => {
         if (!cancelled) {
-          setShelfMessage(loaded.message);
+          setLiveMessage(loaded.message);
           setMessageLoading(false);
         }
       },
@@ -478,7 +511,41 @@ function ReadyView({ quote }: { quote: CustomerQuote }) {
     return () => {
       cancelled = true;
     };
-  }, [shelf, quote.id]);
+  }, [shelf, quote]);
+
+  async function saveLines() {
+    setError("");
+    setSaved(false);
+    setSaving(true);
+    try {
+      const edits: Record<string, { label: string | null; hidden: boolean }> = {};
+      quote.lines.forEach((line, index) => {
+        const draft = drafts[index];
+        const label = draft.label.trim();
+        if (label === "" && !draft.hidden) {
+          throw new Error(
+            `Line ${index + 1} needs words, or hide it from the exports.`,
+          );
+        }
+        const cleaned =
+          label === "" || label === line.model ? null : label;
+        if (cleaned !== null || draft.hidden) {
+          edits[String(index)] = { label: cleaned, hidden: draft.hidden };
+        }
+      });
+      const updated = await updateQuoteLines(quote.id, edits);
+      onChanged(updated);
+      setSaved(true);
+    } catch (err) {
+      setError(
+        err instanceof ApiError || err instanceof Error
+          ? err.message
+          : "Could not save lines.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
 
   function shelfSuffix(): string {
     if (shelf === "") return "";
@@ -546,10 +613,31 @@ function ReadyView({ quote }: { quote: CustomerQuote }) {
       ) : null}
       <Card>
         <CardHeader>
-          <CardTitle>Lines</CardTitle>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <CardTitle>Lines</CardTitle>
+            {canOperate && visibleIndexes.length > 0 ? (
+              <div className="flex items-center gap-3">
+                {saved ? (
+                  <span className="text-sm text-muted-foreground">Saved.</span>
+                ) : null}
+                <Button
+                  size="sm"
+                  disabled={saving}
+                  onClick={() => void saveLines()}
+                >
+                  {saving ? "Saving…" : "Save labels"}
+                </Button>
+              </div>
+            ) : null}
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Rewrite the customer-facing product text or hide a line — labels
+            and hidden lines apply to the files and the Telegram message.
+            Prices and sources stay frozen.
+          </p>
         </CardHeader>
         <CardContent>
-          {visibleLines.length === 0 ? (
+          {visibleIndexes.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               Every group was skipped — see the notes below.
             </p>
@@ -564,38 +652,112 @@ function ReadyView({ quote }: { quote: CustomerQuote }) {
                   <TableHead>Qty</TableHead>
                   <TableHead>Price</TableHead>
                   <TableHead>Rule</TableHead>
+                  <TableHead>Exports</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {visibleLines.map((line, index) => (
-                  <TableRow key={index}>
-                    <TableCell>
-                      {line.brand} {line.model}
-                      {line.capacity_gb !== null ? ` ${line.capacity_gb}GB` : ""}
-                    </TableCell>
-                    {categorized ? (
-                      <TableCell>{line.category_name || "—"}</TableCell>
-                    ) : null}
-                    <TableCell>{line.grade || "—"}</TableCell>
-                    <TableCell>
-                      {line.supplier}
-                      {(line.candidates ?? []).length > 1 ? (
-                        <span className="block text-xs text-muted-foreground">
-                          also:{" "}
-                          {(line.candidates ?? [])
-                            .filter((c) => c.supplier !== line.supplier)
-                            .map((c) => `${c.supplier} ${c.currency} ${c.unit_price}`)
-                            .join(" · ")}
-                        </span>
+                {visibleIndexes.map((index) => {
+                  const line = quote.lines[index];
+                  const draft = drafts[index] ?? {
+                    label: line.model,
+                    hidden: false,
+                  };
+                  const edited = draft.label.trim() !== line.model;
+                  return (
+                    <TableRow
+                      key={index}
+                      className={draft.hidden ? "opacity-60" : undefined}
+                    >
+                      <TableCell>
+                        {canOperate ? (
+                          <Input
+                            value={draft.label}
+                            onChange={(event) => {
+                              setSaved(false);
+                              const value = event.target.value;
+                              setDrafts((prev) =>
+                                prev.map((row, i) =>
+                                  i === index ? { ...row, label: value } : row,
+                                ),
+                              );
+                            }}
+                            aria-label={`Customer label for line ${index + 1}`}
+                            className="min-w-44"
+                          />
+                        ) : (
+                          <span>
+                            {line.brand} {draft.label || line.model}
+                            {line.capacity_gb !== null
+                              ? ` ${line.capacity_gb}GB`
+                              : ""}
+                          </span>
+                        )}
+                        {canOperate ? (
+                          <span className="mt-0.5 block text-xs text-muted-foreground">
+                            {line.brand}
+                            {line.capacity_gb !== null
+                              ? ` · ${line.capacity_gb}GB`
+                              : ""}
+                            {edited ? ` · was “${line.model}”` : ""}
+                          </span>
+                        ) : null}
+                      </TableCell>
+                      {categorized ? (
+                        <TableCell>{line.category_name || "—"}</TableCell>
                       ) : null}
-                    </TableCell>
-                    <TableCell>{line.quantity ?? "—"}</TableCell>
-                    <TableCell className="tabular-nums">
-                      {line.currency} {line.unit_price}
-                    </TableCell>
-                    <TableCell>{line.rule ?? "—"}</TableCell>
-                  </TableRow>
-                ))}
+                      <TableCell>{line.grade || "—"}</TableCell>
+                      <TableCell>
+                        {line.supplier}
+                        {(line.candidates ?? []).length > 1 ? (
+                          <span className="block text-xs text-muted-foreground">
+                            also:{" "}
+                            {(line.candidates ?? [])
+                              .filter((c) => c.supplier !== line.supplier)
+                              .map(
+                                (c) =>
+                                  `${c.supplier} ${c.currency} ${c.unit_price}`,
+                              )
+                              .join(" · ")}
+                          </span>
+                        ) : null}
+                      </TableCell>
+                      <TableCell>{line.quantity ?? "—"}</TableCell>
+                      <TableCell className="tabular-nums">
+                        {line.currency} {line.unit_price}
+                      </TableCell>
+                      <TableCell>{line.rule ?? "—"}</TableCell>
+                      <TableCell>
+                        {canOperate ? (
+                          <label className="flex cursor-pointer items-center gap-2 text-sm">
+                            <input
+                              type="checkbox"
+                              checked={!draft.hidden}
+                              onChange={() => {
+                                setSaved(false);
+                                setDrafts((prev) =>
+                                  prev.map((row, i) =>
+                                    i === index
+                                      ? { ...row, hidden: !row.hidden }
+                                      : row,
+                                  ),
+                                );
+                              }}
+                              aria-label={`Include line ${index + 1} in exports`}
+                              className="h-4 w-4 accent-primary"
+                            />
+                            Include
+                          </label>
+                        ) : draft.hidden ? (
+                          <Badge variant="warning">Hidden</Badge>
+                        ) : (
+                          <span className="text-sm text-muted-foreground">
+                            Included
+                          </span>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           )}
@@ -701,7 +863,7 @@ export default function QuoteDetailPage() {
       </div>
 
       {quote.status === "ready" ? (
-        <ReadyView quote={quote} />
+        <ReadyView quote={quote} onChanged={setQuote} />
       ) : (
         <ReconcileView quote={quote} onConfirmed={setQuote} />
       )}

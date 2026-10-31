@@ -36,8 +36,10 @@ class Organization(models.Model):
     """An independent customer organization (the tenant)."""
 
     name = models.CharField(max_length=255)
-    default_currency = models.CharField(max_length=3, blank=True, default="")
-    destination_currency = models.CharField(max_length=3, blank=True, default="")
+    default_currency = models.CharField(max_length=3, blank=True, default="USD")
+    destination_currency = models.CharField(
+        max_length=3, blank=True, default="USD"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -131,6 +133,10 @@ class DateTimeFormat(models.TextChoices):
     EUROPEAN = "eu", "European (DD/MM/YYYY)"
 
 
+DEFAULT_AI_MODEL = "muse-spark-1.3-contributor"
+DEFAULT_MONTHLY_CREDITS = 25_000_000
+
+
 class AIProviderConfig(models.Model):
     """Singleton: the shared model account for every company.
 
@@ -139,12 +145,18 @@ class AIProviderConfig(models.Model):
     this row is complete and enabled it takes precedence over the
     OFFERFLOW_META_* environment variables, which remain as fallback so
     local development and tests keep working without a database row.
+
+    Fresh installs ship with the default model and a 25M-credit monthly
+    default already filled in, so enabling paid features is just adding
+    the API key.
     """
 
     enabled = models.BooleanField(default=True)
     api_key_encrypted = models.TextField(blank=True, default="")
-    model = models.CharField(max_length=128, blank=True, default="")
-    default_monthly_credits = models.PositiveIntegerField(default=0)
+    model = models.CharField(max_length=128, blank=True, default=DEFAULT_AI_MODEL)
+    default_monthly_credits = models.PositiveIntegerField(
+        default=DEFAULT_MONTHLY_CREDITS
+    )
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -185,6 +197,10 @@ class UserPreference(models.Model):
     )
     datetime_format = models.CharField(
         max_length=8, choices=DateTimeFormat.choices, default=DateTimeFormat.US
+    )
+    assistant_banned = models.BooleanField(
+        default=False,
+        help_text="Super-admin ban from the paid help assistant.",
     )
 
     def __str__(self) -> str:

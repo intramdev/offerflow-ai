@@ -14,6 +14,7 @@ from rest_framework.test import APIClient
 
 from organizations.models import Membership, Organization
 from pipeline.fx import (
+    SUPPORTED_CURRENCIES,
     FixtureFxProvider,
     FxNotConfigured,
     get_fx_provider,
@@ -47,6 +48,20 @@ class FixtureProviderTests(TestCase):
         rates = FixtureFxProvider().rates_for(date(2026, 10, 30), "EUR")["rates"]
         self.assertEqual(rates["EUR"], "1.000000")
         self.assertIn("USD", rates)
+
+    def test_supported_list_is_alphabetical(self):
+        codes = list(SUPPORTED_CURRENCIES)
+        self.assertEqual(len(codes), 34)
+        self.assertEqual(codes, sorted(codes))
+        for code in ("USD", "EUR", "GBP", "CZK", "JPY", "XDR"):
+            self.assertIn(code, codes)
+
+    def test_fixture_rates_every_supported_currency(self):
+        rates = FixtureFxProvider().rates_for(date(2026, 10, 30), "EUR")[
+            "rates"
+        ]
+        for code in SUPPORTED_CURRENCIES:
+            self.assertIn(code, rates)
 
     def test_unknown_provider_refused(self):
         with mock.patch.dict(os.environ, {"OFFERFLOW_FX_PROVIDER": "bogus"}):
@@ -126,6 +141,8 @@ class FileFxTests(TestCase):
         self.assertEqual(offers[0]["unit_price"], "299.9900")
 
     def test_no_destination_leaves_table_empty(self):
+        self.org.destination_currency = ""
+        self.org.save(update_fields=["destination_currency"])
         run = self._upload()
         source = SourceFile.objects.get(pk=run.source_file_id)
         self.assertEqual(source.currency_date, timezone.localdate())
@@ -179,6 +196,8 @@ class FileFxTests(TestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_rates_need_destination_first(self):
+        self.org.destination_currency = ""
+        self.org.save(update_fields=["destination_currency"])
         run = self._upload()
         response = self.client.post(
             f"/api/pipeline/files/{run.source_file_id}/fx/",
@@ -233,9 +252,10 @@ class FileFxTests(TestCase):
 
     def test_destination_setting_round_trip(self):
         response = self.client.get(f"/api/orgs/{self.org.id}/settings/")
+        self.assertEqual(response.data["default_currency"], "USD")
+        self.assertEqual(response.data["destination_currency"], "USD")
         self.assertEqual(
-            response.data,
-            {"default_currency": "", "destination_currency": ""},
+            response.data["supported_currencies"], list(SUPPORTED_CURRENCIES)
         )
         updated = self.client.put(
             f"/api/orgs/{self.org.id}/settings/",
@@ -243,10 +263,8 @@ class FileFxTests(TestCase):
             format="json",
         )
         self.assertEqual(updated.status_code, 200)
-        self.assertEqual(
-            updated.data,
-            {"default_currency": "", "destination_currency": "EUR"},
-        )
+        self.assertEqual(updated.data["default_currency"], "USD")
+        self.assertEqual(updated.data["destination_currency"], "EUR")
 
     def test_settings_updates_merge_fields(self):
         self.client.put(
@@ -259,10 +277,8 @@ class FileFxTests(TestCase):
             {"default_currency": "USD"},
             format="json",
         )
-        self.assertEqual(
-            updated.data,
-            {"default_currency": "USD", "destination_currency": "EUR"},
-        )
+        self.assertEqual(updated.data["default_currency"], "USD")
+        self.assertEqual(updated.data["destination_currency"], "EUR")
 
     def test_settings_reject_bad_destination(self):
         response = self.client.put(
@@ -305,7 +321,7 @@ class FileFxTests(TestCase):
         self.org.destination_currency = "EUR"
         self.org.save(update_fields=["destination_currency"])
         row = complete_row()
-        row[9] = "JPY"
+        row[9] = "XXX"
         run = self._upload([HEADERS, row])
         create_rule(
             organization=self.org,
@@ -323,9 +339,11 @@ class FileFxTests(TestCase):
         quote = build_quote(ImportRun.objects.get(pk=run.id))
         self.assertEqual(quote["lines"], [])
         self.assertEqual(len(quote["notes"]), 1)
-        self.assertIn("JPY->EUR", quote["notes"][0])
+        self.assertIn("XXX->EUR", quote["notes"][0])
 
     def test_quote_skips_without_destination(self):
+        self.org.destination_currency = ""
+        self.org.save(update_fields=["destination_currency"])
         run = self._upload()
         create_rule(
             organization=self.org,

@@ -1,6 +1,7 @@
 "use client";
 
 import { Badge } from "@/components/ui/badge";
+import { Combobox } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/cn";
@@ -101,11 +102,14 @@ export function FieldMapper({
   selection,
   onChange,
   autoFields,
+  currencies,
 }: {
   headers: HeaderOption[];
   selection: FieldSelection;
   onChange: (next: FieldSelection) => void;
   autoFields?: string[];
+  /** Supported currency codes; null while loading (falls back to text). */
+  currencies?: string[] | null;
 }) {
   function choose(field: string, selectValue: string) {
     const current = selection[field];
@@ -175,13 +179,24 @@ export function FieldMapper({
               </Select>
             </label>
             {choice.kind === "custom" ? (
-              <Input
-                className="mt-1.5"
-                value={choice.value}
-                onChange={(event) => setValue(field.name, event.target.value)}
-                placeholder={`Value for every row, e.g. ${field.name === "supplier" ? "Acme" : field.name === "currency" ? "EUR" : "…"}`}
-                aria-label={`${field.label} value`}
-              />
+              field.name === "currency" && Array.isArray(currencies) ? (
+                <Combobox
+                  className="mt-1.5"
+                  value={choice.value}
+                  options={currencies}
+                  onChange={(code) => setValue(field.name, code)}
+                  ariaLabel={`${field.label} value`}
+                  placeholder="Type to search…"
+                />
+              ) : (
+                <Input
+                  className="mt-1.5"
+                  value={choice.value}
+                  onChange={(event) => setValue(field.name, event.target.value)}
+                  placeholder={`Value for every row, e.g. ${field.name === "supplier" ? "Acme" : field.name === "currency" ? "EUR" : "…"}`}
+                  aria-label={`${field.label} value`}
+                />
+              )
             ) : null}
           </div>
         );

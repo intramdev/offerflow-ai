@@ -2,9 +2,10 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Coins, Files, LogOut, Settings, Tags, UploadCloud } from "lucide-react";
+import { Coins, Files, LogOut, Receipt, Settings, Shapes, Tags, Truck, UploadCloud } from "lucide-react";
 import * as React from "react";
 
+import { AssistantWidget } from "@/components/app/assistant-widget";
 import { OrgProvider, useOrg } from "@/components/app/org-context";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/cn";
@@ -14,6 +15,9 @@ const NAV = [
   { href: "/app", label: "Upload", icon: UploadCloud, exact: true },
   { href: "/app/files", label: "Files", icon: Files, exact: false },
   { href: "/app/rules", label: "Pricing rules", icon: Tags, exact: false },
+  { href: "/app/categories", label: "Categories", icon: Shapes, exact: false },
+  { href: "/app/suppliers", label: "Suppliers", icon: Truck, exact: false },
+  { href: "/app/quotes", label: "Quotes", icon: Receipt, exact: false },
   { href: "/app/credits", label: "Credits", icon: Coins, exact: false },
   { href: "/app/settings", label: "Settings", icon: Settings, exact: false },
 ];
@@ -107,8 +111,17 @@ function Shell({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
       <div className="min-w-0 flex-1">
-        <main className="mx-auto w-full max-w-5xl px-6 py-8">{children}</main>
+        <main
+          className={
+            pathname.startsWith("/app/files")
+              ? "mx-auto w-[90%] px-6 py-8"
+              : "mx-auto w-full max-w-5xl px-6 py-8"
+          }
+        >
+          {children}
+        </main>
       </div>
+      <AssistantWidget />
     </div>
   );
 }

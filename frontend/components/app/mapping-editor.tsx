@@ -51,6 +51,7 @@ export function MappingEditor({
     ),
   );
   const [defaultCurrency, setDefaultCurrency] = React.useState("");
+  const [currencies, setCurrencies] = React.useState<string[] | null>(null);
   const [samples, setSamples] = React.useState<PreviewSamples>(preview.samples);
   const [rendering, setRendering] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
@@ -94,7 +95,9 @@ export function MappingEditor({
     let cancelled = false;
     void getOrgSettings(active.organization).then(
       (settings) => {
-        if (!cancelled) setDefaultCurrency(settings.default_currency);
+        if (cancelled) return;
+        setDefaultCurrency(settings.default_currency);
+        setCurrencies(settings.supported_currencies ?? []);
       },
       () => {},
     );
@@ -173,6 +176,7 @@ export function MappingEditor({
             selection={selection}
             onChange={change}
             autoFields={Object.keys(preview.detected)}
+            currencies={currencies}
           />
           {missing.length > 0 ? (
             <p className="mt-3 text-sm font-medium text-destructive" role="alert">

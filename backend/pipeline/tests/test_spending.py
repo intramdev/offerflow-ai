@@ -147,8 +147,10 @@ class SpendingTests(TestCase):
         provider = MetaProvider(self.config(**config_overrides), client_factory=factory)
         return provider, holder
 
-    def test_default_budget_zero_refuses(self):
+    def test_zero_budget_refuses(self):
         allowance = get_allowance(self.org.id)
+        allowance.monthly_credits = 0
+        allowance.save(update_fields=["monthly_credits"])
         self.assertEqual(allowance.token_budget, 0)
         with self.assertRaises(BudgetRefused):
             reserve(self.org.id, 100, 1)

@@ -107,6 +107,64 @@ class RuleServiceTests(TestCase):
         with self.assertRaises(ValidationError):
             self._rule(matcher={"color": "red"})
 
+    def test_create_rule_accepts_category_matcher(self):
+        rule = self._rule(name="Phones", matcher={"category": "Phones"})
+        self.assertEqual(rule.matcher, {"category": "Phones"})
+
+    def test_category_rule_beats_general_despite_priority(self):
+        from pipeline.quotes import _winning_rule
+
+        general = self._rule(name="General", matcher={}, priority=0)
+        scoped = self._rule(
+            name="Phones", matcher={"category": "phones"}, priority=100
+        )
+        winner = _winning_rule(
+            [general, scoped],
+            {"brand": "Apple", "model": "iPhone 15", "category": "Phones"},
+        )
+        self.assertEqual(winner, scoped)
+        fallback = _winning_rule(
+            [general, scoped],
+            {"brand": "Apple", "model": "iPhone 15", "category": ""},
+        )
+        self.assertEqual(fallback, general)
+
+    def test_per_run_quote_ignores_category_rules(self):
+        self._rule(
+            name="Phones",
+            matcher={"category": "Phones"},
+            ops=[{"op": "percent", "value": "50"}],
+        )
+        self._rule(name="General", matcher={}, ops=[])
+        run = self._run()
+        self._offer(run, 2)
+        quote = build_quote(run)
+        self.assertEqual(quote["lines"][0]["rule"], "General")
+        self.assertEqual(quote["lines"][0]["unit_price"], "100.0000")
+
+    def test_rename_retargets_rule_matchers(self):
+        from pipeline.customer_quotes import update_category
+        from pipeline.models import Category
+
+        category = Category.objects.create(organization=self.org, name="Phones")
+        rule = self._rule(name="Phones", matcher={"category": "phones"})
+        update_category(
+            category=category, user=self.user, data={"name": "Smartphones"}
+        )
+        rule.refresh_from_db()
+        self.assertEqual(rule.matcher, {"category": "Smartphones"})
+
+    def test_delete_refused_while_rule_names_the_shelf(self):
+        from pipeline.customer_quotes import delete_category
+        from pipeline.models import Category
+
+        category = Category.objects.create(organization=self.org, name="Phones")
+        self._rule(name="Phones deal", matcher={"category": "Phones"})
+        with self.assertRaises(ValidationError) as ctx:
+            delete_category(category=category, user=self.user)
+        self.assertIn("Phones deal", str(ctx.exception))
+        self.assertTrue(Category.objects.filter(pk=category.pk).exists())
+
     def test_create_rule_unknown_op_rejected(self):
         with self.assertRaises(ValidationError):
             self._rule(ops=[{"op": "discount"}])
@@ -260,6 +318,35 @@ class RuleServiceTests(TestCase):
         quote = build_quote(run)
         text = render_quote_csv(quote).decode("utf-8")
         self.assertIn("'=1+1", text)
+
+    def test_category_column_is_opt_in(self):
+        run = self._run()
+        self._offer(run, 2)
+        quote = build_quote(run)
+        plain = render_quote_csv(quote).decode("utf-8").splitlines()[0]
+        self.assertNotIn("Category", plain)
+        quote["lines"][0]["category_name"] = "Phones"
+        text = render_quote_csv(quote, include_category=True).decode("utf-8")
+        rows = text.strip().splitlines()
+        self.assertTrue(rows[0].endswith(",Category"))
+        self.assertTrue(rows[1].endswith(",Phones"))
+
+    def test_quote_xlsx_appends_category_when_asked(self):
+        import io
+
+        from openpyxl import load_workbook
+
+        run = self._run()
+        self._offer(run, 2)
+        quote = build_quote(run)
+        quote["lines"][0]["category_name"] = "Phones"
+        workbook = load_workbook(
+            filename=io.BytesIO(render_quote_xlsx(quote, include_category=True))
+        )
+        sheet = workbook.active
+        self.assertEqual(sheet["J1"].value, "Category")
+        self.assertEqual(sheet["J2"].value, "Phones")
+        self.assertEqual(sheet["G2"].value, 100)
 
 
 @override_settings(PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])

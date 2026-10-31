@@ -6,10 +6,14 @@ import { ErrorNotice } from "@/components/app/error-notice";
 import { useOrg } from "@/components/app/org-context";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
+import { Combobox } from "@/components/ui/combobox";
 import {
   ApiError,
+  deleteOrganizationData,
+  downloadGdprExport,
   getOrgSettings,
+  logout,
+  saveBlob,
   updateOrgSettings,
   updatePreferences,
 } from "@/lib/api";
@@ -21,6 +25,7 @@ function OrgCurrencyCard() {
   const { active, canOperate } = useOrg();
   const [fallback, setFallback] = React.useState("");
   const [destination, setDestination] = React.useState("");
+  const [currencies, setCurrencies] = React.useState<string[]>([]);
   const [loaded, setLoaded] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [saved, setSaved] = React.useState(false);
@@ -40,6 +45,7 @@ function OrgCurrencyCard() {
         if (cancelled) return;
         setFallback(settings.default_currency);
         setDestination(settings.destination_currency);
+        setCurrencies(settings.supported_currencies ?? []);
         setLoaded(true);
       })
       .catch((err: unknown) => {
@@ -78,8 +84,8 @@ function OrgCurrencyCard() {
       <CardHeader>
         <CardTitle>Organization currency</CardTitle>
         <CardDescription>
-          Shared by {active.organization_name}. Codes are three letters, for
-          example USD, EUR, or CZK.
+          Shared by {active.organization_name}. Type to search the supported
+          currencies.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -87,40 +93,48 @@ function OrgCurrencyCard() {
           <p className="text-sm text-muted-foreground">Loading currencies…</p>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2">
-            <label className="block text-sm font-medium">
-              Default currency
-              <Input
-                className="mt-1.5 uppercase"
+            <div className="block text-sm font-medium">
+              <label htmlFor="default-currency">Default currency</label>
+              <Combobox
+                id="default-currency"
+                className="mt-1.5"
                 value={fallback}
-                maxLength={3}
-                placeholder="—"
-                disabled={!canOperate}
-                onChange={(e) => {
-                  setFallback(e.target.value.toUpperCase());
+                options={currencies}
+                onChange={(code) => {
+                  setFallback(code);
                   setSaved(false);
                 }}
+                disabled={!canOperate}
+                ariaLabel="Default currency"
+                placeholder="Type to search…"
+                allowEmpty
+                emptyLabel="None — leave rows without currency"
               />
               <span className="mt-1 block text-xs font-normal text-muted-foreground">
                 Fills in rows whose file has no currency.
               </span>
-            </label>
-            <label className="block text-sm font-medium">
-              Destination currency
-              <Input
-                className="mt-1.5 uppercase"
+            </div>
+            <div className="block text-sm font-medium">
+              <label htmlFor="destination-currency">Destination currency</label>
+              <Combobox
+                id="destination-currency"
+                className="mt-1.5"
                 value={destination}
-                maxLength={3}
-                placeholder="EUR"
-                disabled={!canOperate}
-                onChange={(e) => {
-                  setDestination(e.target.value.toUpperCase());
+                options={currencies}
+                onChange={(code) => {
+                  setDestination(code);
                   setSaved(false);
                 }}
+                disabled={!canOperate}
+                ariaLabel="Destination currency"
+                placeholder="Type to search…"
+                allowEmpty
+                emptyLabel="None — no conversion"
               />
               <span className="mt-1 block text-xs font-normal text-muted-foreground">
                 Quotes convert to this using each file&apos;s recorded rates.
               </span>
-            </label>
+            </div>
           </div>
         )}
         {error ? <ErrorNotice message={error} /> : null}
@@ -136,6 +150,131 @@ function OrgCurrencyCard() {
           )}
           {saved ? <span className="text-sm text-muted-foreground">Saved.</span> : null}
         </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function GdprCard() {
+  const { active } = useOrg();
+  const [confirm, setConfirm] = React.useState("");
+  const [busy, setBusy] = React.useState<"export" | "delete" | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [deleted, setDeleted] = React.useState<string | null>(null);
+
+  if (!active) return null;
+  const isOwner = active.role === "owner";
+
+  async function exportData() {
+    if (!active) return;
+    setBusy("export");
+    setError(null);
+    try {
+      const blob = await downloadGdprExport(active.organization);
+      saveBlob(
+        blob,
+        `offerflow-export-${active.organization_name}-${active.organization}.zip`,
+      );
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Export failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function erase() {
+    if (!active) return;
+    setBusy("delete");
+    setError(null);
+    try {
+      const result = await deleteOrganizationData(
+        active.organization,
+        confirm,
+      );
+      setDeleted(
+        `Deleted ${result.organization}: ${result.stored_files_removed} files, ` +
+          `${result.member_logins_deleted} logins. Signing out…`,
+      );
+      try {
+        await logout();
+      } catch {
+        // Memberships are gone; leave regardless.
+      }
+      window.location.assign("/app/login");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Deletion failed.");
+      setBusy(null);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Privacy &amp; data</CardTitle>
+        <CardDescription>
+          Your rights under the GDPR: take your data or erase it. Both
+          actions cover {active.organization_name} only.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {error ? <ErrorNotice message={error} /> : null}
+        {deleted ? (
+          <p className="text-sm text-muted-foreground">{deleted}</p>
+        ) : (
+          <>
+            <div className="flex flex-wrap items-center gap-3">
+              {isOwner ? (
+                <Button
+                  variant="outline"
+                  onClick={() => void exportData()}
+                  disabled={busy !== null}
+                >
+                  {busy === "export"
+                    ? "Preparing…"
+                    : "Download all my data"}
+                </Button>
+              ) : (
+                <span className="text-sm text-muted-foreground">
+                  Only the organization owner can export or erase data.
+                </span>
+              )}
+            </div>
+            {isOwner ? (
+              <div className="space-y-2 rounded-md border border-red-200 bg-red-50 p-4">
+                <p className="text-sm font-semibold text-red-800">
+                  Delete everything
+                </p>
+                <p className="text-sm text-red-700">
+                  Removes the organization, every file, run, quote,
+                  supplier, and usage record, plus logins left without an
+                  organization. This cannot be undone.
+                </p>
+                <label
+                  className="block text-sm font-medium text-red-800"
+                  htmlFor="gdpr-confirm"
+                >
+                  Type {active.organization_name} to confirm
+                </label>
+                <input
+                  id="gdpr-confirm"
+                  className="w-full rounded-md border border-red-300 bg-white px-3 py-2 text-sm"
+                  value={confirm}
+                  onChange={(event) => setConfirm(event.target.value)}
+                  placeholder={active.organization_name}
+                />
+                <Button
+                  variant="destructive"
+                  onClick={() => void erase()}
+                  disabled={
+                    busy !== null || confirm !== active.organization_name
+                  }
+                >
+                  {busy === "delete" ? "Deleting…" : "Delete everything"}
+                </Button>
+              </div>
+            ) : null}
+          </>
+        )}
       </CardContent>
     </Card>
   );
@@ -228,6 +367,8 @@ export default function SettingsPage() {
       </Card>
 
       <OrgCurrencyCard />
+
+      <GdprCard />
 
       <Card>
         <CardHeader>

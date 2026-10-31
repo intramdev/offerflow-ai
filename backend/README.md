@@ -84,7 +84,22 @@ network with no published ports.
   customer quote with recorded FX
 - `GET api/pipeline/artifacts/<id>/download/` — exact stored bytes
 - `POST api/pipeline/runs/<id>/cancel/` — stop an unapproved run
-- `GET/POST api/pipeline/rules/` — pricing rules
+- `GET/POST api/pipeline/rules/` — pricing rules (general or
+  category-scoped; the category rule wins for its shelf)
+- `GET/POST api/pipeline/categories/` — company categories
+- `PUT api/pipeline/files/<id>/category/` — shelve a whole file
+- `GET/POST api/pipeline/suppliers/` — supplier list (auto-created on
+  import), `PUT .../order/` for favorites, `.../<id>/notes/` for notes
+- `POST api/pipeline/quotes/` — start a customer quote from the latest
+  approved runs; `POST .../<id>/confirm/` learns reconcile groups
+- `GET api/pipeline/quotes/<id>/download/<fmt>/?category_id=` — full
+  quote or one shelf (`none` = uncategorized)
+- `GET api/pipeline/quotes/<id>/message/?category_id=` — Telegram
+  message, frozen whole or re-rendered per shelf
+- `GET api/pipeline/assistant/status/?organization_id=` — paid
+  assistant reachability (free to ask)
+- `POST api/pipeline/assistant/chat/` — one help turn, spent as
+  `task=assistant` in the usage log
 
 Cross-tenant identifiers answer 404.
 
@@ -104,6 +119,11 @@ Cross-tenant identifiers answer 404.
 - `GET/PUT api/orgs/<id>/settings/` — default + destination currency
 - `GET api/orgs/<id>/usage/` — monthly credits, reset date, grand total,
   per-import spend log
+- `GET api/orgs/<id>/gdpr/export/` — ZIP of every company row plus
+  stored bytes (Owner only)
+- `POST api/orgs/<id>/gdpr/delete/` — `{"confirm": "<org name>"}` erases
+  the workspace, its bytes, and orphaned logins (Owner only; blocked
+  while runs are in flight)
 
 ## How interpretation works
 
@@ -199,6 +219,43 @@ Kill switch, in order: pause the company in the admin, disable the AI
 provider config, revoke the key at the provider, unset the paid
 variables, and return to plain `docker compose up`. Note that revoking
 the key cannot unspend accepted requests.
+
+### Assistant safety
+
+The help assistant has no data access and no tools: it cannot see any
+company's rows or run anything. A server-side guard refuses SQL shapes,
+code, imperative bulk-destructive commands, and requests for other
+companies' data before any token is spent; each refusal writes an
+**Assistant flag** row (organization, user, question, reason) for the
+super-admin. The admin can ban a repeat offender from the assistant
+(flag action or the User preference switch) or deactivate the account
+via the standard User admin. Out-of-scope answers always return the
+same fixed refusal text.
+
+### GDPR self-service
+
+Owners export (`gdpr/export/`) or erase (`gdpr/delete/`, typed-name
+confirmation) their workspace from Settings → Privacy & data. The ZIP
+holds every company row plus original uploads and artifacts; a manifest
+notes any unreadable bytes. Erasure deletes the organization, its
+stored bytes, and member logins left without an organization (shared
+and staff accounts survive), and refuses while runs are in flight.
+The public `/privacy` and `/terms` pages disclose processing, the
+Contributor-training note, and these rights.
+
+## Supplier backfill
+
+Imports create supplier records automatically, but files imported before
+suppliers existed leave no rows. Backfill them once per database:
+
+```sh
+docker compose exec backend python manage.py sync_suppliers
+docker compose exec backend python manage.py sync_suppliers --organization-id 3
+```
+
+Names come from existing offers (case-insensitive, blanks skipped);
+details, favorites, ratings, and notes are then filled in via the UI.
+The command is idempotent: a second run creates nothing.
 
 ## Rebuilding images
 

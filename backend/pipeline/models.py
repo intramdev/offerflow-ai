@@ -150,6 +150,14 @@ class SourceFile(models.Model):
     # explicitly from this table; nothing here is ever re-fetched
     # implicitly, so a file's numbers stay reproducible.
     currency_date = models.DateField(null=True, blank=True)
+    category = models.ForeignKey(
+        "pipeline.Category",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="files",
+        help_text="Optional: every product in this file belongs here.",
+    )
     fx_destination = models.CharField(max_length=3, blank=True, default="")
     fx_rates = models.JSONField(default=dict)
     fx_source = models.CharField(max_length=64, blank=True, default="")
@@ -441,10 +449,208 @@ class ColumnMappingMemory(models.Model):
         ordering = ["-last_used_at"]
 
 
+class Category(models.Model):
+    """One company-owned product category (phones, accessories, ...).
+
+    Categories are optional: companies without any quote a single
+    uncategorized list. Names are unique per company up to case.
+    """
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="categories",
+    )
+    name = models.CharField(max_length=100)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "name"],
+                name="unique_org_category",
+            )
+        ]
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.organization_id})"
+
+
+class Supplier(models.Model):
+    """One supplier a company buys from, auto-created on import.
+
+    The first import naming a supplier creates its record; later
+    imports reuse it. Names are unique per company up to case.
+    favorite_rank orders the favorites shelf (1 is the favorite);
+    null means not a favorite. Ratings score five relationship
+    aspects from 1 to 5 stars; customs fields record whether a
+    shipment needs clearing and at what percentage fee.
+    """
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="suppliers",
+    )
+    name = models.CharField(max_length=255)
+    favorite_rank = models.PositiveIntegerField(null=True, blank=True)
+    location = models.CharField(max_length=255, blank=True)
+    customs_required = models.BooleanField(default=False)
+    customs_fee_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True
+    )
+    rating_shipping = models.PositiveSmallIntegerField(null=True, blank=True)
+    rating_quality = models.PositiveSmallIntegerField(null=True, blank=True)
+    rating_payment = models.PositiveSmallIntegerField(null=True, blank=True)
+    rating_quantity = models.PositiveSmallIntegerField(null=True, blank=True)
+    rating_rma = models.PositiveSmallIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "name"],
+                name="unique_org_supplier",
+            ),
+        ]
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.organization_id})"
+
+
+class SupplierNote(models.Model):
+    """One timestamped note on a supplier relationship.
+
+    Notes are append-only history: relationship quality degrades
+    (or improves) over time, and the trail shows when.
+    """
+
+    supplier = models.ForeignKey(
+        Supplier,
+        on_delete=models.CASCADE,
+        related_name="notes",
+    )
+    author = models.ForeignKey(
+        "auth.User",
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="supplier_notes",
+    )
+    text = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"note {self.id} on supplier {self.supplier_id}"
+
+
+class ProductAlias(models.Model):
+    """One learned product-name spelling, scoped to a single company.
+
+    Each supplier spells the same product the same way, so a confirmed
+    (supplier, spelling, brand, capacity, grade) tuple re-matches
+    instantly on later quotes. One company's learning never leaks into
+    another's: the organization is part of the key. Offers without a
+    capacity are never remembered, since "same product" cannot be
+    verified for them.
+    """
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="product_aliases",
+    )
+    supplier_norm = models.CharField(max_length=255)
+    alias_norm = models.CharField(max_length=255)
+    brand_norm = models.CharField(max_length=255)
+    capacity_gb = models.PositiveIntegerField()
+    grade_norm = models.CharField(max_length=32, default="")
+    canonical_model = models.CharField(max_length=255)
+    category = models.ForeignKey(
+        "pipeline.Category",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="aliases",
+    )
+    use_count = models.PositiveIntegerField(default=1)
+    last_used_at = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    "organization",
+                    "supplier_norm",
+                    "alias_norm",
+                    "brand_norm",
+                    "capacity_gb",
+                    "grade_norm",
+                ],
+                name="unique_org_product_alias",
+            )
+        ]
+        ordering = ["-last_used_at"]
+
+    def __str__(self) -> str:
+        return f"{self.alias_norm} -> {self.canonical_model} ({self.organization_id})"
+
+
 class SupplierStrategy(models.TextChoices):
     LOWEST = "lowest", "Lowest price"
     HIGHEST = "highest", "Highest price"
     PREFERRED = "preferred", "Preferred supplier"
+
+
+class QuoteStatus(models.TextChoices):
+    NEEDS_REVIEW = "needs_review", "Needs review"
+    READY = "ready", "Ready"
+
+
+class CustomerQuote(models.Model):
+    """One generated customer quote over matched cross-supplier offers.
+
+    source_run_ids freezes which supplier runs fed the quote; groups
+    snapshots the confirmed product groups; lines/notes/message are the
+    rendered outputs. Files and messages render from the stored lines,
+    so a quote never changes under a customer after generation.
+    """
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="customer_quotes",
+    )
+    status = models.CharField(
+        max_length=16, choices=QuoteStatus.choices, default=QuoteStatus.NEEDS_REVIEW
+    )
+    source_run_ids = models.JSONField(default=list)
+    groups = models.JSONField(default=list)
+    lines = models.JSONField(default=list)
+    notes = models.JSONField(default=list)
+    message = models.TextField(blank=True)
+    provider_name = models.CharField(max_length=32, default="fixture")
+    simulated = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_quotes",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"Quote {self.id} ({self.organization_id})"
 
 
 class PricingRule(models.Model):
@@ -517,3 +723,41 @@ class SpendAllowance(models.Model):
     period_start = models.DateField(default=timezone.localdate)
     period_spent = models.PositiveIntegerField(default=0)
     updated_at = models.DateTimeField(auto_now=True)
+
+
+class AssistantFlag(models.Model):
+    """One assistant question refused by the server-side guard.
+
+    The refusal costs the company nothing; the row exists so the
+    super-admin can see abuse attempts and ban repeat offenders.
+    The username is snapshotted because the user row may be deleted.
+    """
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="assistant_flags",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    username = models.CharField(max_length=150)
+    question = models.TextField()
+    reason = models.CharField(
+        max_length=16,
+        choices=[
+            ("sql", "SQL attempt"),
+            ("code", "Code attempt"),
+            ("destructive", "Destructive command"),
+            ("cross_tenant", "Other companies' data"),
+        ],
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["organization", "created_at"])]

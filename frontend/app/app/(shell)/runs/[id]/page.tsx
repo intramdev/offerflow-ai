@@ -192,12 +192,15 @@ function RemapDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [defaultCurrency, setDefaultCurrency] = useState("");
+  const [currencies, setCurrencies] = useState<string[] | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     void getOrgSettings(run.organization).then(
       (settings) => {
-        if (!cancelled) setDefaultCurrency(settings.default_currency);
+        if (cancelled) return;
+        setDefaultCurrency(settings.default_currency);
+        setCurrencies(settings.supported_currencies ?? []);
       },
       () => {},
     );
@@ -251,6 +254,7 @@ function RemapDialog({
           selection={selection}
           onChange={setSelection}
           autoFields={Object.keys(stored.detected ?? {})}
+          currencies={currencies}
         />
         {missing.length > 0 ? (
           <p className="text-sm font-medium text-destructive" role="alert">

@@ -73,3 +73,9 @@ class ProviderFactoryTests(SimpleTestCase):
             provider = get_provider(organization_id=7)
         self.assertEqual(provider.name, "meta")
         self.assertFalse(provider.is_simulated)
+
+    def test_meta_defaults_model_when_env_leaves_it_blank(self):
+        env = dict(FULL_META_ENV, OFFERFLOW_META_MODEL="")
+        with mock.patch.dict(os.environ, env, clear=True):
+            provider = get_provider(organization_id=7)
+        self.assertEqual(provider._config.model, "muse-spark-1.3-contributor")

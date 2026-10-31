@@ -9,6 +9,8 @@ from organizations.views import (
     InvitationCreateView,
     MemberListView,
     MembershipListView,
+    OrganizationGdprDeleteView,
+    OrganizationGdprExportView,
     OrganizationSettingsView,
     OrganizationUsageView,
     PreferenceView,
@@ -37,6 +39,16 @@ urlpatterns = [
         "<int:organization_id>/usage/",
         OrganizationUsageView.as_view(),
         name="org-usage",
+    ),
+    path(
+        "<int:organization_id>/gdpr/export/",
+        OrganizationGdprExportView.as_view(),
+        name="org-gdpr-export",
+    ),
+    path(
+        "<int:organization_id>/gdpr/delete/",
+        OrganizationGdprDeleteView.as_view(),
+        name="org-gdpr-delete",
     ),
     path("preferences/me/", PreferenceView.as_view(), name="preferences"),
 ]

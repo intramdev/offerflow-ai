@@ -140,6 +140,16 @@ class PipelineFlowTests(TestCase):
         self.assertEqual(len(lines), 4)
         self.assertTrue(lines[0].startswith("supplier,brand,model"))
 
+    def test_org_default_yields_to_file_currency_column(self):
+        self.org.default_currency = "EUR"
+        self.org.save(update_fields=["default_currency"])
+        run = self.upload_and_process(MIXED_ROWS)
+        self.assertEqual(run.status, RunStatus.NEEDS_INPUT)
+        self.assertEqual(run.mapping.get("applied_defaults"), {})
+        first = run.offers.filter(status=OfferStatus.OK).first()
+        self.assertIsNotNone(first)
+        self.assertEqual(first.currency, "USD")
+
     def test_ignore_record_excludes_offer_and_advances(self):
         from pipeline.review import ignore_request
 

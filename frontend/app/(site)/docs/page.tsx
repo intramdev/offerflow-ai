@@ -1,3 +1,4 @@
+import Link from "next/link";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
@@ -118,6 +119,37 @@ export default function Docs() {
           for each file on its own date. Exports carry sheet and row
           references; exclusions are listed with reasons rather than dropped
           silently.
+        </li>
+        <li>
+          Settings and the import page offer 34 supported currencies in
+          searchable dropdowns — type a letter or two to filter; only a
+          listed code can be chosen. New companies start with USD as both
+          the row default and the quote destination.
+        </li>
+        <li>
+          Customer quotes merge the latest approved run per supplier file,
+          matching same-brand, capacity, and grade products across spelling
+          variants. Uncertain groups reconcile visually and teach your
+          company&apos;s memory on confirm. Optional categories shelve
+          products per file, by the model, or by hand — quotes, messages,
+          and downloads split per category or stay whole.
+        </li>
+        <li>
+          Suppliers appear automatically from imports: order your favorites,
+          rate five aspects, keep timestamped notes, and record location
+          and customs fees.
+        </li>
+        <li>
+          When the paid model lane is up, a Muse chat bubble answers
+          app-how-to questions and every turn spends credits. It has no
+          access to company data; abuse attempts are refused free and
+          flagged for the administrator.
+        </li>
+        <li>
+          Organization owners can download every company row and file, or
+          erase the workspace, from Settings → Privacy &amp; data. See the{" "}
+          <Link href="/privacy">privacy policy</Link> and{" "}
+          <Link href="/terms">terms of service</Link>.
         </li>
       </ul>
 

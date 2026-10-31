@@ -58,7 +58,12 @@ class AIProviderConfigAdmin(admin.ModelAdmin):
 
 @admin.register(Organization)
 class OrganizationAdmin(admin.ModelAdmin):
-    list_display = ("name", "created_at")
+    list_display = (
+        "name",
+        "default_currency",
+        "destination_currency",
+        "created_at",
+    )
     search_fields = ("name",)
 
 
@@ -78,6 +83,6 @@ class InvitationAdmin(admin.ModelAdmin):
 
 @admin.register(UserPreference)
 class UserPreferenceAdmin(admin.ModelAdmin):
-    list_display = ("user", "datetime_format")
-    list_filter = ("datetime_format",)
+    list_display = ("user", "datetime_format", "assistant_banned")
+    list_filter = ("datetime_format", "assistant_banned")
     search_fields = ("user__username",)

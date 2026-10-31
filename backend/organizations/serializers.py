@@ -51,6 +51,7 @@ class PreferenceSerializer(serializers.ModelSerializer):
 
 
 def _clean_currency_code(value) -> str:
+    from pipeline.fx import SUPPORTED_CURRENCIES
     from pipeline.normalize import parse_currency
 
     text = (value or "").strip()
@@ -60,6 +61,11 @@ def _clean_currency_code(value) -> str:
     if code is None:
         raise serializers.ValidationError(
             "Enter a three-letter currency code such as USD, EUR, or CZK."
+        )
+    if code not in SUPPORTED_CURRENCIES:
+        raise serializers.ValidationError(
+            "Unsupported currency code. "
+            f"Supported: {', '.join(SUPPORTED_CURRENCIES)}."
         )
     return code
 
@@ -73,6 +79,12 @@ class OrganizationSettingsSerializer(serializers.Serializer):
     destination_currency = serializers.CharField(
         max_length=3, allow_blank=True, required=False, default=""
     )
+    supported_currencies = serializers.SerializerMethodField()
+
+    def get_supported_currencies(self, _obj) -> list:
+        from pipeline.fx import SUPPORTED_CURRENCIES
+
+        return list(SUPPORTED_CURRENCIES)
 
     def validate_default_currency(self, value):
         return _clean_currency_code(value)

@@ -1,5 +1,8 @@
 # OfferFlow AI
 
+**Beta — version 0.2.0.** Simulated-first and fully usable with no model
+key; paid Muse features activate per company with credits.
+
 Supplier information arrives in messy spreadsheets and documents. OfferFlow AI
 turns them into validated customer quotes through a checkable pipeline: upload,
 preview the mapping, interpret, validate, review the ambiguous rows with a
@@ -38,6 +41,26 @@ organized by Cerebral Valley.
   dashboard gauge with a per-import spend log, and a never-reset grand
   total. Budgets refuse loudly before overspend; kill switches pause a
   company or the whole model lane.
+- **Customer-quote matching** — one quote built from the latest approved
+  run per supplier file, merging same-brand/capacity/grade products
+  across spelling variants. Memory, normalized, and model lanes propose
+  groups; uncertain groups reconcile visually and every confirm teaches
+  the company its suppliers' spellings.
+- **Categories** — optional shelves per company: map a whole file, let
+  the model shelve lines, or reconcile manually. Quotes, messages, and
+  downloads split per category or stay whole; pricing rules can target
+  one category and override the general rule there.
+- **Suppliers** — auto-created on import with drag-and-drop favorites
+  order, five-aspect star ratings, timestamped notes, location, and
+  customs fees.
+- **Help assistant** — a paid-model chat bubble (bottom-right, only when
+  the model lane is up) answering app-how-to questions. Spend lands in
+  the same usage log; a server-side guard refuses SQL, code,
+  bulk-destructive commands, and other companies' data for free, and
+  flags attempts for the admin, who can ban or deactivate abusers.
+- **GDPR self-service** — owners download every company row plus stored
+  bytes as a ZIP, or erase the workspace with typed-name confirmation.
+  Public privacy and terms pages disclose processing and rights.
 
 ## Without AI vs with a Muse key
 
@@ -52,9 +75,12 @@ cannot read.
 | Review questions, ignore-a-record, approve, export, quotes, FX | Yes | Yes |
 | Rules engine, multi-company, audit, credits dashboard | Yes | Yes |
 | Model reads rows local parsing cannot (gap rows only) | No — gaps always ask the reviewer | Yes, in bounded chunks with live progress |
+| Model matching + categorization lanes | Memory/normalized lanes only; the rest asks for review | Yes, bounded single-shot calls |
+| Help assistant chat bubble | Hidden (no model lane) | Visible; every turn spends credits |
 | Monthly credit allowances, spend log, grand total | Visible, zero spend | Enforced per company |
 | Admin-managed key/model, budget + pause controls | Key section empty | Full control |
-| Any network traffic to a model provider | None, by construction | Only for gap rows, only with budget |
+| Assistant abuse flags + bans | No traffic to flag | Guard, flags, ban, deactivation |
+| Any network traffic to a model provider | None, by construction | Only for gaps, matching, categories, chat — only with budget |
 
 Local-first routing keeps paid use minimal: clean files import free even
 with a key configured, and a 357-row file with a handful of gaps costs a
@@ -118,9 +144,9 @@ variables, return to plain `docker compose up`.
 
 ## Verification
 
-- Backend: `265` tests green
+- Backend: `432` tests green
   (`docker compose exec backend python manage.py test`), `pyflakes` clean.
-- Frontend: production `npm run build` renders all routes.
+- Frontend: production `npm run build` renders all 22 routes.
 - Simulated mode emits zero model traffic by construction: no key is
   configured, the worker has no external route, and every synthetic
   artifact is labeled.

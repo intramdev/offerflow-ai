@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import * as React from "react";
 
@@ -71,10 +72,21 @@ function LoginForm() {
 
 export default function LoginPage() {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-muted px-4">
+    <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-muted px-4 py-8">
       <React.Suspense>
         <LoginForm />
       </React.Suspense>
+      <p className="text-xs text-muted-foreground">
+        By signing in you accept the{" "}
+        <Link href="/terms" className="underline">
+          Terms of service
+        </Link>{" "}
+        and{" "}
+        <Link href="/privacy" className="underline">
+          Privacy policy
+        </Link>
+        .
+      </p>
     </div>
   );
 }

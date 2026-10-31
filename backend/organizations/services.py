@@ -63,6 +63,17 @@ def authorize_organization_access(user, organization_id: int) -> Organization:
     return membership.organization
 
 
+def require_organization_owner(user, organization_id: int) -> Organization:
+    """Return the organization if the user owns it (GDPR actions)."""
+    organization = authorize_organization_access(user, organization_id)
+    membership = Membership.objects.get(
+        user=user, organization_id=organization.id
+    )
+    if membership.role != OrganizationRole.OWNER:
+        raise PermissionDenied("That action requires the Owner role.")
+    return organization
+
+
 def _require_manager(user, organization: Organization) -> Membership:
     try:
         membership = Membership.objects.get(user=user, organization=organization)

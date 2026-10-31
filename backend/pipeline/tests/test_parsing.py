@@ -279,3 +279,28 @@ class ParsingTests(SimpleTestCase):
         )
         sheet = parse_named(content, "sup.xlsx")
         self.assertEqual(sheet.rows[0].data["model"], "P1")
+
+    def test_default_constant_yields_to_file_column(self):
+        content = make_workbook(
+            [HEADERS, ["Acme", "Pear", "P1", "128GB", "Black", "A", "Unlocked", 5, 299.99, "USD", ""]]
+        )
+        sheet = parse_named(
+            content,
+            "sup.xlsx",
+            column_constants={"currency": "EUR"},
+            constant_sources={"currency": "default"},
+        )
+        self.assertEqual(sheet.rows[0].data["currency"], "USD")
+
+    def test_manual_constant_still_conflicts_with_file_column(self):
+        content = make_workbook(
+            [HEADERS, ["Acme", "Pear", "P1", "128GB", "Black", "A", "Unlocked", 5, 299.99, "USD", ""]]
+        )
+        with self.assertRaises(UnsupportedFile) as ctx:
+            parse_named(
+                content,
+                "sup.xlsx",
+                column_constants={"currency": "EUR"},
+                constant_sources={"currency": "manual"},
+            )
+        self.assertIn("both a column and a set value", str(ctx.exception))

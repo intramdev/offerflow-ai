@@ -18,7 +18,7 @@ from pipeline.export import sanitize_cell
 from pipeline.fx import FxRateMissing
 from pipeline.models import OfferStatus, PricingRule, SupplierStrategy
 
-MATCHER_KEYS = ("brand", "model", "grade")
+MATCHER_KEYS = ("brand", "model", "grade", "category")
 
 QUOTE_COLUMNS = [
     "Brand",
@@ -195,8 +195,22 @@ def _rule_matches(rule: PricingRule, attrs: dict) -> bool:
 
 
 def _winning_rule(rules: list, attrs: dict):
+    """Pick the rule for one product: category scope first.
+
+    A rule naming a category beats every general rule for products in
+    that category; the general rules only price what no category rule
+    claims. Inside each scope, more matcher keys win, then priority,
+    then name.
+    """
     matching = [rule for rule in rules if rule.active and _rule_matches(rule, attrs)]
-    matching.sort(key=lambda rule: (-len(rule.matcher or {}), rule.priority, rule.name))
+    matching.sort(
+        key=lambda rule: (
+            0 if "category" in (rule.matcher or {}) else 1,
+            -len(rule.matcher or {}),
+            rule.priority,
+            rule.name,
+        )
+    )
     return matching[0] if matching else None
 
 
@@ -330,50 +344,61 @@ def _cell(value):
     return value
 
 
-def render_quote_csv(quote: dict) -> bytes:
-    """Render quote lines as CSV bytes."""
+def render_quote_csv(quote: dict, *, include_category: bool = False) -> bytes:
+    """Render quote lines as CSV bytes.
+
+    include_category appends a trailing Category column for quotes
+    whose lines carry categories; per-run quotes stay untouched.
+    """
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(QUOTE_COLUMNS)
+    columns = QUOTE_COLUMNS + (["Category"] if include_category else [])
+    writer.writerow(columns)
     for line in quote["lines"]:
-        writer.writerow(
-            [
-                sanitize_cell(line["brand"]),
-                sanitize_cell(line["model"]),
-                _cell(line["capacity_gb"]),
-                sanitize_cell(line["grade"]),
-                sanitize_cell(line["supplier"]),
-                _cell(line["quantity"]),
-                line["unit_price"],
-                sanitize_cell(line["currency"]),
-                sanitize_cell(line["rule"] or ""),
-            ]
-        )
+        row = [
+            sanitize_cell(line["brand"]),
+            sanitize_cell(line["model"]),
+            _cell(line["capacity_gb"]),
+            sanitize_cell(line["grade"]),
+            sanitize_cell(line["supplier"]),
+            _cell(line["quantity"]),
+            line["unit_price"],
+            sanitize_cell(line["currency"]),
+            sanitize_cell(line["rule"] or ""),
+        ]
+        if include_category:
+            row.append(sanitize_cell(line.get("category_name") or ""))
+        writer.writerow(row)
     return buffer.getvalue().encode("utf-8")
 
 
-def render_quote_xlsx(quote: dict) -> bytes:
-    """Render quote lines as xlsx bytes (prices as numbers)."""
+def render_quote_xlsx(quote: dict, *, include_category: bool = False) -> bytes:
+    """Render quote lines as xlsx bytes (prices as numbers).
+
+    include_category appends a trailing Category column for quotes
+    whose lines carry categories; per-run quotes stay untouched.
+    """
     from openpyxl import Workbook
 
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Quote"
-    sheet.append(QUOTE_COLUMNS)
+    sheet.append(QUOTE_COLUMNS + (["Category"] if include_category else []))
     for line in quote["lines"]:
-        sheet.append(
-            [
-                sanitize_cell(line["brand"]),
-                sanitize_cell(line["model"]),
-                line["capacity_gb"],
-                sanitize_cell(line["grade"]),
-                sanitize_cell(line["supplier"]),
-                line["quantity"],
-                float(line["unit_price"]),
-                sanitize_cell(line["currency"]),
-                sanitize_cell(line["rule"] or ""),
-            ]
-        )
+        row = [
+            sanitize_cell(line["brand"]),
+            sanitize_cell(line["model"]),
+            line["capacity_gb"],
+            sanitize_cell(line["grade"]),
+            sanitize_cell(line["supplier"]),
+            line["quantity"],
+            float(line["unit_price"]),
+            sanitize_cell(line["currency"]),
+            sanitize_cell(line["rule"] or ""),
+        ]
+        if include_category:
+            row.append(sanitize_cell(line.get("category_name") or ""))
+        sheet.append(row)
     buffer = io.BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()

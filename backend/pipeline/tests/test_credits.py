@@ -84,12 +84,19 @@ class MonthlyCreditTests(TestCase):
     def test_new_account_activates_today(self):
         allowance = get_allowance(self.org.id)
         self.assertEqual(allowance.cycle_anchor, timezone.localdate())
-        self.assertEqual(allowance.monthly_credits, 0)
+        self.assertEqual(allowance.monthly_credits, 25_000_000)
 
     def test_new_account_inherits_config_default(self):
         AIProviderConfig.objects.create(default_monthly_credits=5000)
         allowance = get_allowance(self.org.id)
         self.assertEqual(allowance.monthly_credits, 5000)
+
+    def test_fresh_config_ships_with_sane_defaults(self):
+        config = AIProviderConfig.objects.create()
+        self.assertEqual(config.model, "muse-spark-1.3-contributor")
+        self.assertEqual(config.default_monthly_credits, 25_000_000)
+        allowance = get_allowance(self.org.id)
+        self.assertEqual(allowance.monthly_credits, 25_000_000)
 
     def test_lazy_reset_on_new_cycle(self):
         allowance = get_allowance(self.org.id)
@@ -267,6 +274,31 @@ class UsageEndpointTests(TestCase):
         self.assertEqual(entry["requests"], 1)
         self.assertEqual(entry["tokens"], 952)
         self.assertEqual(entry["calls"][0]["prompt_tokens"], 291)
+        self.assertEqual(data["matching"], [])
+
+    def test_match_spend_listed_separately(self):
+        from pipeline.models import UsageEvent
+
+        UsageEvent.objects.create(
+            organization=self.org,
+            run=None,
+            kind="provider_call",
+            quantity=40,
+            detail={
+                "prompt_tokens": 30,
+                "completion_tokens": 10,
+                "model": "muse-spark",
+                "task": "match",
+                "block": "apple 128GB",
+            },
+        )
+        response = self.client.get(f"/api/orgs/{self.org.id}/usage/")
+        self.assertEqual(response.status_code, 200, response.content)
+        data = response.data
+        self.assertEqual(len(data["imports"]), 0)
+        self.assertEqual(len(data["matching"]), 1)
+        self.assertEqual(data["matching"][0]["total"], 40)
+        self.assertEqual(data["matching"][0]["label"], "apple 128GB")
 
     def test_read_snaps_new_period(self):
         allowance = get_allowance(self.org.id)
@@ -307,6 +339,8 @@ class AdminCreditActionTests(TestCase):
         return {"action": "", "_selected_action": [str(self.allowance.pk)]}
 
     def test_increase_monthly_credits(self):
+        self.allowance.monthly_credits = 0
+        self.allowance.save(update_fields=["monthly_credits"])
         payload = self._selected()
         payload["action"] = "adjust_credits"
         response = self.client.post(payload["action"] and self.changelist, payload)

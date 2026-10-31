@@ -329,10 +329,16 @@ def _table_to_sheet(
         if canonical not in HEADER_TOKENS:
             raise UnsupportedFile(f"Unknown column {canonical!r}.")
     constants = dict(column_constants or {})
-    for canonical, value in constants.items():
+    labels = constant_sources or {}
+    for canonical, value in list(constants.items()):
         if canonical not in HEADER_TOKENS:
             raise UnsupportedFile(f"Unknown column {canonical!r}.")
         if canonical in column_map and canonical not in ignored:
+            if labels.get(canonical) == "default":
+                # The organization default only fills unspecified
+                # fields; a real file column wins over it.
+                del constants[canonical]
+                continue
             raise UnsupportedFile(
                 f"Column {canonical!r} has both a column and a set value."
             )
@@ -345,7 +351,6 @@ def _table_to_sheet(
     for canonical in ignored:
         column_map.pop(canonical, None)
         sources.pop(canonical, None)
-    labels = constant_sources or {}
     for canonical in constants:
         sources[canonical] = labels.get(canonical, "manual")
 

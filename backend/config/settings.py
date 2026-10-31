@@ -196,7 +196,7 @@ LOGGING = {
     "root": {"handlers": ["console"], "level": "INFO"},
 }
 
-APP_VERSION = _env("OFFERFLOW_APP_VERSION", "dev")
+APP_VERSION = _env("OFFERFLOW_APP_VERSION", "0.2.0-beta")
 OFFERFLOW_FILE_ROOT = _env("OFFERFLOW_FILE_ROOT", "/var/offerflow/files")
 
 # Spreadsheet intake limits (overridable per environment).

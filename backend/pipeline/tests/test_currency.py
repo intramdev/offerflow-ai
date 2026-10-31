@@ -8,6 +8,7 @@ from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from organizations.models import Membership, Organization
+from pipeline.fx import SUPPORTED_CURRENCIES
 from pipeline.models import ColumnMappingMemory
 from pipeline.normalize import parse_currency
 from pipeline.tests.test_parsing import HEADERS, make_workbook
@@ -152,9 +153,10 @@ class DefaultCurrencyTests(TestCase):
     def test_settings_round_trip(self):
         response = self.client.get(f"/api/orgs/{self.org.id}/settings/")
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["default_currency"], "USD")
+        self.assertEqual(response.data["destination_currency"], "USD")
         self.assertEqual(
-            response.data,
-            {"default_currency": "", "destination_currency": ""},
+            response.data["supported_currencies"], list(SUPPORTED_CURRENCIES)
         )
         updated = self.client.put(
             f"/api/orgs/{self.org.id}/settings/",
@@ -162,10 +164,13 @@ class DefaultCurrencyTests(TestCase):
             format="json",
         )
         self.assertEqual(updated.status_code, 200)
-        self.assertEqual(
-            updated.data,
-            {"default_currency": "EUR", "destination_currency": ""},
-        )
+        self.assertEqual(updated.data["default_currency"], "EUR")
+        self.assertEqual(updated.data["destination_currency"], "USD")
+
+    def test_new_organization_defaults_to_usd(self):
+        org = Organization.objects.create(name="Fresh")
+        self.assertEqual(org.default_currency, "USD")
+        self.assertEqual(org.destination_currency, "USD")
 
     def test_settings_reject_bad_code(self):
         response = self.client.put(
@@ -174,6 +179,27 @@ class DefaultCurrencyTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 400)
+
+    def test_settings_reject_unsupported_code(self):
+        response = self.client.put(
+            f"/api/orgs/{self.org.id}/settings/",
+            {"destination_currency": "XXX"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Supported", str(response.data))
+        self.org.refresh_from_db()
+        self.assertEqual(self.org.destination_currency, "USD")
+
+    def test_settings_blank_still_clears(self):
+        updated = self.client.put(
+            f"/api/orgs/{self.org.id}/settings/",
+            {"default_currency": "", "destination_currency": ""},
+            format="json",
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.data["default_currency"], "")
+        self.assertEqual(updated.data["destination_currency"], "")
 
     def test_settings_viewer_read_only(self):
         self.client.force_authenticate(self.bob)

@@ -53,6 +53,10 @@ export default function SiteLayout({ children }: { children: React.ReactNode }) 
           <p>
             Licensed under the GNU Affero General Public License version 3
             only. <Link href="/source">Source and licenses</Link>
+            {" · "}
+            <Link href="/privacy">Privacy policy</Link>
+            {" · "}
+            <Link href="/terms">Terms of service</Link>
           </p>
         </div>
       </footer>

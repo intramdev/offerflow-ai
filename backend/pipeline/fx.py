@@ -21,7 +21,9 @@ from django.utils import timezone
 
 # Synthetic anchors (units per USD) for the fixture provider. These are
 # clearly demo data, not market rates; the date-seeded jitter below is
-# what makes each day's table differ.
+# what makes each day's table differ. The original six entries stay
+# first so long-standing demo rates keep their sequence; the rest are
+# alphabetical.
 BASE_UNITS_PER_USD = {
     "USD": 1.0,
     "EUR": 0.92,
@@ -29,7 +31,41 @@ BASE_UNITS_PER_USD = {
     "CZK": 23.1,
     "CHF": 0.88,
     "PLN": 4.02,
+    "AUD": 1.52,
+    "BGN": 1.80,
+    "BRL": 5.42,
+    "CAD": 1.39,
+    "CNY": 7.24,
+    "DKK": 6.87,
+    "HKD": 7.79,
+    "HRK": 6.93,
+    "HUF": 368.0,
+    "IDR": 15850.0,
+    "ILS": 3.72,
+    "INR": 84.1,
+    "ISK": 138.5,
+    "JPY": 151.5,
+    "KRW": 1378.0,
+    "MXN": 19.8,
+    "MYR": 4.46,
+    "NOK": 10.9,
+    "NZD": 1.66,
+    "PHP": 58.3,
+    "RON": 4.57,
+    "RUB": 97.5,
+    "SEK": 10.5,
+    "SGD": 1.34,
+    "THB": 34.2,
+    "TRY": 34.5,
+    "XDR": 0.76,
+    "ZAR": 18.1,
 }
+
+# The currencies OfferFlow supports, alphabetical. This is the single
+# source of truth: settings validation and the currency dropdowns
+# (served via the organization settings response) both read it, and
+# the fixture provider above rates every entry.
+SUPPORTED_CURRENCIES = tuple(sorted(BASE_UNITS_PER_USD))
 
 FIXTURE_SOURCE = "fixture (synthetic demo rates)"
 

@@ -33,6 +33,18 @@ class BaseProvider:
         """Interpret a table-like payload. Implemented per provider."""
         raise NotImplementedError
 
+    def match_products(self, payload: Mapping[str, Any], on_chunk=None):
+        """Cluster product-name spellings into same-product groups."""
+        raise NotImplementedError
+
+    def categorize(self, payload: Mapping[str, Any], on_chunk=None):
+        """Assign products to the company's category names."""
+        raise NotImplementedError
+
+    def chat(self, payload: Mapping[str, Any], on_chunk=None):
+        """Answer one help-assistant turn."""
+        raise NotImplementedError
+
 
 class FixtureProvider(BaseProvider):
     """Deterministic synthetic responses. Pure function; no network I/O."""
@@ -50,6 +62,66 @@ class FixtureProvider(BaseProvider):
             "row_count": len(rows),
             "rows": [{"index": index, "echo": row} for index, row in enumerate(rows)],
         }
+
+    def match_products(self, payload: Mapping[str, Any], on_chunk=None):
+        """Echo each spelling as its own zero-confidence cluster.
+
+        The fixture cannot judge similarity, so every unknown spelling
+        stays provisional and waits for human reconcile. Pure function;
+        no spend and no progress callbacks.
+        """
+        spellings = (
+            payload.get("spellings", []) if isinstance(payload, Mapping) else []
+        )
+        if not isinstance(spellings, list):
+            spellings = []
+        clusters = []
+        for index, entry in enumerate(spellings):
+            raw = entry.get("raw", "") if isinstance(entry, Mapping) else ""
+            clusters.append(
+                {"canonical": raw, "members": [index], "confidence": 0.0}
+            )
+        return {
+            "simulated": True,
+            "label": "synthetic fixture response",
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+            "clusters": clusters,
+        }
+
+    def categorize(self, payload: Mapping[str, Any], on_chunk=None):
+        """Leave every product unassigned at zero confidence.
+
+        The fixture cannot judge categories, so simulated runs flag
+        uncategorized products for human reconcile. Pure function.
+        """
+        products = (
+            payload.get("products", []) if isinstance(payload, Mapping) else []
+        )
+        if not isinstance(products, list):
+            products = []
+        return {
+            "simulated": True,
+            "label": "synthetic fixture response",
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+            "decisions": [
+                {"ref": index, "category": "", "confidence": 0.0}
+                for index in range(len(products))
+            ],
+        }
+
+    def chat(self, payload: Mapping[str, Any], on_chunk=None):
+        """Simulated runs have no assistant; the icon stays hidden."""
+        from common.meta import ProviderError
+
+        raise ProviderError("The assistant needs the paid model.")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -96,7 +168,11 @@ def _resolve_credentials(key_prefix: str) -> tuple[str, str]:
         raise ProviderNotConfigured("No Meta API key configured.")
     if not key.startswith(key_prefix):
         raise ProviderNotConfigured("Meta API key format unexpected.")
-    model = (os.environ.get("OFFERFLOW_META_MODEL", "") or "").strip()
+    from organizations.models import DEFAULT_AI_MODEL
+
+    model = (
+        os.environ.get("OFFERFLOW_META_MODEL", "") or DEFAULT_AI_MODEL
+    ).strip()
     if not model:
         raise ProviderNotConfigured("No Meta model configured.")
     return key, model

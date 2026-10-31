@@ -170,6 +170,11 @@ export interface UsageImport {
   calls: UsageCall[];
 }
 
+export interface UsageMatchCall extends UsageCall {
+  label: string;
+  task: string;
+}
+
 export interface UsageSummary {
   allowance: number;
   used: number;
@@ -179,6 +184,7 @@ export interface UsageSummary {
   grand_total: number;
   paused: boolean;
   imports: UsageImport[];
+  matching: UsageMatchCall[];
 }
 
 export async function getUsage(organizationId: number): Promise<UsageSummary> {
@@ -188,6 +194,7 @@ export async function getUsage(organizationId: number): Promise<UsageSummary> {
 export interface OrgSettings {
   default_currency: string;
   destination_currency: string;
+  supported_currencies: string[];
 }
 
 export async function getOrgSettings(organizationId: number): Promise<OrgSettings> {
@@ -196,7 +203,9 @@ export async function getOrgSettings(organizationId: number): Promise<OrgSetting
 
 export async function updateOrgSettings(
   organizationId: number,
-  settings: Partial<OrgSettings>,
+  settings: Partial<
+    Pick<OrgSettings, "default_currency" | "destination_currency">
+  >,
 ): Promise<OrgSettings> {
   return api<OrgSettings>(`/api/orgs/${organizationId}/settings/`, {
     method: "PUT",
@@ -333,6 +342,8 @@ export interface SourceFile {
   fx_source: string;
   fx_simulated: boolean;
   fx_fetched_at: string | null;
+  category: number | null;
+  category_name: string;
   created_at: string;
 }
 
@@ -364,6 +375,17 @@ export async function updateFileFx(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ currency_date: currencyDate }),
+  });
+}
+
+export async function setFileCategory(
+  fileId: number,
+  categoryId: number | null,
+): Promise<SourceFile> {
+  return api<SourceFile>(`/api/pipeline/files/${fileId}/category/`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ category_id: categoryId }),
   });
 }
 
@@ -512,6 +534,163 @@ export async function deleteRule(ruleId: number): Promise<void> {
   await api(`/api/pipeline/rules/${ruleId}/`, { method: "DELETE" });
 }
 
+// --- Categories ---------------------------------------------------------
+
+export interface Category {
+  id: number;
+  organization: number;
+  name: string;
+  created_at: string;
+}
+
+export async function listCategories(
+  organizationId?: number,
+): Promise<Category[]> {
+  const query = organizationId ? `?organization_id=${organizationId}` : "";
+  return api<Category[]>(`/api/pipeline/categories/${query}`);
+}
+
+export async function createCategory(
+  organizationId: number,
+  name: string,
+): Promise<Category> {
+  return api<Category>("/api/pipeline/categories/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ organization_id: organizationId, name }),
+  });
+}
+
+export async function renameCategory(
+  categoryId: number,
+  name: string,
+): Promise<Category> {
+  return api<Category>(`/api/pipeline/categories/${categoryId}/`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+}
+
+export async function deleteCategory(categoryId: number): Promise<void> {
+  await api(`/api/pipeline/categories/${categoryId}/`, { method: "DELETE" });
+}
+
+// --- Suppliers --------------------------------------------------------
+
+export interface Supplier {
+  id: number;
+  organization: number;
+  name: string;
+  favorite_rank: number | null;
+  location: string;
+  customs_required: boolean;
+  customs_fee_percent: string | null;
+  rating_shipping: number | null;
+  rating_quality: number | null;
+  rating_payment: number | null;
+  rating_quantity: number | null;
+  rating_rma: number | null;
+  notes_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SupplierNote {
+  id: number;
+  supplier: number;
+  author_name: string;
+  text: string;
+  created_at: string;
+}
+
+export interface SupplierInput {
+  organization_id?: number;
+  name?: string;
+  location?: string | null;
+  customs_required?: boolean;
+  customs_fee_percent?: string | null;
+  rating_shipping?: number | null;
+  rating_quality?: number | null;
+  rating_payment?: number | null;
+  rating_quantity?: number | null;
+  rating_rma?: number | null;
+}
+
+export async function listSuppliers(
+  organizationId?: number,
+): Promise<Supplier[]> {
+  const query = organizationId ? `?organization_id=${organizationId}` : "";
+  return api<Supplier[]>(`/api/pipeline/suppliers/${query}`);
+}
+
+export async function getSupplier(supplierId: number): Promise<Supplier> {
+  return api<Supplier>(`/api/pipeline/suppliers/${supplierId}/`);
+}
+
+export async function createSupplier(input: SupplierInput): Promise<Supplier> {
+  return api<Supplier>("/api/pipeline/suppliers/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function updateSupplier(
+  supplierId: number,
+  input: SupplierInput,
+): Promise<Supplier> {
+  return api<Supplier>(`/api/pipeline/suppliers/${supplierId}/`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteSupplier(supplierId: number): Promise<void> {
+  await api(`/api/pipeline/suppliers/${supplierId}/`, { method: "DELETE" });
+}
+
+export async function setFavoriteOrder(
+  organizationId: number,
+  orderedIds: number[],
+): Promise<Supplier[]> {
+  return api<Supplier[]>(
+    `/api/pipeline/suppliers/order/?organization_id=${organizationId}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ordered_ids: orderedIds }),
+    },
+  );
+}
+
+export async function listSupplierNotes(
+  supplierId: number,
+): Promise<SupplierNote[]> {
+  return api<SupplierNote[]>(`/api/pipeline/suppliers/${supplierId}/notes/`);
+}
+
+export async function addSupplierNote(
+  supplierId: number,
+  text: string,
+): Promise<SupplierNote> {
+  return api<SupplierNote>(`/api/pipeline/suppliers/${supplierId}/notes/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+}
+
+export async function deleteSupplierNote(
+  supplierId: number,
+  noteId: number,
+): Promise<void> {
+  await api(`/api/pipeline/suppliers/${supplierId}/notes/${noteId}/`, {
+    method: "DELETE",
+  });
+}
+
 // --- Quotes -------------------------------------------------------------
 
 export interface QuoteLine {
@@ -545,4 +724,167 @@ export interface Quote {
 
 export async function getQuote(runId: number): Promise<Quote> {
   return api<Quote>(`/api/pipeline/runs/${runId}/quote/`);
+}
+
+export interface QuoteGroupMember {
+  id: number;
+  supplier: string;
+  model_name: string;
+  grade: string;
+  unit_price: string;
+  currency: string;
+}
+
+export interface QuoteGroup {
+  brand: string;
+  capacity_gb: number | null;
+  grade: string;
+  canonical_model: string;
+  confidence: number;
+  source: string;
+  needs_review: boolean;
+  category_id: number | null;
+  category_name: string;
+  category_source: string;
+  category_review: boolean;
+  offers: number[];
+  suppliers: string[];
+  members?: QuoteGroupMember[];
+  suggestion?: string;
+  category_suggestion?: string;
+}
+
+export interface QuoteCandidate {
+  supplier: string;
+  unit_price: string;
+  currency: string;
+}
+
+export interface CustomerQuoteLine extends QuoteLine {
+  candidates?: QuoteCandidate[];
+  category_id: number | null;
+  category_name: string;
+}
+
+export interface CustomerQuote {
+  id: number;
+  organization: number;
+  status: string;
+  source_run_ids: number[];
+  sources: { run_id: number; filename: string }[];
+  groups: QuoteGroup[];
+  lines: CustomerQuoteLine[];
+  notes: string[];
+  message: string;
+  provider_name: string;
+  simulated: boolean;
+  created_at: string;
+}
+
+export async function listCustomerQuotes(
+  organizationId?: number,
+): Promise<CustomerQuote[]> {
+  const query = organizationId ? `?organization_id=${organizationId}` : "";
+  return api<CustomerQuote[]>(`/api/pipeline/quotes/${query}`);
+}
+
+export async function startCustomerQuote(
+  organizationId: number,
+): Promise<CustomerQuote> {
+  return api<CustomerQuote>(`/api/pipeline/quotes/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ organization_id: organizationId }),
+  });
+}
+
+export async function getCustomerQuote(quoteId: number): Promise<CustomerQuote> {
+  return api<CustomerQuote>(`/api/pipeline/quotes/${quoteId}/`);
+}
+
+export async function confirmCustomerQuote(
+  quoteId: number,
+  groups: {
+    canonical_model: string;
+    offer_ids: number[];
+    category_id: number | null;
+  }[],
+): Promise<CustomerQuote> {
+  return api<CustomerQuote>(`/api/pipeline/quotes/${quoteId}/confirm/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ groups }),
+  });
+}
+
+export async function getCustomerQuoteMessage(
+  quoteId: number,
+  categoryId?: number | "none",
+): Promise<{ message: string }> {
+  const query =
+    categoryId === undefined ? "" : `?category_id=${categoryId}`;
+  return api<{ message: string }>(
+    `/api/pipeline/quotes/${quoteId}/message/${query}`,
+  );
+}
+
+// --- Assistant -----------------------------------------------------------
+
+export async function getAssistantStatus(
+  organizationId: number,
+): Promise<{ available: boolean }> {
+  return api<{ available: boolean }>(
+    `/api/pipeline/assistant/status/?organization_id=${organizationId}`,
+  );
+}
+
+export interface AssistantTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface AssistantReply {
+  reply: string;
+  out_of_scope: boolean;
+  tokens: number;
+  flagged?: boolean;
+}
+
+export async function askAssistant(
+  organizationId: number,
+  messages: AssistantTurn[],
+): Promise<AssistantReply> {
+  return api<AssistantReply>("/api/pipeline/assistant/chat/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ organization_id: organizationId, messages }),
+  });
+}
+
+// --- GDPR ----------------------------------------------------------------
+
+export async function downloadGdprExport(
+  organizationId: number,
+): Promise<Blob> {
+  return download(`/api/orgs/${organizationId}/gdpr/export/`);
+}
+
+export interface GdprDeleteResult {
+  organization: string;
+  stored_files_removed: number;
+  member_logins_deleted: number;
+}
+
+export async function deleteOrganizationData(
+  organizationId: number,
+  confirm: string,
+): Promise<GdprDeleteResult> {
+  return api<GdprDeleteResult>(
+    `/api/orgs/${organizationId}/gdpr/delete/`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm }),
+    },
+  );
 }

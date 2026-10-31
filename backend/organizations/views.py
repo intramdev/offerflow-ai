@@ -103,6 +103,27 @@ class OrganizationUsageView(APIView):
                     "model": detail.get("model", ""),
                 }
             )
+        match_calls = (
+            UsageEvent.objects.filter(
+                organization=organization, kind="provider_call", run__isnull=True
+            )
+            .order_by("-created_at")[:50]
+        )
+        matching = []
+        for event in match_calls:
+            detail = event.detail or {}
+            matching.append(
+                {
+                    "at": event.created_at.isoformat(),
+                    "task": detail.get("task", ""),
+                    "prompt_tokens": detail.get("prompt_tokens", 0),
+                    "completion_tokens": detail.get("completion_tokens", 0),
+                    "total": event.quantity,
+                    "model": detail.get("model", ""),
+                    "label": detail.get("block", "")
+                    or detail.get("question", ""),
+                }
+            )
         return Response(
             {
                 "allowance": allowance.monthly_credits,
@@ -113,6 +134,7 @@ class OrganizationUsageView(APIView):
                 "grand_total": allowance.tokens_spent,
                 "paused": allowance.paused,
                 "imports": imports,
+                "matching": matching,
             }
         )
 
@@ -270,3 +292,80 @@ class OrganizationSettingsView(APIView):
             updated,
         )
         return Response(OrganizationSettingsSerializer(organization).data)
+
+
+class OrganizationGdprExportView(APIView):
+    """Download every organization row plus stored bytes (Owner only)."""
+
+    def get(self, request, organization_id):
+        import io
+
+        from django.http import FileResponse
+
+        from organizations.gdpr import build_export_archive
+
+        try:
+            organization = services.require_organization_owner(
+                request.user, organization_id
+            )
+        except DjangoPermissionDenied as error:
+            from rest_framework.exceptions import (
+                PermissionDenied as DRFPermissionDenied,
+            )
+
+            raise DRFPermissionDenied(str(error)) from error
+        content, manifest = build_export_archive(organization)
+        missing = [
+            entry
+            for entry in manifest["uploads"] + manifest["artifacts"]
+            if not entry["included"]
+        ]
+        if missing:
+            from pipeline.jobs import record_audit
+
+            record_audit(
+                organization.id,
+                request.user,
+                "gdpr_export_partial",
+                "organization",
+                organization.id,
+                {"missing": len(missing)},
+            )
+        safe = "".join(
+            char if char.isalnum() else "_" for char in organization.name[:40]
+        )
+        return FileResponse(
+            io.BytesIO(content),
+            content_type="application/zip",
+            filename=f"offerflow-export-{safe or 'org'}-{organization.id}.zip",
+            as_attachment=True,
+        )
+
+
+class OrganizationGdprDeleteView(APIView):
+    """Erase the organization after typed-name confirmation (Owner only)."""
+
+    def post(self, request, organization_id):
+        from organizations.gdpr import erase_organization
+
+        try:
+            organization = services.require_organization_owner(
+                request.user, organization_id
+            )
+        except DjangoPermissionDenied as error:
+            from rest_framework.exceptions import (
+                PermissionDenied as DRFPermissionDenied,
+            )
+
+            raise DRFPermissionDenied(str(error)) from error
+        confirm = request.data.get("confirm", "")
+        if confirm != organization.name:
+            return Response(
+                {"detail": "Type the organization name to confirm deletion."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            result = erase_organization(organization=organization)
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
+        return Response(result)

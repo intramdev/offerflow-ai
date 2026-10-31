@@ -11,6 +11,7 @@ import { Select } from "@/components/ui/select";
 import {
   ApiError,
   createRule,
+  listCategories,
   updateRule,
   type PricingRule,
   type RuleInput,
@@ -66,6 +67,8 @@ export function RuleDialog({
   const [brand, setBrand] = React.useState(rule?.matcher.brand ?? "");
   const [model, setModel] = React.useState(rule?.matcher.model ?? "");
   const [grade, setGrade] = React.useState(rule?.matcher.grade ?? "");
+  const [category, setCategory] = React.useState(rule?.matcher.category ?? "");
+  const [shelves, setShelves] = React.useState<string[]>([]);
   const [drafts, setDrafts] = React.useState<OpDraft[]>(() => toDrafts(rule?.ops ?? []));
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -80,9 +83,22 @@ export function RuleDialog({
     setBrand(rule?.matcher.brand ?? "");
     setModel(rule?.matcher.model ?? "");
     setGrade(rule?.matcher.grade ?? "");
+    setCategory(rule?.matcher.category ?? "");
     setDrafts(toDrafts(rule?.ops ?? []));
     setError(null);
-  }, [open, rule]);
+    let cancelled = false;
+    void listCategories(organizationId).then(
+      (rows) => {
+        if (!cancelled) setShelves(rows.map((row) => row.name));
+      },
+      () => {
+        if (!cancelled) setShelves([]);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [open, rule, organizationId]);
 
   function setDraft(index: number, patch: Partial<OpDraft>) {
     setDrafts(drafts.map((d, i) => (i === index ? { ...d, ...patch } : d)));
@@ -95,6 +111,7 @@ export function RuleDialog({
     if (brand.trim()) matcher.brand = brand.trim();
     if (model.trim()) matcher.model = model.trim();
     if (grade.trim()) matcher.grade = grade.trim();
+    if (category.trim()) matcher.category = category.trim();
     const input: RuleInput = {
       organization_id: organizationId,
       name: name.trim(),
@@ -121,7 +138,7 @@ export function RuleDialog({
       open={open}
       onClose={onClose}
       title={rule ? `Edit rule “${rule.name}”` : "New pricing rule"}
-      description="Rules pick one supplier per product, then reprice. More specific matchers win over general ones."
+      description="Rules pick one supplier per product, then reprice. A rule naming a category beats any general rule; otherwise more specific matchers win."
       wide
     >
       <div className="space-y-5">
@@ -168,7 +185,7 @@ export function RuleDialog({
           <legend className="text-sm font-medium">
             Applies to <span className="font-normal text-muted-foreground">(blank = all products)</span>
           </legend>
-          <div className="mt-1.5 grid gap-3 sm:grid-cols-3">
+          <div className="mt-1.5 grid gap-3 sm:grid-cols-2">
             <label className="block text-sm">
               Brand
               <Input className="mt-1.5" value={brand} onChange={(e) => setBrand(e.target.value)} placeholder="Apple" />
@@ -180,6 +197,21 @@ export function RuleDialog({
             <label className="block text-sm">
               Grade
               <Input className="mt-1.5" value={grade} onChange={(e) => setGrade(e.target.value)} placeholder="A" />
+            </label>
+            <label className="block text-sm">
+              Category
+              <Input
+                className="mt-1.5"
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                placeholder="Phones"
+                list="rule-category-shelves"
+              />
+              <datalist id="rule-category-shelves">
+                {shelves.map((shelf) => (
+                  <option key={shelf} value={shelf} />
+                ))}
+              </datalist>
             </label>
           </div>
         </fieldset>

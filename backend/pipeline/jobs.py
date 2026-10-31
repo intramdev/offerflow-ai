@@ -292,6 +292,11 @@ def _parse_step(run: ImportRun) -> bool:
     except MappingRequired as exc:
         _ask_mapping(run, exc)
         return True
+    for field in list(applied):
+        # A real file column wins over the organization default; only
+        # defaults that actually filled a gap are recorded as applied.
+        if field in sheet.column_map:
+            del applied[field]
     run.mapping = {
         "headers": sheet.headers,
         "detected": sheet.column_map,
@@ -456,6 +461,19 @@ def _interpret_step(run: ImportRun) -> None:
                 evidence={"provenance": offer.provenance, "raw": cells},
                 choices=gap.get("choices", []),
             )
+    from pipeline.suppliers import ensure_suppliers
+
+    ensure_suppliers(
+        run.organization_id,
+        sorted(
+            {
+                offer.supplier
+                for offer in NormalizedOffer.objects.filter(run=run).only(
+                    "supplier"
+                )
+            }
+        ),
+    )
     transition_run(run, RunStatus.VALIDATION)
 
 

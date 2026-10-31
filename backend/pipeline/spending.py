@@ -69,17 +69,19 @@ def next_reset_date(anchor: date | None, today: date | None = None) -> date:
 
 def _creation_defaults() -> dict:
     """Defaults for a first-time credit account (activation day = today)."""
-    from organizations.models import AIProviderConfig
+    from organizations.models import AIProviderConfig, DEFAULT_MONTHLY_CREDITS
 
     config = AIProviderConfig.get_solo()
     return {
         "cycle_anchor": timezone.localdate(),
-        "monthly_credits": config.default_monthly_credits if config else 0,
+        "monthly_credits": (
+            config.default_monthly_credits if config else DEFAULT_MONTHLY_CREDITS
+        ),
     }
 
 
 def get_allowance(organization_id: int) -> SpendAllowance:
-    """Return the allowance, creating the zero-budget default if needed."""
+    """Return the allowance, creating the default credit account if needed."""
     try:
         allowance, _created = SpendAllowance.objects.get_or_create(
             organization_id=organization_id, defaults=_creation_defaults()

@@ -17,6 +17,7 @@ import { StatusBadge } from "@/components/app/status-badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -28,15 +29,39 @@ import {
 import {
   ApiError,
   deleteFile,
+  listCategories,
   listFiles,
   renameFile,
+  setFileCategory,
   updateFileFx,
+  type Category,
   type SourceFile,
 } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { formatBytes, formatDateTime } from "@/lib/format";
 
 const TODAY = new Date().toISOString().slice(0, 10);
+
+function trimRate(rate: string): string {
+  if (!/^-?\d+(\.\d+)?$/.test(rate)) return rate;
+  return rate.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+}
+
+function fxSummary(file: {
+  fx_destination: string;
+  fx_rates: Record<string, string>;
+  fx_simulated: boolean;
+}): string {
+  if (!file.fx_destination) return "no destination";
+  const entries = Object.entries(file.fx_rates ?? {});
+  if (entries.length === 0) return `→ ${file.fx_destination}`;
+  const shown = entries
+    .slice(0, 2)
+    .map(([from, rate]) => `${from}→${file.fx_destination} ${trimRate(rate)}`);
+  const extra = entries.length > 2 ? ` +${entries.length - 2}` : "";
+  const tag = file.fx_simulated ? " (simulated)" : "";
+  return `${shown.join(" · ")}${extra}${tag}`;
+}
 const PAGE_SIZE = 50;
 
 function pageWindow(current: number, total: number): (number | "…")[] {
@@ -155,20 +180,27 @@ export default function FilesPage() {
   const [renaming, setRenaming] = React.useState<SourceFile | null>(null);
   const [draftName, setDraftName] = React.useState("");
   const [savingName, setSavingName] = React.useState(false);
+  const [categories, setCategories] = React.useState<Category[]>([]);
+  const [catBusy, setCatBusy] = React.useState<number | null>(null);
 
   React.useEffect(() => {
     if (!active) {
       setFiles([]);
+      setCategories([]);
       setLoading(false);
       return;
     }
     let cancelled = false;
     setLoading(true);
     setError(null);
-    void listFiles(active.organization)
-      .then((rows) => {
+    void Promise.all([
+      listFiles(active.organization),
+      listCategories(active.organization).catch(() => [] as Category[]),
+    ])
+      .then(([rows, shelves]) => {
         if (!cancelled) {
           setFiles(rows);
+          setCategories(shelves);
           setPage(1);
         }
       })
@@ -198,6 +230,23 @@ export default function FilesPage() {
       );
     } finally {
       setFxBusy(null);
+    }
+  }
+
+  async function changeCategory(file: SourceFile, value: string) {
+    const next = value === "" ? null : Number(value);
+    if (next === file.category) return;
+    setCatBusy(file.id);
+    setError(null);
+    try {
+      const updated = await setFileCategory(file.id, next);
+      setFiles((rows) => rows.map((row) => (row.id === file.id ? updated : row)));
+    } catch (err) {
+      setError(
+        err instanceof ApiError ? err.message : "Could not map the file.",
+      );
+    } finally {
+      setCatBusy(null);
     }
   }
 
@@ -300,6 +349,7 @@ export default function FilesPage() {
           <TableHeader>
             <TableRow>
               <TableHead className="px-3">File</TableHead>
+              <TableHead className="px-3">Category</TableHead>
               <TableHead className="px-3">Uploaded</TableHead>
               <TableHead className="px-3">FX date</TableHead>
               <TableHead className="px-3">Run</TableHead>
@@ -316,6 +366,30 @@ export default function FilesPage() {
                   <span className="block text-xs text-muted-foreground">
                     {formatBytes(file.size_bytes)}
                   </span>
+                </TableCell>
+                <TableCell className="px-3">
+                  {canOperate && categories.length > 0 ? (
+                    <Select
+                      value={file.category === null ? "" : String(file.category)}
+                      disabled={catBusy === file.id}
+                      onChange={(e) => void changeCategory(file, e.target.value)}
+                      aria-label={`Category for ${file.original_name}`}
+                      className="h-8 max-w-44 py-0 text-xs"
+                    >
+                      <option value="">No category</option>
+                      {categories.map((shelf) => (
+                        <option key={shelf.id} value={shelf.id}>
+                          {shelf.name}
+                        </option>
+                      ))}
+                    </Select>
+                  ) : (
+                    <span className="text-sm">
+                      {file.category_name || (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </span>
+                  )}
                 </TableCell>
                 <TableCell className="whitespace-nowrap px-3">
                   {formatDateTime(file.created_at, prefs.datetime_format)}
@@ -337,10 +411,17 @@ export default function FilesPage() {
                   ) : (
                     <span className="whitespace-nowrap">{file.currency_date}</span>
                   )}
-                  <span className="block text-xs text-muted-foreground">
-                    {file.fx_destination
-                      ? `→ ${file.fx_destination}${file.fx_simulated ? " · simulated" : ""}`
-                      : "no destination"}
+                  <span
+                    className="block text-xs text-muted-foreground"
+                    title={
+                      file.fx_destination
+                        ? Object.entries(file.fx_rates ?? {})
+                            .map(([from, rate]) => `${from}→${file.fx_destination} ${rate}`)
+                            .join(", ") || "no recorded rates"
+                        : "no destination"
+                    }
+                  >
+                    {fxSummary(file)}
                   </span>
                 </TableCell>
                 <TableCell className="px-3">

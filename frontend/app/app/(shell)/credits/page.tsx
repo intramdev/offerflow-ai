@@ -15,6 +15,19 @@ function formatCredits(n: number): string {
   return n.toLocaleString("en-US");
 }
 
+function taskLabel(task: string): string {
+  switch (task) {
+    case "match":
+      return "Matching";
+    case "categorize":
+      return "Categories";
+    case "assistant":
+      return "Assistant";
+    default:
+      return task || "—";
+  }
+}
+
 function RingGauge({ used, allowance }: { used: number; allowance: number }) {
   const radius = 84;
   const circumference = 2 * Math.PI * radius;
@@ -259,6 +272,66 @@ export default function CreditsPage() {
                 );
               })}
             </ul>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>AI requests beyond imports</CardTitle>
+          <CardDescription>
+            Matching, categorization, and assistant chats, newest first.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {(usage.matching ?? []).length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              No requests yet. Matching, categorization, and assistant chats
+              land here with their credit cost.
+            </p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border text-left text-xs text-muted-foreground">
+                    <th className="py-1 pr-4 font-medium">Time</th>
+                    <th className="py-1 pr-4 font-medium">Type</th>
+                    <th className="py-1 pr-4 font-medium">Detail</th>
+                    <th className="py-1 pr-4 font-medium">Model</th>
+                    <th className="py-1 pr-4 text-right font-medium">In</th>
+                    <th className="py-1 pr-4 text-right font-medium">Out</th>
+                    <th className="py-1 text-right font-medium">Total</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(usage.matching ?? []).map((call, index) => (
+                    <tr key={index} className="border-b border-border/50 tabular-nums">
+                      <td className="py-1 pr-4 text-xs text-muted-foreground">
+                        {formatDateTime(call.at, format)}
+                      </td>
+                      <td className="py-1 pr-4 text-xs">
+                        {taskLabel(call.task)}
+                      </td>
+                      <td className="max-w-48 truncate py-1 pr-4 text-xs">
+                        {call.label || "—"}
+                      </td>
+                      <td className="max-w-48 truncate py-1 pr-4 text-xs">
+                        {call.model || "—"}
+                      </td>
+                      <td className="py-1 pr-4 text-right">
+                        {formatCredits(call.prompt_tokens)}
+                      </td>
+                      <td className="py-1 pr-4 text-right">
+                        {formatCredits(call.completion_tokens)}
+                      </td>
+                      <td className="py-1 text-right font-medium">
+                        {formatCredits(call.total)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </CardContent>
       </Card>

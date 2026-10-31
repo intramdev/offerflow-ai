@@ -2,9 +2,17 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
 // Protects /app/* by asking Django who holds the session cookie.
-// The login page itself stays public.
+// Login and password recovery stay public.
+const PUBLIC_PATHS = ["/app/login", "/app/reset-password"];
+
 export async function middleware(request: NextRequest) {
-  if (request.nextUrl.pathname === "/app/login") {
+  if (
+    PUBLIC_PATHS.some(
+      (path) =>
+        request.nextUrl.pathname === path ||
+        request.nextUrl.pathname.startsWith(path + "/"),
+    )
+  ) {
     return NextResponse.next();
   }
   const backend =

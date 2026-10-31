@@ -199,7 +199,7 @@ export default function SupplierDetailPage() {
                 value={location}
                 disabled={!canOperate}
                 onChange={(e) => setLocation(e.target.value)}
-                placeholder="Shenzhen, CN"
+                placeholder="Ex. Shenzhen, CN"
               />
             </label>
             <label className="flex items-end gap-2 pb-2 text-sm">
@@ -219,7 +219,7 @@ export default function SupplierDetailPage() {
                 value={fee}
                 disabled={!canOperate}
                 onChange={(e) => setFee(e.target.value)}
-                placeholder="12.50"
+                placeholder="Ex. 12.50"
                 inputMode="decimal"
               />
             </label>
@@ -277,8 +277,8 @@ export default function SupplierDetailPage() {
                 value={draftNote}
                 onChange={(e) => setDraftNote(e.target.value)}
                 rows={3}
-                placeholder="How did the last shipment go?"
-                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary"
+                placeholder="Ex. March shipment arrived late, 2 DOA units"
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:font-normal placeholder:text-stone-400 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary"
               />
               <Button
                 onClick={() => void addNote()}

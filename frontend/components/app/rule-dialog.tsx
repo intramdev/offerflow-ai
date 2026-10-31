@@ -175,7 +175,7 @@ export function RuleDialog({
                 className="mt-1.5"
                 value={preferred}
                 onChange={(e) => setPreferred(e.target.value)}
-                placeholder="Exact supplier name"
+                placeholder="Ex. ACME Ltd (exact match)"
               />
             </label>
           ) : null}
@@ -188,15 +188,15 @@ export function RuleDialog({
           <div className="mt-1.5 grid gap-3 sm:grid-cols-2">
             <label className="block text-sm">
               Brand
-              <Input className="mt-1.5" value={brand} onChange={(e) => setBrand(e.target.value)} placeholder="Apple" />
+              <Input className="mt-1.5" value={brand} onChange={(e) => setBrand(e.target.value)} placeholder="Ex. Apple" />
             </label>
             <label className="block text-sm">
               Model
-              <Input className="mt-1.5" value={model} onChange={(e) => setModel(e.target.value)} placeholder="iPhone 15" />
+              <Input className="mt-1.5" value={model} onChange={(e) => setModel(e.target.value)} placeholder="Ex. iPhone 15" />
             </label>
             <label className="block text-sm">
               Grade
-              <Input className="mt-1.5" value={grade} onChange={(e) => setGrade(e.target.value)} placeholder="A" />
+              <Input className="mt-1.5" value={grade} onChange={(e) => setGrade(e.target.value)} placeholder="Ex. A" />
             </label>
             <label className="block text-sm">
               Category
@@ -204,7 +204,7 @@ export function RuleDialog({
                 className="mt-1.5"
                 value={category}
                 onChange={(e) => setCategory(e.target.value)}
-                placeholder="Phones"
+                placeholder="Ex. Phones"
                 list="rule-category-shelves"
               />
               <datalist id="rule-category-shelves">
@@ -241,14 +241,14 @@ export function RuleDialog({
                   <>
                     <Input
                       className="w-28"
-                      placeholder="Rate"
+                      placeholder="Ex. 0.92"
                       value={draft.rate}
                       onChange={(e) => setDraft(index, { rate: e.target.value })}
                       aria-label={`Step ${index + 1} rate`}
                     />
                     <Input
                       className="w-20"
-                      placeholder="EUR"
+                      placeholder="Ex. EUR"
                       maxLength={3}
                       value={draft.to}
                       onChange={(e) => setDraft(index, { to: e.target.value })}
@@ -264,7 +264,7 @@ export function RuleDialog({
                 {draft.op === "percent" ? (
                   <Input
                     className="w-28"
-                    placeholder="+10"
+                    placeholder="Ex. +10"
                     value={draft.value}
                     onChange={(e) => setDraft(index, { value: e.target.value })}
                     aria-label={`Step ${index + 1} percent`}
@@ -273,7 +273,7 @@ export function RuleDialog({
                 {draft.op === "round" ? (
                   <Input
                     className="w-28"
-                    placeholder="Step, e.g. 1"
+                    placeholder="Ex. 1"
                     value={draft.step}
                     onChange={(e) => setDraft(index, { step: e.target.value })}
                     aria-label={`Step ${index + 1} step`}

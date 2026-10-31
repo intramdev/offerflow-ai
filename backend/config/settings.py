@@ -29,6 +29,13 @@ def _env_required(name: str) -> str:
     return value
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
 SECRET_KEY = _env_required("OFFERFLOW_SECRET_KEY")
 
 # Debug is strictly opt-in and only for local development. Staging and
@@ -80,7 +87,7 @@ ROOT_URLCONF = "config.urls"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [],
+        "DIRS": [BASE_DIR / "templates"],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -150,6 +157,12 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.SessionAuthentication",
     ],
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.ScopedRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "password_reset": "10/hour",
+    },
 }
 
 # Cookies are secured whenever debug mode is off.
@@ -196,8 +209,29 @@ LOGGING = {
     "root": {"handlers": ["console"], "level": "INFO"},
 }
 
-APP_VERSION = _env("OFFERFLOW_APP_VERSION", "0.2.0-beta")
+APP_VERSION = _env("OFFERFLOW_APP_VERSION", "0.3.0-beta")
 OFFERFLOW_FILE_ROOT = _env("OFFERFLOW_FILE_ROOT", "/var/offerflow/files")
+
+# Public frontend base used for absolute links in emails.
+FRONTEND_BASE_URL = _env("OFFERFLOW_FRONTEND_URL", "http://127.0.0.1:4344")
+
+# Password-reset links stay valid for 30 minutes.
+PASSWORD_RESET_TIMEOUT = 1800
+
+# Outgoing mail (password recovery). SMTP is the default; point it at a
+# real relay in production. Failures refuse loudly, never silently.
+EMAIL_BACKEND = _env(
+    "OFFERFLOW_EMAIL_BACKEND",
+    "django.core.mail.backends.smtp.EmailBackend",
+)
+EMAIL_HOST = _env("OFFERFLOW_EMAIL_HOST", "localhost")
+EMAIL_PORT = _env_int("OFFERFLOW_EMAIL_PORT", 587)
+EMAIL_HOST_USER = _env("OFFERFLOW_EMAIL_USER", "")
+EMAIL_HOST_PASSWORD = _env("OFFERFLOW_EMAIL_PASSWORD", "")
+EMAIL_USE_TLS = (_env("OFFERFLOW_EMAIL_TLS", "true") or "").lower() == "true"
+DEFAULT_FROM_EMAIL = _env(
+    "OFFERFLOW_EMAIL_FROM", "OfferFlow AI <no-reply@example.com>"
+)
 
 # Spreadsheet intake limits (overridable per environment).
 OFFERFLOW_UPLOAD_MAX_BYTES = int(_env("OFFERFLOW_UPLOAD_MAX_BYTES", str(10 * 1024 * 1024)) or 0)

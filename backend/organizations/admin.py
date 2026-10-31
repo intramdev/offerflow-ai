@@ -2,6 +2,8 @@
 
 from django import forms
 from django.contrib import admin
+from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from django.contrib.auth.models import User
 
 from organizations.models import (
     AIProviderConfig,
@@ -10,6 +12,31 @@ from organizations.models import (
     Organization,
     UserPreference,
 )
+
+admin.site.unregister(User)
+
+
+@admin.register(User)
+class OfferFlowUserAdmin(BaseUserAdmin):
+    actions = ["send_password_reset_email"]
+
+    @admin.action(
+        description="Send password-reset email (30-minute, single-use link)"
+    )
+    def send_password_reset_email(self, request, queryset):
+        from organizations.password_reset import send_reset_email
+
+        sent = 0
+        for user in queryset.exclude(email=""):
+            send_reset_email(user)
+            sent += 1
+        skipped = queryset.count() - sent
+        note = (
+            f" {skipped} selected users have no email address."
+            if skipped
+            else ""
+        )
+        self.message_user(request, f"Sent {sent} reset emails.{note}")
 
 
 class AIProviderConfigForm(forms.ModelForm):

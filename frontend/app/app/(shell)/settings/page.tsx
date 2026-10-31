@@ -240,24 +240,24 @@ function GdprCard() {
               )}
             </div>
             {isOwner ? (
-              <div className="space-y-2 rounded-md border border-red-200 bg-red-50 p-4">
-                <p className="text-sm font-semibold text-red-800">
+              <div className="space-y-2 rounded-md border border-red-200 bg-red-50 p-4 dark:border-red-900 dark:bg-red-950/50">
+                <p className="text-sm font-semibold text-red-800 dark:text-red-200">
                   Delete everything
                 </p>
-                <p className="text-sm text-red-700">
+                <p className="text-sm text-red-700 dark:text-red-300">
                   Removes the organization, every file, run, quote,
                   supplier, and usage record, plus logins left without an
                   organization. This cannot be undone.
                 </p>
                 <label
-                  className="block text-sm font-medium text-red-800"
+                  className="block text-sm font-medium text-red-800 dark:text-red-200"
                   htmlFor="gdpr-confirm"
                 >
                   Type {active.organization_name} to confirm
                 </label>
                 <input
                   id="gdpr-confirm"
-                  className="w-full rounded-md border border-red-300 bg-white px-3 py-2 text-sm"
+                  className="w-full rounded-md border border-red-300 bg-white px-3 py-2 text-sm text-foreground dark:border-red-800 dark:bg-muted"
                   value={confirm}
                   onChange={(event) => setConfirm(event.target.value)}
                   placeholder={active.organization_name}

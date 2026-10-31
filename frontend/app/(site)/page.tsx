@@ -8,7 +8,7 @@ export const metadata: Metadata = {
 export default function Home() {
   return (
     <>
-      <h1>Supplier spreadsheets in, verifiable price lists out</h1>
+      <h1>Supplier files and chats in, verifiable price lists out</h1>
       <p className="lede">
         Suppliers send inconsistent files: mismatched descriptions, missing
         capacities, prices without currencies. OfferFlow AI interprets each

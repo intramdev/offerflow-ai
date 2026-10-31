@@ -9,9 +9,9 @@ export default function Source() {
     <>
       <h1>Source and licenses</h1>
       <p>
-        OfferFlow AI is free software, built by IN.TRA.M s.r.o. during the
-        Meta Global AI Developer Hackathon. Hackathon-period work is recorded
-        in dated notes in the repository.
+        OfferFlow AI is free software, built by Gian Paolo Cipicchia for
+        IN.TRA.M s.r.o. during the Meta Global AI Developer Hackathon.
+        Hackathon-period work is recorded in dated notes in the repository.
       </p>
 
       <h2>License</h2>
@@ -26,6 +26,13 @@ export default function Source() {
         <a href="https://github.com/intramdev/offerflow-ai">
           github.com/intramdev/offerflow-ai
         </a>
+      </p>
+      <p>
+        Independent hackathon entry by Gian Paolo Cipicchia: Meta is not
+        affiliated with this app, does not endorse it, and accepts no
+        responsibility for it. The optional Meta model integration is used
+        only when the operator configures an API key, under Meta&apos;s
+        own terms.
       </p>
 
       <h2>Third-party components</h2>

@@ -36,11 +36,12 @@ def record_audit(organization_id, user, action, target_type="", target_id="", me
     )
 
 
-def record_usage(organization_id, run, kind, quantity=1, detail=None):
+def record_usage(organization_id, run, kind, quantity=1, detail=None, user=None):
     """Append one usage event for later budget reconciliation."""
     return UsageEvent.objects.create(
         organization_id=organization_id,
         run=run,
+        user=user,
         kind=kind,
         quantity=quantity,
         detail=detail or {},

@@ -74,9 +74,21 @@ export default function PrivacyPolicy() {
       <p>
         Workspace data is kept until the organization owner deletes it.
         Security records are kept with the workspace and disappear with
-        it. No personal data is sold, shared for advertising, or moved
-        outside the configured infrastructure except for paid model calls
-        described above.
+        it. The AI usage log rotates faster: entries older than 120 days
+        are removed automatically, while monthly totals and the grand
+        total stay. No personal data is sold, shared for advertising, or
+        moved outside the configured infrastructure except for paid model
+        calls described above.
+      </p>
+
+      <h2>About this app</h2>
+      <p>
+        OfferFlow AI is free software developed by Gian Paolo Cipicchia
+        for IN.TRA.M s.r.o. for the Meta Global AI Developer Hackathon
+        (AGPL-3.0-only; see the source and licenses page). It is an
+        independent entry: Meta is not affiliated with this app, does not
+        endorse it, and accepts no responsibility for it or for data
+        processed through it.
       </p>
 
       <p>

@@ -1,0 +1,7 @@
+{% extends "admin/index.html" %}
+{% load activity_charts %}
+
+{% block content %}
+{% activity_charts %}
+{{ block.super }}
+{% endblock %}

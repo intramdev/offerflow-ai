@@ -9,6 +9,7 @@ stored.
 from django.conf import settings
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db.models import Count, OuterRef, Subquery
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import permissions, status
@@ -28,6 +29,7 @@ from pipeline.models import (
     CustomerQuote,
     ExportArtifact,
     ImportRun,
+    NormalizedOffer,
     PricingRule,
     ReviewRequest,
     ReviewStatus,
@@ -323,9 +325,18 @@ class FileListView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        top_currency = (
+            NormalizedOffer.objects.filter(run__source_file=OuterRef("pk"))
+            .exclude(currency="")
+            .values("currency")
+            .annotate(n=Count("id"))
+            .order_by("-n")
+            .values("currency")[:1]
+        )
         files = (
             SourceFile.objects.filter(organization__memberships__user=request.user)
             .select_related("organization", "uploaded_by", "run", "category")
+            .annotate(annotated_currency=Subquery(top_currency))
             .order_by("-created_at")
         )
         organization_id = request.query_params.get("organization_id")
@@ -979,6 +990,7 @@ class AssistantChatView(APIView):
                     "task": "assistant",
                     "question": question,
                 },
+                user=request.user,
             )
 
         try:

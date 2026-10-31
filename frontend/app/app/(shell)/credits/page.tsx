@@ -5,9 +5,19 @@ import * as React from "react";
 
 import { ErrorNotice } from "@/components/app/error-notice";
 import { useOrg } from "@/components/app/org-context";
+import { Pager } from "@/components/app/pager";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { ApiError, getUsage, type UsageSummary } from "@/lib/api";
+import {
+  ApiError,
+  getUsage,
+  getUsageLog,
+  releaseStuckSlots,
+  type UsageImport,
+  type UsageMatchCall,
+  type UsageSummary,
+} from "@/lib/api";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/cn";
 import { formatDate, formatDateTime, type DateTimeFormat } from "@/lib/format";
 
@@ -68,11 +78,19 @@ function RingGauge({ used, allowance }: { used: number; allowance: number }) {
 }
 
 export default function CreditsPage() {
-  const { active, prefs } = useOrg();
+  const { active, prefs, canOperate } = useOrg();
+  const [releasing, setReleasing] = React.useState(false);
+  const [releasedNote, setReleasedNote] = React.useState<string | null>(null);
   const [usage, setUsage] = React.useState<UsageSummary | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [openRuns, setOpenRuns] = React.useState<Set<number>>(new Set());
+  const [importsPage, setImportsPage] = React.useState(1);
+  const [importsPages, setImportsPages] = React.useState(1);
+  const [importsBusy, setImportsBusy] = React.useState(false);
+  const [matchingPage, setMatchingPage] = React.useState(1);
+  const [matchingPages, setMatchingPages] = React.useState(1);
+  const [matchingBusy, setMatchingBusy] = React.useState(false);
   const format: DateTimeFormat = prefs.datetime_format;
 
   React.useEffect(() => {
@@ -85,7 +103,12 @@ export default function CreditsPage() {
     setError(null);
     void getUsage(active.organization)
       .then((data) => {
-        if (!cancelled) setUsage(data);
+        if (cancelled) return;
+        setUsage(data);
+        setImportsPage(1);
+        setImportsPages(Math.max(1, Math.ceil(data.imports_count / data.log_page_size)));
+        setMatchingPage(1);
+        setMatchingPages(Math.max(1, Math.ceil(data.matching_count / data.log_page_size)));
       })
       .catch((err: unknown) => {
         if (!cancelled) {
@@ -117,6 +140,48 @@ export default function CreditsPage() {
       else next.add(runId);
       return next;
     });
+  }
+
+  async function releaseStuck() {
+    if (!active) return;
+    setReleasing(true);
+    setReleasedNote(null);
+    try {
+      const data = await releaseStuckSlots(active.organization);
+      const freed = data.released.in_flight;
+      setReleasedNote(
+        freed > 0
+          ? `Released ${freed} stuck slot${freed === 1 ? "" : "s"} for ${active.organization_name}. You can retry now.`
+          : `No stuck slots for ${active.organization_name} — nothing needed releasing.`,
+      );
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not release the slot.");
+    } finally {
+      setReleasing(false);
+    }
+  }
+
+  async function loadLogPage(section: "imports" | "matching", page: number) {
+    if (!active || !usage) return;
+    if (section === "imports") setImportsBusy(true);
+    else setMatchingBusy(true);
+    try {
+      const data = await getUsageLog(active.organization, section, page);
+      if (section === "imports") {
+        setUsage({ ...usage, imports: data.results as UsageImport[] });
+        setImportsPage(data.page);
+        setImportsPages(data.pages);
+      } else {
+        setUsage({ ...usage, matching: data.results as UsageMatchCall[] });
+        setMatchingPage(data.page);
+        setMatchingPages(data.pages);
+      }
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not load that log page.");
+    } finally {
+      if (section === "imports") setImportsBusy(false);
+      else setMatchingBusy(false);
+    }
   }
 
   return (
@@ -187,11 +252,41 @@ export default function CreditsPage() {
         </div>
       </div>
 
+      {canOperate ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Stuck AI requests?</CardTitle>
+            <CardDescription>
+              If requests keep failing with “No free in-flight slot” while
+              nobody is working, release {active.organization_name}’s stuck
+              slot here. It affects only your company and never changes
+              billed spend.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                variant="outline"
+                onClick={() => void releaseStuck()}
+                disabled={releasing}
+              >
+                {releasing ? "Releasing…" : "Release stuck slot"}
+              </Button>
+              {releasedNote ? (
+                <span className="text-sm text-muted-foreground">{releasedNote}</span>
+              ) : null}
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
       <Card>
         <CardHeader>
           <CardTitle>Usage by import</CardTitle>
           <CardDescription>
-            Expand an import to see every AI request it made.
+            Expand an import to see every AI request it made. Newest first,
+            {usage.log_page_size} per page — entries older than {usage.log_retention_days} days
+            are removed automatically.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -201,6 +296,7 @@ export default function CreditsPage() {
               appear here with their credit cost.
             </p>
           ) : (
+            <>
             <ul className="divide-y divide-border">
               {usage.imports.map((entry) => {
                 const open = openRuns.has(entry.run_id);
@@ -272,6 +368,16 @@ export default function CreditsPage() {
                 );
               })}
             </ul>
+            <div className="mt-4">
+              <Pager
+                page={importsPage}
+                total={importsPages}
+                busy={importsBusy}
+                label="Import log pages"
+                onPage={(page) => void loadLogPage("imports", page)}
+              />
+            </div>
+            </>
           )}
         </CardContent>
       </Card>
@@ -290,6 +396,7 @@ export default function CreditsPage() {
               land here with their credit cost.
             </p>
           ) : (
+            <>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -332,6 +439,16 @@ export default function CreditsPage() {
                 </tbody>
               </table>
             </div>
+            <div className="mt-4">
+              <Pager
+                page={matchingPage}
+                total={matchingPages}
+                busy={matchingBusy}
+                label="AI request log pages"
+                onPage={(page) => void loadLogPage("matching", page)}
+              />
+            </div>
+            </>
           )}
         </CardContent>
       </Card>

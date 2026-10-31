@@ -91,7 +91,7 @@ def _common_spelling(offers: list) -> str:
     return best
 
 
-def propose_groups(*, organization, offers: list) -> dict:
+def propose_groups(*, organization, offers: list, user=None) -> dict:
     """Group ok offers into same-product groups with confidence.
 
     Returns {"provider", "simulated", "groups", "notes",
@@ -140,6 +140,7 @@ def propose_groups(*, organization, offers: list) -> dict:
                 categories=categories,
                 file_categories=file_categories,
                 notes=notes,
+                user=user,
             )
         )
     groups.sort(
@@ -174,6 +175,7 @@ def _match_block(
     categories,
     file_categories,
     notes,
+    user=None,
 ) -> list[dict]:
     """Match one (brand, capacity, grade) block; return groups."""
     memory: dict[tuple[str, str], ProductAlias] = {}
@@ -260,6 +262,7 @@ def _match_block(
                 known=sorted(by_canonical),
                 pending=pending,
                 notes=notes,
+                user=user,
             )
         )
     else:
@@ -288,6 +291,7 @@ def _match_block(
         categories=categories,
         file_categories=file_categories,
         notes=notes,
+        user=user,
     )
 
 
@@ -302,6 +306,7 @@ def _provider_clusters(
     known,
     pending,
     notes,
+    user=None,
 ) -> list[dict]:
     """Cluster unknown spellings through the provider; validate strictly."""
     raws: list[str] = []
@@ -341,6 +346,7 @@ def _provider_clusters(
                 "task": "match",
                 "block": block_label,
             },
+            user=user,
         )
 
     try:
@@ -450,6 +456,7 @@ def _resolve_categories(
     categories,
     file_categories,
     notes,
+    user=None,
 ) -> list[dict]:
     """Resolve one category per group: file, memory, then model lane.
 
@@ -515,6 +522,7 @@ def _resolve_categories(
         offer_by_id=offer_by_id,
         names=names,
         notes=notes,
+        user=user,
     )
     return groups
 
@@ -531,6 +539,7 @@ def _categorize_groups(
     offer_by_id,
     names,
     notes,
+    user=None,
 ) -> None:
     """Assign categories through the provider; validate strictly.
 
@@ -581,6 +590,7 @@ def _categorize_groups(
                 "task": "categorize",
                 "block": block_label,
             },
+            user=user,
         )
 
     try:

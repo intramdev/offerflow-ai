@@ -133,6 +133,53 @@ class DateTimeFormat(models.TextChoices):
     EUROPEAN = "eu", "European (DD/MM/YYYY)"
 
 
+class ThemeMode(models.TextChoices):
+    SYSTEM = "system", "Follow system"
+    LIGHT = "light", "Light"
+    DARK = "dark", "Dark"
+
+
+class ReadingFont(models.TextChoices):
+    SYSTEM = "system", "System default"
+    READABLE = "readable", "Highly legible (Verdana-based)"
+    SERIF = "serif", "Serif"
+    MONO = "mono", "Monospace"
+
+
+class ReadingSize(models.TextChoices):
+    COMPACT = "sm", "Compact"
+    DEFAULT = "md", "Default"
+    LARGE = "lg", "Large"
+    XLARGE = "xl", "Extra large"
+
+
+class ContrastMode(models.TextChoices):
+    STANDARD = "standard", "Standard"
+    HIGH = "high", "High contrast"
+
+
+class MotionMode(models.TextChoices):
+    SYSTEM = "system", "Follow system"
+    REDUCE = "reduce", "Reduce motion"
+    FULL = "full", "Full motion"
+
+
+class UserLogin(models.Model):
+    """One successful sign-in (app or admin), for activity ranking."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="offerflow_logins",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["user", "created_at"])]
+
+
 DEFAULT_AI_MODEL = "muse-spark-1.3-contributor"
 DEFAULT_MONTHLY_CREDITS = 25_000_000
 
@@ -197,6 +244,21 @@ class UserPreference(models.Model):
     )
     datetime_format = models.CharField(
         max_length=8, choices=DateTimeFormat.choices, default=DateTimeFormat.US
+    )
+    theme_mode = models.CharField(
+        max_length=8, choices=ThemeMode.choices, default=ThemeMode.LIGHT
+    )
+    reading_font = models.CharField(
+        max_length=8, choices=ReadingFont.choices, default=ReadingFont.SYSTEM
+    )
+    reading_size = models.CharField(
+        max_length=8, choices=ReadingSize.choices, default=ReadingSize.DEFAULT
+    )
+    contrast_mode = models.CharField(
+        max_length=8, choices=ContrastMode.choices, default=ContrastMode.STANDARD
+    )
+    motion_mode = models.CharField(
+        max_length=8, choices=MotionMode.choices, default=MotionMode.SYSTEM
     )
     assistant_banned = models.BooleanField(
         default=False,

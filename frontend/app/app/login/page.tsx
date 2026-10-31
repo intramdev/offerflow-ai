@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import * as React from "react";
@@ -34,8 +35,19 @@ function LoginForm() {
   return (
     <Card className="w-full max-w-sm">
       <CardHeader>
-        <CardTitle>OfferFlow AI</CardTitle>
-        <CardDescription>Sign in to your workspace.</CardDescription>
+        <div className="flex items-center gap-3">
+          <Image
+            src="/offerflow-logo.svg"
+            alt=""
+            width={48}
+            height={48}
+            aria-hidden
+          />
+          <div>
+            <CardTitle className="text-2xl">OfferFlow AI</CardTitle>
+            <CardDescription>Sign in to your workspace.</CardDescription>
+          </div>
+        </div>
       </CardHeader>
       <CardContent>
         <form onSubmit={(event) => void submit(event)} className="space-y-4">
@@ -64,6 +76,11 @@ function LoginForm() {
           <Button className="w-full" type="submit" disabled={busy}>
             {busy ? "Signing in…" : "Sign in"}
           </Button>
+          <p className="text-center text-sm">
+            <Link href="/app/reset-password" className="font-medium text-primary underline">
+              Forgot your password?
+            </Link>
+          </p>
         </form>
       </CardContent>
     </Card>

@@ -67,6 +67,16 @@ export default function TermsOfService() {
         cannot be undone. See the privacy policy for details.
       </p>
 
+      <h2>About this app</h2>
+      <p>
+        OfferFlow AI is free software developed by Gian Paolo Cipicchia
+        for IN.TRA.M s.r.o. for the Meta Global AI Developer Hackathon
+        (AGPL-3.0-only; see the source and licenses page). It is an
+        independent entry: Meta is not affiliated with this app, does not
+        endorse it, and accepts no responsibility for it, for quote
+        contents, or for model output.
+      </p>
+
       <h2>Changes</h2>
       <p>
         These terms may change with new releases; continued use after a

@@ -38,16 +38,100 @@ class MembershipListView(APIView):
         return Response(MembershipSerializer(memberships, many=True).data)
 
 
+USAGE_LOG_PAGE_SIZE = 50
+USAGE_LOG_RETENTION_DAYS = 120
+
+
+def _prune_usage_log(organization_id: int) -> None:
+    """Delete metered log rows older than the retention window."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from pipeline.models import UsageEvent
+
+    cutoff = timezone.now() - timedelta(days=USAGE_LOG_RETENTION_DAYS)
+    UsageEvent.objects.filter(
+        organization_id=organization_id,
+        kind="provider_call",
+        created_at__lt=cutoff,
+    ).delete()
+
+
+def _import_log_entries(organization) -> list:
+    from pipeline.models import UsageEvent
+
+    calls = (
+        UsageEvent.objects.filter(
+            organization=organization, kind="provider_call", run__isnull=False
+        )
+        .select_related("run", "run__source_file")
+        .order_by("-created_at")
+    )
+    imports: list[dict] = []
+    for event in calls:
+        detail = event.detail or {}
+        entry = next(
+            (row for row in imports if row["run_id"] == event.run_id), None
+        )
+        if entry is None:
+            entry = {
+                "run_id": event.run_id,
+                "filename": event.run.source_file.original_name,
+                "created_at": event.run.created_at.isoformat(),
+                "run_status": event.run.status,
+                "requests": 0,
+                "tokens": 0,
+                "calls": [],
+            }
+            imports.append(entry)
+        entry["requests"] += 1
+        entry["tokens"] += event.quantity
+        entry["calls"].append(
+            {
+                "at": event.created_at.isoformat(),
+                "prompt_tokens": detail.get("prompt_tokens", 0),
+                "completion_tokens": detail.get("completion_tokens", 0),
+                "total": event.quantity,
+                "model": detail.get("model", ""),
+            }
+        )
+    return imports
+
+
+def _loose_call_entries(organization) -> list:
+    from pipeline.models import UsageEvent
+
+    entries = []
+    for event in UsageEvent.objects.filter(
+        organization=organization, kind="provider_call", run__isnull=True
+    ).order_by("-created_at"):
+        detail = event.detail or {}
+        entries.append(
+            {
+                "at": event.created_at.isoformat(),
+                "task": detail.get("task", ""),
+                "prompt_tokens": detail.get("prompt_tokens", 0),
+                "completion_tokens": detail.get("completion_tokens", 0),
+                "total": event.quantity,
+                "model": detail.get("model", ""),
+                "label": detail.get("block", "")
+                or detail.get("question", ""),
+            }
+        )
+    return entries
+
+
 class OrganizationUsageView(APIView):
     """Credit dashboard data for one company (member read).
 
     Credits are tokens 1:1 against the monthly allowance. Reading snaps
     the billing period first, so the numbers always describe the current
-    cycle; the grand total is never reset.
+    cycle; the grand total is never reset. Log rows older than the
+    retention window are pruned on read.
     """
 
     def get(self, request, organization_id):
-        from pipeline.models import UsageEvent
         from pipeline.spending import (
             current_period_start,
             get_allowance,
@@ -57,6 +141,7 @@ class OrganizationUsageView(APIView):
         organization = services.authorize_organization_access(
             request.user, organization_id
         )
+        _prune_usage_log(organization.id)
         allowance = get_allowance(organization.id)
         period = current_period_start(allowance.cycle_anchor)
         if allowance.period_start != period:
@@ -66,64 +151,8 @@ class OrganizationUsageView(APIView):
                 update_fields=["period_start", "period_spent", "updated_at"]
             )
         used = allowance.period_spent
-        calls = (
-            UsageEvent.objects.filter(
-                organization=organization, kind="provider_call", run__isnull=False
-            )
-            .select_related("run", "run__source_file")
-            .order_by("-created_at")[:500]
-        )
-        imports: list[dict] = []
-        for event in calls:
-            detail = event.detail or {}
-            entry = next(
-                (row for row in imports if row["run_id"] == event.run_id), None
-            )
-            if entry is None:
-                if len(imports) >= 50:
-                    continue
-                entry = {
-                    "run_id": event.run_id,
-                    "filename": event.run.source_file.original_name,
-                    "created_at": event.run.created_at.isoformat(),
-                    "run_status": event.run.status,
-                    "requests": 0,
-                    "tokens": 0,
-                    "calls": [],
-                }
-                imports.append(entry)
-            entry["requests"] += 1
-            entry["tokens"] += event.quantity
-            entry["calls"].append(
-                {
-                    "at": event.created_at.isoformat(),
-                    "prompt_tokens": detail.get("prompt_tokens", 0),
-                    "completion_tokens": detail.get("completion_tokens", 0),
-                    "total": event.quantity,
-                    "model": detail.get("model", ""),
-                }
-            )
-        match_calls = (
-            UsageEvent.objects.filter(
-                organization=organization, kind="provider_call", run__isnull=True
-            )
-            .order_by("-created_at")[:50]
-        )
-        matching = []
-        for event in match_calls:
-            detail = event.detail or {}
-            matching.append(
-                {
-                    "at": event.created_at.isoformat(),
-                    "task": detail.get("task", ""),
-                    "prompt_tokens": detail.get("prompt_tokens", 0),
-                    "completion_tokens": detail.get("completion_tokens", 0),
-                    "total": event.quantity,
-                    "model": detail.get("model", ""),
-                    "label": detail.get("block", "")
-                    or detail.get("question", ""),
-                }
-            )
+        imports = _import_log_entries(organization)
+        matching = _loose_call_entries(organization)
         return Response(
             {
                 "allowance": allowance.monthly_credits,
@@ -133,8 +162,100 @@ class OrganizationUsageView(APIView):
                 "reset_date": next_reset_date(allowance.cycle_anchor).isoformat(),
                 "grand_total": allowance.tokens_spent,
                 "paused": allowance.paused,
-                "imports": imports,
-                "matching": matching,
+                "imports": imports[:USAGE_LOG_PAGE_SIZE],
+                "imports_count": len(imports),
+                "matching": matching[:USAGE_LOG_PAGE_SIZE],
+                "matching_count": len(matching),
+                "log_page_size": USAGE_LOG_PAGE_SIZE,
+                "log_retention_days": USAGE_LOG_RETENTION_DAYS,
+            }
+        )
+
+
+class OrganizationReleaseStuckView(APIView):
+    """Release a stuck AI slot for the caller's own company only.
+
+    A crashed request can leave phantom in-flight/reserved counters that
+    block every later dispatch with "No free in-flight slot". This clears
+    them for this organization alone; other companies are untouched. It
+    never changes billed spend (period or grand totals).
+    """
+
+    def post(self, request, organization_id):
+        from pipeline.jobs import record_audit
+        from pipeline.spending import get_allowance
+
+        try:
+            services.require_organization_role(request.user, organization_id)
+        except DjangoPermissionDenied as error:
+            from rest_framework.exceptions import (
+                PermissionDenied as DRFPermissionDenied,
+            )
+
+            raise DRFPermissionDenied(str(error)) from error
+        allowance = get_allowance(organization_id)
+        released = {
+            "in_flight": allowance.in_flight,
+            "tokens_reserved": allowance.tokens_reserved,
+        }
+        allowance.in_flight = 0
+        allowance.tokens_reserved = 0
+        allowance.save(update_fields=["in_flight", "tokens_reserved", "updated_at"])
+        record_audit(
+            organization_id,
+            request.user,
+            "stuck_slots_released",
+            "allowance",
+            allowance.pk,
+            released,
+        )
+        return Response(
+            {"released": released, "in_flight": 0, "tokens_reserved": 0}
+        )
+
+
+class OrganizationUsageLogView(APIView):
+    """One paginated log section, newest first (member read)."""
+
+    def get(self, request, organization_id):
+        import math
+
+        organization = services.authorize_organization_access(
+            request.user, organization_id
+        )
+        _prune_usage_log(organization.id)
+        section = request.query_params.get("section", "")
+        if section == "imports":
+            entries = _import_log_entries(organization)
+        elif section == "matching":
+            entries = _loose_call_entries(organization)
+        else:
+            return Response(
+                {"detail": 'section must be "imports" or "matching".'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            page = int(request.query_params.get("page", "1"))
+        except ValueError:
+            return Response(
+                {"detail": "page must be a positive integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if page < 1:
+            return Response(
+                {"detail": "page must be a positive integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        pages = max(1, math.ceil(len(entries) / USAGE_LOG_PAGE_SIZE))
+        start = (page - 1) * USAGE_LOG_PAGE_SIZE
+        return Response(
+            {
+                "section": section,
+                "page": page,
+                "pages": pages,
+                "count": len(entries),
+                "page_size": USAGE_LOG_PAGE_SIZE,
+                "results": entries[start : start + USAGE_LOG_PAGE_SIZE],
             }
         )
 
@@ -228,13 +349,23 @@ class MemberListView(APIView):
         return Response(MemberSerializer(memberships, many=True).data)
 
 
+PREFERENCE_DEFAULTS = {
+    "datetime_format": DateTimeFormat.US,
+    "theme_mode": "light",
+    "reading_font": "system",
+    "reading_size": "md",
+    "contrast_mode": "standard",
+    "motion_mode": "system",
+}
+
+
 class PreferenceView(APIView):
     """Read or update the caller's display preferences."""
 
     def get(self, request):
         preference = UserPreference.objects.filter(user=request.user).first()
         if preference is None:
-            return Response({"datetime_format": DateTimeFormat.US})
+            return Response(dict(PREFERENCE_DEFAULTS))
         return Response(PreferenceSerializer(preference).data)
 
     def put(self, request):
@@ -242,7 +373,18 @@ class PreferenceView(APIView):
         serializer.is_valid(raise_exception=True)
         preference, _created = UserPreference.objects.update_or_create(
             user=request.user,
-            defaults={"datetime_format": serializer.validated_data["datetime_format"]},
+            defaults=dict(serializer.validated_data),
+        )
+        return Response(PreferenceSerializer(preference).data)
+
+    def patch(self, request):
+        serializer = PreferenceSerializer(
+            data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        preference, _created = UserPreference.objects.update_or_create(
+            user=request.user,
+            defaults=dict(serializer.validated_data),
         )
         return Response(PreferenceSerializer(preference).data)
 

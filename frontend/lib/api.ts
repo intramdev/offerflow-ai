@@ -87,6 +87,22 @@ export interface SessionUser {
   id: number;
   username: string;
   email: string;
+  first_name: string;
+  last_name: string;
+}
+
+export interface ProfileUpdate {
+  first_name?: string;
+  last_name?: string;
+  email?: string;
+}
+
+export async function updateProfile(update: ProfileUpdate): Promise<SessionUser> {
+  return api<SessionUser>("/api/orgs/auth/me/", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
 }
 
 export async function login(
@@ -108,6 +124,35 @@ export async function logout(): Promise<void> {
 
 export async function me(): Promise<SessionUser> {
   return api<SessionUser>("/api/orgs/auth/me/");
+}
+
+export async function requestPasswordReset(email: string): Promise<string> {
+  const data = await api<{ detail: string }>("/api/orgs/auth/password/reset/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email }),
+  });
+  return data.detail;
+}
+
+export async function confirmPasswordReset(
+  uid: string,
+  token: string,
+  newPassword: string,
+): Promise<string> {
+  const data = await api<{ detail: string }>(
+    "/api/orgs/auth/password/confirm/",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        uid,
+        token,
+        new_password: newPassword,
+      }),
+    },
+  );
+  return data.detail;
 }
 
 // --- Organizations ------------------------------------------------------
@@ -138,15 +183,31 @@ export async function setActiveOrg(organizationId: number): Promise<Membership> 
 
 export interface Preferences {
   datetime_format: "us" | "eu";
+  theme_mode: "system" | "light" | "dark";
+  reading_font: "system" | "readable" | "serif" | "mono";
+  reading_size: "sm" | "md" | "lg" | "xl";
+  contrast_mode: "standard" | "high";
+  motion_mode: "system" | "reduce" | "full";
 }
+
+export const DEFAULT_PREFERENCES: Preferences = {
+  datetime_format: "us",
+  theme_mode: "light",
+  reading_font: "system",
+  reading_size: "md",
+  contrast_mode: "standard",
+  motion_mode: "system",
+};
 
 export async function getPreferences(): Promise<Preferences> {
   return api<Preferences>("/api/orgs/preferences/me/");
 }
 
-export async function updatePreferences(prefs: Preferences): Promise<Preferences> {
+export async function updatePreferences(
+  prefs: Partial<Preferences>,
+): Promise<Preferences> {
   return api<Preferences>("/api/orgs/preferences/me/", {
-    method: "PUT",
+    method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(prefs),
   });
@@ -184,11 +245,43 @@ export interface UsageSummary {
   grand_total: number;
   paused: boolean;
   imports: UsageImport[];
+  imports_count: number;
   matching: UsageMatchCall[];
+  matching_count: number;
+  log_page_size: number;
+  log_retention_days: number;
 }
 
 export async function getUsage(organizationId: number): Promise<UsageSummary> {
   return api<UsageSummary>(`/api/orgs/${organizationId}/usage/`);
+}
+
+export interface UsageLogPage<T> {
+  section: "imports" | "matching";
+  page: number;
+  pages: number;
+  count: number;
+  page_size: number;
+  results: T[];
+}
+
+export async function releaseStuckSlots(
+  organizationId: number,
+): Promise<{ released: { in_flight: number; tokens_reserved: number } }> {
+  return api(`/api/orgs/${organizationId}/spending/release-stuck/`, {
+    method: "POST",
+  });
+}
+
+export async function getUsageLog(
+  organizationId: number,
+  section: "imports" | "matching",
+  page: number,
+): Promise<UsageLogPage<UsageImport | UsageMatchCall>> {
+  const params = new URLSearchParams({ section, page: String(page) });
+  return api<UsageLogPage<UsageImport | UsageMatchCall>>(
+    `/api/orgs/${organizationId}/usage/log/?${params}`,
+  );
 }
 
 export interface OrgSettings {
@@ -337,6 +430,7 @@ export interface SourceFile {
   run_status: string | null;
   uploaded_by_name: string | null;
   currency_date: string;
+  source_currency: string;
   fx_destination: string;
   fx_rates: Record<string, string>;
   fx_source: string;

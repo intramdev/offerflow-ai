@@ -390,7 +390,7 @@ def start_customer_quote(*, organization, user) -> CustomerQuote:
         raise ValidationError(
             "Nothing to quote yet: approve at least one supplier import first."
         )
-    proposed = propose_groups(organization=organization, offers=offers)
+    proposed = propose_groups(organization=organization, offers=offers, user=user)
     quote = CustomerQuote.objects.create(
         organization=organization,
         status=QuoteStatus.NEEDS_REVIEW,

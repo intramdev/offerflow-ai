@@ -1,6 +1,6 @@
 # OfferFlow AI
 
-**Beta — version 0.2.0.** Simulated-first and fully usable with no model
+**Beta — version 0.3.0.** Simulated-first and fully usable with no model
 key; paid Muse features activate per company with credits.
 
 Supplier information arrives in messy spreadsheets and documents. OfferFlow AI
@@ -9,8 +9,10 @@ preview the mapping, interpret, validate, review the ambiguous rows with a
 person, approve, and export. Nothing is ever guessed — unreadable rows pause
 for a decision or are excluded with a stated reason.
 
-Built by **IN.TRA.M s.r.o.** for the **Meta Global AI Developer Hackathon**,
-organized by Cerebral Valley.
+Built by **Gian Paolo Cipicchia** for **IN.TRA.M s.r.o.** for the **Meta
+Global AI Developer Hackathon**, organized by Cerebral Valley. Independent
+entry: Meta is not affiliated with this app and accepts no responsibility
+for it.
 
 ## What it does
 
@@ -61,6 +63,19 @@ organized by Cerebral Valley.
 - **GDPR self-service** — owners download every company row plus stored
   bytes as a ZIP, or erase the workspace with typed-name confirmation.
   Public privacy and terms pages disclose processing and rights.
+- **Profile and accessibility** — each user edits name, email, theme
+  (light/dark/system, light by default), typeface, text size,
+  high-contrast, and reduced motion; preferences travel with the account
+  and meet EN 301 549/WCAG AA aims.
+- **Admin activity dashboard** — staff see per-user sign-ins and token
+  spend ranked top-down (7/30 days or all time), plus live token and
+  sign-in charts on the admin home page.
+- **Stuck-slot release** — a run blocked by a stale in-flight lock can be
+  released from the credits page for the user's own company only; the
+  release is audited and never touches billed spend.
+- **Password recovery** — email links, single-use, 30 minutes, throttled;
+  super admins can also reset a user password from the backend.
+- **Help center** — the in-app Help item documents every screen.
 
 ## Without AI vs with a Muse key
 

@@ -159,7 +159,7 @@ export function AssistantWidget() {
             <div ref={bottomRef} />
           </div>
           {error ? (
-            <p role="alert" className="border-t border-border px-4 py-2 text-xs text-red-600">
+            <p role="alert" className="border-t border-border px-4 py-2 text-xs text-red-600 dark:text-red-400">
               {error}
             </p>
           ) : null}
@@ -173,7 +173,7 @@ export function AssistantWidget() {
             <Input
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
-              placeholder="How do I remap a file?"
+              placeholder="Ex. How do I remap a file?"
               aria-label="Ask the assistant"
               maxLength={2000}
               disabled={busy}

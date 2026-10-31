@@ -1,0 +1,62 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}User activity · OfferFlow AI backend{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">Home</a>
+  &rsaquo; User activity
+</div>
+{% endblock %}
+
+{% block content %}
+<p>
+  Most active users first — ranked by
+  {% if sort == "logins" %}sign-ins{% else %}tokens consumed{% endif %},
+  {% if days == "all" %}all time{% else %}last {{ days }} days{% endif %}.
+  Logins and directly-attributed spend are tracked from this release on;
+  import spend is attributed to whoever uploaded the file.
+</p>
+<p>
+  Sort:
+  {% if sort == "tokens" %}<strong>Tokens</strong>{% else %}<a href="?sort=tokens&amp;days={{ days }}">Tokens</a>{% endif %} ·
+  {% if sort == "logins" %}<strong>Sign-ins</strong>{% else %}<a href="?sort=logins&amp;days={{ days }}">Sign-ins</a>{% endif %}
+  &nbsp;·&nbsp;
+  Period:
+  {% if days == "7" %}<strong>7 days</strong>{% else %}<a href="?sort={{ sort }}&amp;days=7">7 days</a>{% endif %} ·
+  {% if days == "30" %}<strong>30 days</strong>{% else %}<a href="?sort={{ sort }}&amp;days=30">30 days</a>{% endif %} ·
+  {% if days == "all" %}<strong>All time</strong>{% else %}<a href="?sort={{ sort }}&amp;days=all">All time</a>{% endif %}
+</p>
+<div class="module">
+  <table>
+    <caption>Totals: {{ login_total }} sign-ins · {{ token_total }} tokens</caption>
+    <thead>
+      <tr>
+        <th scope="col">#</th>
+        <th scope="col">User</th>
+        <th scope="col">Name</th>
+        <th scope="col">Companies</th>
+        <th scope="col">Sign-ins</th>
+        <th scope="col">Tokens</th>
+        <th scope="col">Last sign-in</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>{{ forloop.counter }}</td>
+        <th scope="row">{{ row.username }}</th>
+        <td>{{ row.full_name|default:"—" }}</td>
+        <td>{{ row.companies|default:"—" }}</td>
+        <td>{{ row.logins }}</td>
+        <td>{{ row.tokens }}</td>
+        <td>{% if row.last_login %}{{ row.last_login|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="7">No users yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if truncated %}<p>Showing the top 100.</p>{% endif %}
+</div>
+{% endblock %}

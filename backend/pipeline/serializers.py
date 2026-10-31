@@ -1,5 +1,6 @@
 """API shapes for uploads, runs, reviews, and export artifacts."""
 
+from django.db import models
 from rest_framework import serializers
 
 from pipeline.models import (
@@ -159,6 +160,7 @@ class SourceFileSerializer(serializers.ModelSerializer):
     uploaded_by_name = serializers.SerializerMethodField()
     currency_date = serializers.SerializerMethodField()
     category_name = serializers.SerializerMethodField()
+    source_currency = serializers.SerializerMethodField()
 
     class Meta:
         model = SourceFile
@@ -173,6 +175,7 @@ class SourceFileSerializer(serializers.ModelSerializer):
             "run_status",
             "uploaded_by_name",
             "currency_date",
+            "source_currency",
             "fx_destination",
             "fx_rates",
             "fx_source",
@@ -183,6 +186,22 @@ class SourceFileSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = fields
+
+    def get_source_currency(self, obj):
+        """Most common offer currency on the file ("" when none yet)."""
+        annotated = getattr(obj, "annotated_currency", None)
+        if annotated:
+            return annotated
+        top = (
+            NormalizedOffer.objects.filter(run__source_file_id=obj.id)
+            .exclude(currency="")
+            .values("currency")
+            .annotate(n=models.Count("id"))
+            .order_by("-n")
+            .values_list("currency", flat=True)
+            .first()
+        )
+        return top or ""
 
     def get_category_name(self, obj):
         if obj.category_id and obj.category:

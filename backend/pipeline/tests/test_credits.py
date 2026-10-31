@@ -373,3 +373,142 @@ class AdminCreditActionTests(TestCase):
         self.allowance.refresh_from_db()
         self.assertEqual(self.allowance.period_spent, 0)
         self.assertEqual(self.allowance.tokens_spent, 900)
+
+
+class UsageLogPaginationTests(TestCase):
+    def setUp(self):
+        self.alice = User.objects.create_user(username="alice", password="x")
+        self.org = Organization.objects.create(name="Org")
+        Membership.objects.create(
+            user=self.alice, organization=self.org, role="owner"
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.alice)
+        self.url = f"/api/orgs/{self.org.id}/usage/log/"
+
+    def _loose_call(self, label, tokens=10):
+        return UsageEvent.objects.create(
+            organization=self.org,
+            run=None,
+            kind="provider_call",
+            quantity=tokens,
+            detail={"task": "match", "block": label, "model": "m"},
+        )
+
+    def _run_with_call(self, name):
+        source = SourceFile.objects.create(
+            organization=self.org,
+            uploaded_by=self.alice,
+            original_name=name,
+            size_bytes=10,
+            sha256=name,
+            storage_key=name,
+        )
+        run = ImportRun.objects.create(
+            organization=self.org,
+            source_file=source,
+            rule_version=RuleSetVersion.objects.get(version="v1"),
+        )
+        UsageEvent.objects.create(
+            organization=self.org,
+            run=run,
+            kind="provider_call",
+            quantity=5,
+            detail={"model": "m"},
+        )
+        return run
+
+    def test_matching_paginates_fifty_per_page_newest_first(self):
+        for index in range(55):
+            self._loose_call(f"block-{index:02d}")
+        first = self.client.get(self.url, {"section": "matching", "page": 1})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.data["count"], 55)
+        self.assertEqual(first.data["pages"], 2)
+        self.assertEqual(first.data["page_size"], 50)
+        self.assertEqual(len(first.data["results"]), 50)
+        self.assertEqual(first.data["results"][0]["label"], "block-54")
+        second = self.client.get(self.url, {"section": "matching", "page": 2})
+        self.assertEqual(len(second.data["results"]), 5)
+        self.assertEqual(second.data["results"][-1]["label"], "block-00")
+
+    def test_imports_paginate_by_run(self):
+        for index in range(51):
+            self._run_with_call(f"f{index:02d}.xlsx")
+        first = self.client.get(self.url, {"section": "imports", "page": 1})
+        self.assertEqual(first.data["count"], 51)
+        self.assertEqual(len(first.data["results"]), 50)
+        second = self.client.get(self.url, {"section": "imports", "page": 2})
+        self.assertEqual(len(second.data["results"]), 1)
+
+    def test_invalid_section_and_page_rejected(self):
+        bad = self.client.get(self.url, {"section": "nope"})
+        self.assertEqual(bad.status_code, 400)
+        bad = self.client.get(self.url, {"section": "matching", "page": 0})
+        self.assertEqual(bad.status_code, 400)
+        bad = self.client.get(self.url, {"section": "matching", "page": "x"})
+        self.assertEqual(bad.status_code, 400)
+
+    def test_release_stuck_clears_only_own_company(self):
+        from pipeline.models import AuditEvent
+
+        other = Organization.objects.create(name="Other")
+        mine = get_allowance(self.org.id)
+        mine.in_flight = 1
+        mine.tokens_reserved = 500
+        mine.period_spent = 100
+        mine.tokens_spent = 100
+        mine.save(
+            update_fields=[
+                "in_flight",
+                "tokens_reserved",
+                "period_spent",
+                "tokens_spent",
+            ]
+        )
+        theirs = get_allowance(other.id)
+        theirs.in_flight = 1
+        theirs.tokens_reserved = 700
+        theirs.save(update_fields=["in_flight", "tokens_reserved"])
+        response = self.client.post(
+            f"/api/orgs/{self.org.id}/spending/release-stuck/"
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.data["released"]["in_flight"], 1)
+        mine.refresh_from_db()
+        self.assertEqual(mine.in_flight, 0)
+        self.assertEqual(mine.tokens_reserved, 0)
+        self.assertEqual(mine.period_spent, 100)
+        self.assertEqual(mine.tokens_spent, 100)
+        theirs.refresh_from_db()
+        self.assertEqual(theirs.in_flight, 1)
+        self.assertEqual(theirs.tokens_reserved, 700)
+        self.assertTrue(
+            AuditEvent.objects.filter(
+                organization=self.org, action="stuck_slots_released"
+            ).exists()
+        )
+        stranger = self.client.post(
+            f"/api/orgs/{other.id}/spending/release-stuck/"
+        )
+        self.assertEqual(stranger.status_code, 403)
+
+    def test_log_pruned_after_retention_window(self):
+        from datetime import timedelta
+
+        old = self._loose_call("ancient")
+        UsageEvent.objects.filter(pk=old.pk).update(
+            created_at=timezone.now() - timedelta(days=121)
+        )
+        kept = self._loose_call("fresh")
+        UsageEvent.objects.filter(pk=kept.pk).update(
+            created_at=timezone.now() - timedelta(days=119)
+        )
+        response = self.client.get(self.url, {"section": "matching"})
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["label"], "fresh")
+        self.assertFalse(UsageEvent.objects.filter(pk=old.pk).exists())
+        summary = self.client.get(f"/api/orgs/{self.org.id}/usage/")
+        self.assertEqual(summary.data["matching_count"], 1)
+        self.assertEqual(summary.data["log_retention_days"], 120)
+        self.assertEqual(summary.data["log_page_size"], 50)

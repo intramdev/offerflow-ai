@@ -48,19 +48,20 @@ function trimRate(rate: string): string {
 }
 
 function fxSummary(file: {
+  source_currency: string;
   fx_destination: string;
   fx_rates: Record<string, string>;
-  fx_simulated: boolean;
 }): string {
-  if (!file.fx_destination) return "no destination";
-  const entries = Object.entries(file.fx_rates ?? {});
-  if (entries.length === 0) return `→ ${file.fx_destination}`;
-  const shown = entries
-    .slice(0, 2)
-    .map(([from, rate]) => `${from}→${file.fx_destination} ${trimRate(rate)}`);
-  const extra = entries.length > 2 ? ` +${entries.length - 2}` : "";
-  const tag = file.fx_simulated ? " (simulated)" : "";
-  return `${shown.join(" · ")}${extra}${tag}`;
+  const dst = file.fx_destination;
+  if (!dst) return "no destination";
+  // fx_source is rate-table provenance ("fixture (synthetic demo rates)"),
+  // never a currency: the pair comes from the file's own currency.
+  const from = file.source_currency;
+  if (!from) return `→ ${dst}`;
+  if (from === dst) return `${from} → ${dst} (no conversion)`;
+  const rate = (file.fx_rates ?? {})[from];
+  if (!rate) return `${from} → ${dst} —`;
+  return `${from} → ${dst} ${trimRate(rate)}`;
 }
 const PAGE_SIZE = 50;
 
@@ -331,7 +332,7 @@ export default function FilesPage() {
               setQuery(e.target.value);
               setPage(1);
             }}
-            placeholder="Search by file name or uploader…"
+            placeholder="Ex. acme-march.xlsx"
             aria-label="Search files"
             className="pl-9"
           />
@@ -414,10 +415,11 @@ export default function FilesPage() {
                   <span
                     className="block text-xs text-muted-foreground"
                     title={
-                      file.fx_destination
-                        ? Object.entries(file.fx_rates ?? {})
-                            .map(([from, rate]) => `${from}→${file.fx_destination} ${rate}`)
-                            .join(", ") || "no recorded rates"
+                      file.fx_destination && file.source_currency
+                        ? `${file.source_currency} → ${file.fx_destination}: ${
+                            (file.fx_rates ?? {})[file.source_currency] ??
+                            "rate not recorded"
+                          }`
                         : "no destination"
                     }
                   >

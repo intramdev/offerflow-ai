@@ -383,6 +383,13 @@ class UsageEvent(models.Model):
     run = models.ForeignKey(
         ImportRun, on_delete=models.CASCADE, null=True, blank=True, related_name="usage_events"
     )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="usage_events",
+    )
     kind = models.CharField(max_length=64)
     quantity = models.PositiveIntegerField(default=1)
     detail = models.JSONField(default=dict)
@@ -390,7 +397,10 @@ class UsageEvent(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
-        indexes = [models.Index(fields=["organization", "created_at"])]
+        indexes = [
+            models.Index(fields=["organization", "created_at"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
 
 
 class AuditEvent(models.Model):
@@ -465,6 +475,7 @@ class Category(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
+        verbose_name_plural = "Categories"
         constraints = [
             models.UniqueConstraint(
                 fields=["organization", "name"],

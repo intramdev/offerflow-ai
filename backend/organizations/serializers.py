@@ -47,7 +47,14 @@ class PreferenceSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = UserPreference
-        fields = ["datetime_format"]
+        fields = [
+            "datetime_format",
+            "theme_mode",
+            "reading_font",
+            "reading_size",
+            "contrast_mode",
+            "motion_mode",
+        ]
 
 
 def _clean_currency_code(value) -> str:

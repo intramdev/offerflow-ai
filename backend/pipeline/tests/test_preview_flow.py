@@ -396,6 +396,18 @@ class PreviewFlowTests(TestCase):
             AuditEvent.objects.filter(action="upload_deleted").exists()
         )
 
+    def test_files_list_reports_source_currency(self):
+        self._confirm(
+            self._preview(self.alice, self.org_a, [HEADERS, complete_row()]).data["key"],
+            {},
+        )
+        self.client.force_authenticate(self.alice)
+        rows = self.client.get("/api/pipeline/files/")
+        self.assertEqual(rows.status_code, 200, rows.content)
+        row = rows.data[0]
+        self.assertEqual(row["source_currency"], "USD")
+        self.assertNotEqual(row["fx_source"], "USD")
+
     def test_files_list_scoped_to_member_orgs(self):
         self._confirm(
             self._preview(self.alice, self.org_a, [HEADERS, complete_row()]).data["key"],
@@ -419,14 +431,42 @@ class PreviewFlowTests(TestCase):
     def test_preferences_default_and_update(self):
         self.client.force_authenticate(self.alice)
         default = self.client.get("/api/orgs/preferences/me/")
-        self.assertEqual(default.data, {"datetime_format": "us"})
+        self.assertEqual(
+            default.data,
+            {
+                "datetime_format": "us",
+                "theme_mode": "light",
+                "reading_font": "system",
+                "reading_size": "md",
+                "contrast_mode": "standard",
+                "motion_mode": "system",
+            },
+        )
+        full = {
+            "datetime_format": "eu",
+            "theme_mode": "dark",
+            "reading_font": "readable",
+            "reading_size": "lg",
+            "contrast_mode": "high",
+            "motion_mode": "reduce",
+        }
         update = self.client.put(
-            "/api/orgs/preferences/me/", {"datetime_format": "eu"}, format="json"
+            "/api/orgs/preferences/me/", full, format="json"
         )
         self.assertEqual(update.status_code, 200, update.content)
         again = self.client.get("/api/orgs/preferences/me/")
-        self.assertEqual(again.data, {"datetime_format": "eu"})
+        self.assertEqual(again.data, full)
+        partial = self.client.patch(
+            "/api/orgs/preferences/me/",
+            {"theme_mode": "light"},
+            format="json",
+        )
+        self.assertEqual(partial.status_code, 200, partial.content)
+        self.assertEqual(partial.data["theme_mode"], "light")
+        self.assertEqual(partial.data["reading_size"], "lg")
         bad = self.client.put(
-            "/api/orgs/preferences/me/", {"datetime_format": "xx"}, format="json"
+            "/api/orgs/preferences/me/",
+            {**full, "theme_mode": "xx"},
+            format="json",
         )
         self.assertEqual(bad.status_code, 400)

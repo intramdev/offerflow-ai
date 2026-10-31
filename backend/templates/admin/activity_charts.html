@@ -1,0 +1,43 @@
+<div class="module" id="of-activity">
+  <h2>User activity · last 30 days (<a href="{% url 'activity-dashboard' %}">full ranking</a>)</h2>
+  {% if has_data %}
+  <div class="of-charts">
+    <div class="of-chart">
+      <h3>Tokens consumed</h3>
+      {% for row in by_tokens %}
+      <div class="of-bar-row">
+        <span class="of-bar-user">{{ row.username }}</span>
+        <span class="of-bar-track"><span class="of-bar-fill of-tokens" style="width: {{ row.width }}%"></span></span>
+        <span class="of-bar-value">{{ row.tokens }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    <div class="of-chart">
+      <h3>Sign-ins</h3>
+      {% for row in by_logins %}
+      <div class="of-bar-row">
+        <span class="of-bar-user">{{ row.username }}</span>
+        <span class="of-bar-track"><span class="of-bar-fill of-logins" style="width: {{ row.width }}%"></span></span>
+        <span class="of-bar-value">{{ row.logins }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% else %}
+  <p>No sign-ins or token spend in the last 30 days yet.</p>
+  {% endif %}
+</div>
+<style>
+  #of-activity h2 { background: linear-gradient(100deg, #4f46e5, #0d9488); }
+  #of-activity h2 a { color: #fff; text-decoration: underline; }
+  .of-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; padding: 1rem 1.25rem 1.25rem; }
+  @media (max-width: 900px) { .of-charts { grid-template-columns: 1fr; } }
+  .of-chart h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin: 0 0 0.6rem; }
+  .of-bar-row { display: grid; grid-template-columns: 9rem 1fr 4.5rem; align-items: center; gap: 0.6rem; padding: 0.18rem 0; }
+  .of-bar-user { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .of-bar-track { display: block; height: 0.9rem; border-radius: 999px; background: #e5e7eb; overflow: hidden; }
+  .of-bar-fill { display: block; height: 100%; border-radius: 999px; min-width: 3px; }
+  .of-tokens { background: linear-gradient(90deg, #4f46e5, #0d9488); }
+  .of-logins { background: linear-gradient(90deg, #0d9488, #34d399); }
+  .of-bar-value { text-align: right; font-variant-numeric: tabular-nums; }
+</style>

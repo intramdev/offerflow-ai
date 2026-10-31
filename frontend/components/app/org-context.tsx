@@ -4,6 +4,7 @@ import * as React from "react";
 
 import {
   ApiError,
+  DEFAULT_PREFERENCES,
   getActiveOrg,
   getPreferences,
   listMemberships,
@@ -24,6 +25,7 @@ interface OrgState {
   canOperate: boolean;
   selectOrg: (organizationId: number) => Promise<void>;
   refreshPrefs: () => Promise<void>;
+  refreshUser: () => Promise<void>;
 }
 
 const OrgContext = React.createContext<OrgState | null>(null);
@@ -34,7 +36,7 @@ export function OrgProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = React.useState<SessionUser | null>(null);
   const [memberships, setMemberships] = React.useState<Membership[]>([]);
   const [active, setActive] = React.useState<Membership | null>(null);
-  const [prefs, setPrefs] = React.useState<Preferences>({ datetime_format: "us" });
+  const [prefs, setPrefs] = React.useState<Preferences>(DEFAULT_PREFERENCES);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -82,6 +84,10 @@ export function OrgProvider({ children }: { children: React.ReactNode }) {
     setPrefs(await getPreferences());
   }, []);
 
+  const refreshUser = React.useCallback(async () => {
+    setUser(await me());
+  }, []);
+
   const value: OrgState = {
     user,
     memberships,
@@ -92,6 +98,7 @@ export function OrgProvider({ children }: { children: React.ReactNode }) {
     canOperate: active !== null && OPERATING_ROLES.has(active.role),
     selectOrg,
     refreshPrefs,
+    refreshUser,
   };
   return <OrgContext.Provider value={value}>{children}</OrgContext.Provider>;
 }

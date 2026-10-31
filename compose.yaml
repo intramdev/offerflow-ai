@@ -128,6 +128,7 @@ services:
     command: sh -c "npm install --no-audit --no-fund && npm run dev -- --hostname 0.0.0.0 --port 3000"
     environment:
       OFFERFLOW_BACKEND_URL: http://backend:8000
+      NEXT_PUBLIC_BACKEND_URL: http://127.0.0.1:8384
     ports:
       - "127.0.0.1:4344:3000"
     volumes:

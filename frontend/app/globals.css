@@ -2,18 +2,60 @@
 
 @plugin "@tailwindcss/typography";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
+  color-scheme: light;
   --background: #ffffff;
   --foreground: #1c1917;
   --muted: #f5f5f4;
   --muted-foreground: #57534e;
   --border: #e7e5e4;
-  --primary: #1d5c38;
+  --primary: #1d4ed8;
   --primary-foreground: #ffffff;
   --destructive: #991b1b;
   --destructive-foreground: #ffffff;
   --warning: #92400e;
   --radius: 0.5rem;
+}
+
+/* Dark theme. Toggled by the theme provider from the user's saved
+   preference (light / dark / follow system). */
+.dark {
+  color-scheme: dark;
+  --background: #1c1917;
+  --foreground: #fafaf9;
+  --muted: #292524;
+  --muted-foreground: #d6d3d1;
+  --border: #44403c;
+  --primary: #93c5fd;
+  --primary-foreground: #1c1917;
+  --destructive: #fca5a5;
+  --destructive-foreground: #1c1917;
+  --warning: #fcd34d;
+}
+
+/* High-contrast scheme (light and dark), for EN 301 549 / WCAG AA
+   compliance beyond the default palette. */
+:root[data-contrast="high"] {
+  --foreground: #000000;
+  --muted: #f5f5f4;
+  --muted-foreground: #292524;
+  --border: #57534e;
+  --primary: #1e40af;
+  --destructive: #7f1d1d;
+}
+
+.dark[data-contrast="high"] {
+  --background: #000000;
+  --foreground: #ffffff;
+  --muted: #1c1917;
+  --muted-foreground: #e7e5e4;
+  --border: #a8a29e;
+  --primary: #bfdbfe;
+  --primary-foreground: #000000;
+  --destructive: #fecaca;
+  --destructive-foreground: #000000;
 }
 
 @theme inline {
@@ -32,6 +74,19 @@
   --radius-sm: calc(var(--radius) - 4px);
 }
 
+/* Reading size scales the root so every rem-based component follows. */
+:root[data-reading-size="sm"] {
+  font-size: 14px;
+}
+
+:root[data-reading-size="lg"] {
+  font-size: 18px;
+}
+
+:root[data-reading-size="xl"] {
+  font-size: 20px;
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
@@ -39,9 +94,25 @@ body {
     sans-serif;
 }
 
+:root[data-reading-font="readable"] body {
+  font-family: Verdana, Geneva, "DejaVu Sans", sans-serif;
+}
+
+:root[data-reading-font="serif"] body {
+  font-family: Georgia, "Times New Roman", serif;
+}
+
+:root[data-reading-font="mono"] body {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 :focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
+}
+
+:root[data-contrast="high"] :focus-visible {
+  outline-width: 3px;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -51,6 +122,14 @@ body {
     animation: none !important;
     transition: none !important;
   }
+}
+
+/* Explicit motion override from the user's saved preference. */
+:root[data-motion="reduce"] *,
+:root[data-motion="reduce"] *::before,
+:root[data-motion="reduce"] *::after {
+  animation: none !important;
+  transition: none !important;
 }
 
 /* Marketing-page companions to the typography plugin. Scoped under
@@ -113,4 +192,9 @@ body {
 
 .prose .banner p {
   margin: 0.25rem 0;
+}
+
+.dark .prose .banner {
+  border-color: #92610e;
+  background: #2a2111;
 }

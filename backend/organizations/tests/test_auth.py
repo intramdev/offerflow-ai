@@ -91,3 +91,35 @@ class AuthTests(TestCase):
         self.assertEqual(refused.status_code, 403)
         accepted = self.login(strict, "u", "secret-pw")
         self.assertEqual(accepted.status_code, 200)
+
+    def test_profile_read_and_update(self):
+        self.client.force_authenticate(self.user)
+        before = self.client.get("/api/orgs/auth/me/")
+        self.assertEqual(
+            before.data,
+            {
+                "id": self.user.id,
+                "username": "u",
+                "email": "u@example.test",
+                "first_name": "",
+                "last_name": "",
+            },
+        )
+        response = self.client.patch(
+            "/api/orgs/auth/me/",
+            {
+                "first_name": "Gina",
+                "last_name": "Rossi",
+                "email": "gina@example.test",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.data["first_name"], "Gina")
+        self.assertEqual(response.data["last_name"], "Rossi")
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.first_name, "Gina")
+        bad = self.client.patch(
+            "/api/orgs/auth/me/", {"email": "not-an-email"}, format="json"
+        )
+        self.assertEqual(bad.status_code, 400)

@@ -23,7 +23,7 @@ from django.core.management import call_command
 from django.db import DatabaseError, connections, transaction
 from django.test import Client, SimpleTestCase, override_settings
 
-from organizations.rls import TENANT_TABLES
+from organizations.rls import BOOTSTRAP_FUNCTIONS, TENANT_TABLES
 from organizations.services import SESSION_ACTIVE_ORG_KEY
 
 User = get_user_model()
@@ -401,6 +401,36 @@ class IsolationDirectDbTests(_IsolationBase):
         self.assertFalse(superuser)
         self.assertFalse(bypass)
 
+    def test_runtime_grants_cover_tenant_tables(self):
+        # Row policies scope access, but the runtime role still needs
+        # table rights to reach its own rows at all. A missing GRANT
+        # fails differently from a policy denial (permission denied vs
+        # empty result), so assert the provisioned rights explicitly.
+        admin = connections[ADMIN_ALIAS]
+        with admin.cursor() as cursor:
+            for table in list(TENANT_TABLES) + ["organizations_organization"]:
+                cursor.execute(
+                    "SELECT has_table_privilege(%s, %s, %s)",
+                    [APP_ROLE, table, "SELECT, INSERT, UPDATE, DELETE"],
+                )
+                (granted,) = cursor.fetchone()
+                self.assertTrue(granted, f"{APP_ROLE} lacks rights on {table}")
+            for signature in BOOTSTRAP_FUNCTIONS:
+                cursor.execute(
+                    "SELECT has_function_privilege(%s, %s, 'EXECUTE')",
+                    [APP_ROLE, signature],
+                )
+                (granted,) = cursor.fetchone()
+                self.assertTrue(
+                    granted, f"{APP_ROLE} cannot EXECUTE {signature}"
+                )
+            cursor.execute(
+                "SELECT has_sequence_privilege(%s, %s, %s)",
+                [APP_ROLE, "pipeline_importrun_id_seq", "USAGE, SELECT"],
+            )
+            (granted,) = cursor.fetchone()
+            self.assertTrue(granted, "sequence rights missing")
+
     def test_no_context_sees_no_tenant_rows(self):
         self._reset_context()
         for table in TENANT_TABLES:
@@ -695,3 +725,66 @@ class HttpIsolationTests(_IsolationBase):
         response = carol.get("/api/pipeline/files/")
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(response.json(), [])
+
+
+@unittest.skipUnless(DSN, "OFFERFLOW_PG_ISOLATION_DSN is not set")
+class WorkerBootstrapTests(_IsolationBase):
+    """Celery bootstrap exactly as the worker runs it, restricted role.
+
+    The worker opens no HTTP session: it resolves the run's organization
+    through the narrow SECURITY DEFINER helper, enters tenant_scope, and
+    resets afterwards. These tests drive ``pipeline.jobs`` helpers on the
+    ``default`` connection, which the module harness points at the
+    disposable database as the restricted runtime role.
+    """
+
+    def setUp(self):
+        from organizations.context import reset_tenant_context
+
+        super().setUp()
+        reset_tenant_context()
+
+    def tearDown(self):
+        from organizations.context import reset_tenant_context
+
+        reset_tenant_context()
+        super().tearDown()
+
+    def test_resolver_reveals_run_org_without_context(self):
+        from pipeline.jobs import _run_org_for_worker
+
+        self.assertEqual(
+            _run_org_for_worker(_state["runs"]["A"]), _state["org_a"]
+        )
+        self.assertEqual(
+            _run_org_for_worker(_state["runs"]["B"]), _state["org_b"]
+        )
+
+    def test_unknown_run_resolves_to_none(self):
+        from pipeline.jobs import _run_org_for_worker
+
+        self.assertIsNone(_run_org_for_worker(123456789))
+
+    def test_worker_scope_sees_own_run_only(self):
+        from organizations.context import tenant_scope
+        from pipeline.models import ImportRun
+
+        with tenant_scope(_state["org_a"], 0):
+            run = ImportRun.objects.get(pk=_state["runs"]["A"])
+            self.assertEqual(run.organization_id, _state["org_a"])
+            self.assertFalse(
+                ImportRun.objects.filter(pk=_state["runs"]["B"]).exists()
+            )
+        self.assertFalse(
+            ImportRun.objects.filter(pk=_state["runs"]["A"]).exists()
+        )
+
+    def test_unresolvable_run_is_left_alone_and_loud(self):
+        from pipeline.jobs import _fail_unresolvable_run
+        from pipeline.models import ImportRun, RunStatus
+
+        with self.assertLogs("pipeline.jobs", level="ERROR"):
+            _fail_unresolvable_run(_state["runs"]["B"])
+        run = ImportRun.objects.using(ADMIN_ALIAS).get(pk=_state["runs"]["B"])
+        self.assertEqual(run.status, RunStatus.NEEDS_INPUT)
+        self.assertFalse(run.error)

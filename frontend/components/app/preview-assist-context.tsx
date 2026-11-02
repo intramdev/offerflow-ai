@@ -10,6 +10,8 @@ export interface PreviewAssistSession {
   filename: string;
   /** Owner applies the fresh preview after a confirmed assist. */
   onApplied: (preview: Preview) => void;
+  /** Live draft revision the next apply must target (409 if stale). */
+  getRevision: () => number | null;
 }
 
 export interface PreviewAssistDraft {

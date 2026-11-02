@@ -13,7 +13,7 @@ from django.core.exceptions import ValidationError
 from common.storage import LocalFileAdapter
 from pipeline.jobs import enqueue_run, record_audit
 from pipeline.models import ImportRun, RuleSetVersion, SourceFile
-from pipeline.parsing import UnsupportedFile, check_upload_safety
+from pipeline.parsing import UnsupportedFile, check_upload_safety, discover_sheets
 
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -52,6 +52,24 @@ def store_upload_run(
     *, organization, user, content: bytes, original_name: str, mapping: dict
 ) -> ImportRun:
     """Persist validated bytes plus file/run rows, then enqueue processing."""
+    mapping = dict(mapping or {})
+    if "sheet" not in mapping:
+        # Direct uploads never saw the preview's sheet picker: record the
+        # default selection and the omissions so no sheet is lost silently.
+        try:
+            entries = discover_sheets(content, original_name)
+        except UnsupportedFile:
+            entries = []
+        selected = next(
+            (entry["name"] for entry in entries if entry.get("visible", True)),
+            None,
+        )
+        mapping["sheet"] = selected
+        mapping["sheets_omitted"] = [
+            entry["name"]
+            for entry in entries
+            if entry["name"] != selected and entry.get("visible", True)
+        ]
     digest = hashlib.sha256(content).hexdigest()
     adapter = LocalFileAdapter(settings.OFFERFLOW_FILE_ROOT)
     key = adapter.build_key(

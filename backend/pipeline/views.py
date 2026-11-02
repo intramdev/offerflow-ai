@@ -47,14 +47,17 @@ from pipeline.quotes import (
     render_quote_xlsx,
     update_rule,
 )
+from pipeline.parsing import MessageCandidateFile
 from pipeline.previews import (
     AssistRefused,
+    DraftConflictError,
     apply_preview_assist,
     assist_preview,
     cancel_preview,
     confirm_preview,
     create_preview,
     create_preview_from_text,
+    get_preview_draft,
     render_preview,
 )
 from pipeline.serializers import (
@@ -517,6 +520,17 @@ class PreviewCreateView(APIView):
                 user=request.user,
                 uploaded_file=serializer.validated_data["file"],
             )
+        except MessageCandidateFile as candidate:
+            return Response(
+                {
+                    "message_candidate": True,
+                    "filename": serializer.validated_data["file"].name,
+                    "text": candidate.text,
+                    "truncated": candidate.truncated,
+                    "total_chars": candidate.total_chars,
+                    "explanation": str(candidate),
+                }
+            )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
         return Response(preview, status=status.HTTP_201_CREATED)
@@ -561,6 +575,7 @@ class PreviewRenderView(APIView):
                 mapping=serializer.validated_data["mapping"],
                 constants=serializer.validated_data.get("constants"),
                 ignored=serializer.validated_data.get("ignored"),
+                sheet=serializer.validated_data.get("sheet"),
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
@@ -580,6 +595,17 @@ class PreviewConfirmView(APIView):
                 mapping=serializer.validated_data["mapping"],
                 constants=serializer.validated_data.get("constants"),
                 ignored=serializer.validated_data.get("ignored"),
+                sheet=serializer.validated_data.get("sheet"),
+                revision=serializer.validated_data.get("revision"),
+            )
+        except DraftConflictError as error:
+            return Response(
+                {
+                    "detail": str(error),
+                    "revision_actual": error.revision_actual,
+                    "revision_expected": error.revision_expected,
+                },
+                status=status.HTTP_409_CONFLICT,
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
@@ -588,6 +614,13 @@ class PreviewConfirmView(APIView):
 
 class PreviewCancelView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, key):
+        try:
+            draft = get_preview_draft(key=key, user=request.user)
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
+        return Response(draft)
 
     def delete(self, request, key):
         try:
@@ -632,6 +665,7 @@ class PreviewAssistView(APIView):
                         "set_constants": {},
                         "drop_lines": [],
                         "dropped_previews": [],
+                        "operations": [],
                     },
                     "tokens": getattr(error, "tokens", 0),
                     "retriable": True,
@@ -673,6 +707,17 @@ class PreviewAssistApplyView(APIView):
                 user=request.user,
                 set_constants=serializer.validated_data["set_constants"],
                 drop_lines=serializer.validated_data["drop_lines"],
+                operations=serializer.validated_data.get("operations"),
+                revision=serializer.validated_data.get("revision"),
+            )
+        except DraftConflictError as error:
+            return Response(
+                {
+                    "detail": str(error),
+                    "revision_actual": error.revision_actual,
+                    "revision_expected": error.revision_expected,
+                },
+                status=status.HTTP_409_CONFLICT,
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
@@ -1246,10 +1291,11 @@ class QuoteDownloadView(APIView):
         import io
 
         quote = build_quote(run)
+        policy = (run.mapping or {}).get("document_policy", "stock")
         if file_format == "xlsx":
-            content = render_quote_xlsx(quote)
+            content = render_quote_xlsx(quote, document_policy=policy)
         else:
-            content = render_quote_csv(quote)
+            content = render_quote_csv(quote, document_policy=policy)
         return FileResponse(
             io.BytesIO(content),
             content_type=DOWNLOAD_TYPES[file_format],

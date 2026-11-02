@@ -186,46 +186,251 @@ CHAT_RESPONSE_SCHEMA = {
 
 ASSIST_PREVIEW_SYSTEM_PROMPT = (
     "You help adjust one pending OfferFlow import preview. The preview "
-    "quotes either numbered pasted chat message lines (one product per "
-    "line) or a small table with detected columns. The user discusses it "
-    "with you; you answer briefly and may propose exactly two kinds of "
-    "change: set_constants (a list of {name, value} pairs, one value "
-    "applied to every row, e.g. supplier, currency, or grade) and "
+    "quotes either numbered pasted chat message lines or a small table "
+    "with detected columns, plus the current draft: confirmed rules, "
+    "candidate product records with line spans, sections, and unresolved "
+    "issues. The user discusses it with you; you answer briefly and may "
+    "propose typed changes: set_constants (a list of {name, value} "
+    "pairs, one value applied to every row, e.g. supplier or currency), "
     "drop_lines (numbered pasted lines that carry no product "
-    "information: titles, dates, locations, or notes). Never propose "
-    "dropping section headers that state values for the lines beneath "
-    "them (for example a grade banner such as "
-    '"P1+ - Like New"): the importer automatically applies those values '
-    "to every covered product line, so dropping them would lose the "
-    "values. Copy the "
-    "supplier name from header lines when it clearly names the supplier. "
+    "information: titles, dates, locations, or notes), classify "
+    "(assign header, metadata, product, continuation, footer, or note "
+    "to numbered lines), section_value (a field value stated by one "
+    "section header line for every product line beneath it until the "
+    "next section header, e.g. a grade banner such as "
+    '"P1+ - Like New"), terminal_price_document or terminal_price_section '
+    "(the final number of each covered product line is the unit price "
+    "in the given currency; propose only when the user confirms this "
+    "meaning), join_lines (numbered lines forming one multi-line "
+    "product record), correct (fix one field of one candidate record "
+    "by its record id), and absent (declare quantity or capacity absent "
+    "document-wide). Never propose dropping section headers that state "
+    "values for the lines beneath them: confirm them with section_value "
+    "instead. Propose terminal_price only for lines whose final number "
+    "is separated from the text before it; a number glued to letters "
+    "or a storage unit is never a terminal price. Copy the supplier "
+    "name from header lines when it clearly names the supplier. "
     "Transcribe values exactly as shown; never invent, guess, or compute "
     "missing values, and propose nothing when unsure or when the request "
     "leaves this preview. You cannot see any other company data and cannot "
     "run commands, code, or SQL. Answer with the requested JSON only."
 )
 
+
+def _assist_object(properties: dict, required: list) -> dict:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+    }
+
+
+def _is_line_number(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _fold_assist_operations(parsed: dict) -> list:
+    """Fold the fixed-shape op arrays into draft operations.
+
+    Shape failures raise ProposalUnusable; semantic checks (unknown
+    fields, line ranges, contradictions) stay with the draft engine at
+    the preview layer, which reports them precisely per batch.
+    """
+    operations = []
+    for key in (
+        "classify",
+        "section_value",
+        "terminal_price_document",
+        "terminal_price_section",
+        "join_lines",
+        "correct",
+        "absent",
+    ):
+        if not isinstance(parsed.get(key, []), list):
+            raise ProposalUnusable("Assist returned an unusable envelope.")
+    classify = parsed.get("classify", [])
+    if any(
+        not isinstance(entry, dict)
+        or not isinstance(entry.get("lines"), list)
+        or not all(_is_line_number(n) for n in entry["lines"])
+        or not isinstance(entry.get("class"), str)
+        for entry in classify
+    ):
+        raise ProposalUnusable("Assist returned an unusable envelope.")
+    for entry in classify:
+        operations.append(
+            {"op": "classify", "lines": entry["lines"], "class": entry["class"]}
+        )
+    sectioned = parsed.get("section_value", [])
+    if any(
+        not isinstance(entry, dict)
+        or not _is_line_number(entry.get("header_line"))
+        or not isinstance(entry.get("field"), str)
+        or not isinstance(entry.get("value"), str)
+        for entry in sectioned
+    ):
+        raise ProposalUnusable("Assist returned an unusable envelope.")
+    for entry in sectioned:
+        operations.append(
+            {
+                "op": "section_value",
+                "header_line": entry["header_line"],
+                "field": entry["field"],
+                "value": entry["value"],
+            }
+        )
+    for entry in parsed.get("terminal_price_document", []):
+        if not isinstance(entry, dict) or not isinstance(
+            entry.get("currency"), str
+        ):
+            raise ProposalUnusable("Assist returned an unusable envelope.")
+        operations.append(
+            {"op": "terminal_price", "currency": entry["currency"]}
+        )
+    for entry in parsed.get("terminal_price_section", []):
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("currency"), str)
+            or not _is_line_number(entry.get("section_header_line"))
+        ):
+            raise ProposalUnusable("Assist returned an unusable envelope.")
+        operations.append(
+            {
+                "op": "terminal_price",
+                "currency": entry["currency"],
+                "section_header_line": entry["section_header_line"],
+            }
+        )
+    for entry in parsed.get("join_lines", []):
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("lines"), list)
+            or not all(_is_line_number(n) for n in entry["lines"])
+        ):
+            raise ProposalUnusable("Assist returned an unusable envelope.")
+        operations.append({"op": "join_lines", "lines": entry["lines"]})
+    for entry in parsed.get("correct", []):
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("record"), str)
+            or not isinstance(entry.get("field"), str)
+            or not isinstance(entry.get("value"), str)
+        ):
+            raise ProposalUnusable("Assist returned an unusable envelope.")
+        operations.append(
+            {
+                "op": "correct",
+                "record": entry["record"],
+                "field": entry["field"],
+                "value": entry["value"],
+            }
+        )
+    for entry in parsed.get("absent", []):
+        if not isinstance(entry, dict) or not isinstance(
+            entry.get("field"), str
+        ):
+            raise ProposalUnusable("Assist returned an unusable envelope.")
+        operations.append({"op": "absent", "field": entry["field"]})
+    return operations
+
+
 ASSIST_PREVIEW_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
         "message": {"type": "string"},
-        # Strict structured output rejects free-form maps, so
-        # constants travel as pairs and fold to a dict on receipt.
+        # Strict structured output rejects free-form maps and
+        # heterogeneous unions, so constants travel as pairs and each
+        # typed operation kind travels in its own fixed-shape array;
+        # the adapter folds them into operations on receipt.
         "set_constants": {
             "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "value": {"type": "string"},
-                },
-                "required": ["name", "value"],
-                "additionalProperties": False,
-            },
+            "items": _assist_object(
+                {"name": {"type": "string"}, "value": {"type": "string"}},
+                ["name", "value"],
+            ),
         },
         "drop_lines": {"type": "array", "items": {"type": "integer"}},
+        "classify": {
+            "type": "array",
+            "items": _assist_object(
+                {
+                    "lines": {
+                        "type": "array", "items": {"type": "integer"},
+                    },
+                    "class": {"type": "string"},
+                },
+                ["lines", "class"],
+            ),
+        },
+        "section_value": {
+            "type": "array",
+            "items": _assist_object(
+                {
+                    "header_line": {"type": "integer"},
+                    "field": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                ["header_line", "field", "value"],
+            ),
+        },
+        "terminal_price_document": {
+            "type": "array",
+            "items": _assist_object(
+                {"currency": {"type": "string"}}, ["currency"]
+            ),
+        },
+        "terminal_price_section": {
+            "type": "array",
+            "items": _assist_object(
+                {
+                    "currency": {"type": "string"},
+                    "section_header_line": {"type": "integer"},
+                },
+                ["currency", "section_header_line"],
+            ),
+        },
+        "join_lines": {
+            "type": "array",
+            "items": _assist_object(
+                {
+                    "lines": {
+                        "type": "array", "items": {"type": "integer"},
+                    }
+                },
+                ["lines"],
+            ),
+        },
+        "correct": {
+            "type": "array",
+            "items": _assist_object(
+                {
+                    "record": {"type": "string"},
+                    "field": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                ["record", "field", "value"],
+            ),
+        },
+        "absent": {
+            "type": "array",
+            "items": _assist_object(
+                {"field": {"type": "string"}}, ["field"]
+            ),
+        },
     },
-    "required": ["message", "set_constants", "drop_lines"],
+    "required": [
+        "message",
+        "set_constants",
+        "drop_lines",
+        "classify",
+        "section_value",
+        "terminal_price_document",
+        "terminal_price_section",
+        "join_lines",
+        "correct",
+        "absent",
+    ],
     "additionalProperties": False,
 }
 
@@ -540,6 +745,7 @@ class MetaProvider:
         ):
             raise ProposalUnusable("Assist returned an unusable envelope.")
         constants = {pair["name"]: pair["value"] for pair in pairs}
+        operations = _fold_assist_operations(parsed)
         if on_chunk is not None:
             on_chunk(1, 1, prompt_tokens, completion_tokens)
         return {
@@ -554,6 +760,7 @@ class MetaProvider:
             "message": message,
             "set_constants": constants,
             "drop_lines": drops,
+            "operations": operations,
         }
 
     def _dispatch_categorize(self, client, payload: dict) -> tuple:
@@ -578,6 +785,7 @@ class MetaProvider:
         from pipeline.spending import (
             BudgetRefused,
             estimate_request_tokens,
+            estimate_schema_tokens,
             estimate_text_tokens,
             mark_uncertain,
             reconcile,
@@ -587,16 +795,22 @@ class MetaProvider:
 
         label = kind.capitalize()
         user_content = json.dumps(payload, separators=(",", ":"))
-        estimated_input = estimate_text_tokens(user_content) + estimate_text_tokens(system)
+        estimated_input = (
+            estimate_text_tokens(user_content)
+            + estimate_text_tokens(system)
+            + estimate_schema_tokens(schema)
+        )
         if estimated_input > self._config.max_input_tokens:
             raise ProviderError(
                 f"{label} block exceeds the input cap; refusing dispatch."
             )
-        # Reserve the full permitted call (bounded input + entire output
-        # allowance + overhead); observed usage refunds the difference.
+        # Reserve the full permitted call (bounded input + schema +
+        # entire output allowance + overhead); observed usage refunds
+        # the difference.
         estimate = estimate_request_tokens(
             texts=[system, user_content],
             max_output_tokens=self._config.max_output_tokens,
+            schema=schema,
         )
         try:
             reservation = reserve(
@@ -685,11 +899,14 @@ class MetaProvider:
 
         base_tokens reserves room for content attached to every call
         (the shared message context), counted before any row is placed.
+        The interpret response schema travels on every call too, so it
+        joins the fixed baseline: the splitter and the dispatch precheck
+        must agree on what counts toward the cap.
         """
-        from pipeline.spending import estimate_text_tokens
+        from pipeline.spending import estimate_schema_tokens, estimate_text_tokens
 
         system_tokens = estimate_text_tokens(SYSTEM_PROMPT)
-        fixed = system_tokens + base_tokens
+        fixed = system_tokens + base_tokens + estimate_schema_tokens(RESPONSE_SCHEMA)
         chunks: list = []
         current: list = []
         current_tokens = fixed
@@ -723,6 +940,7 @@ class MetaProvider:
         from pipeline.spending import (
             BudgetRefused,
             estimate_request_tokens,
+            estimate_schema_tokens,
             estimate_text_tokens,
             mark_uncertain,
             reconcile,
@@ -734,8 +952,10 @@ class MetaProvider:
         if context:
             body = {"context": context, "rows": chunk}
         user_content = json.dumps(body, separators=(",", ":"))
-        estimated_input = estimate_text_tokens(user_content) + estimate_text_tokens(
-            SYSTEM_PROMPT
+        estimated_input = (
+            estimate_text_tokens(user_content)
+            + estimate_text_tokens(SYSTEM_PROMPT)
+            + estimate_schema_tokens(RESPONSE_SCHEMA)
         )
         if estimated_input > self._config.max_input_tokens:
             raise ProviderError(
@@ -745,6 +965,7 @@ class MetaProvider:
         estimate = estimate_request_tokens(
             texts=[SYSTEM_PROMPT, user_content],
             max_output_tokens=self._config.max_output_tokens,
+            schema=RESPONSE_SCHEMA,
         )
         try:
             reservation = reserve(

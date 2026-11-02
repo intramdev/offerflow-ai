@@ -395,11 +395,20 @@ def format_money(value) -> str:
         return str(value)
 
 
+#: Unknown stock on price-only lines renders as a word, never as
+#: zero, one, or a blank that reads as either.
+UNKNOWN_QUANTITY_LABEL = "Unknown"
+
+
 def _quote_cells(line: dict, *, numbers: bool) -> dict:
     """One quote line as template column key -> rendered cell."""
     price = line["unit_price"]
     capacity = line["capacity_gb"]
     quantity = line["quantity"]
+    if quantity is None:
+        # Only price-only runs release lines without stock; stock
+        # runs cannot reach export with a quantity gap.
+        quantity = UNKNOWN_QUANTITY_LABEL
     if numbers:
         try:
             price = float(
@@ -409,7 +418,6 @@ def _quote_cells(line: dict, *, numbers: bool) -> dict:
             price = float(price)
     else:
         capacity = _cell(capacity)
-        quantity = _cell(quantity)
         price = format_money(price)
     return {
         "brand": sanitize_cell(line["brand"]),
@@ -429,16 +437,23 @@ def _quote_cells(line: dict, *, numbers: bool) -> dict:
     }
 
 
-def _render_columns(columns: list | None, *, include_category: bool) -> list:
+def _render_columns(
+    columns: list | None, *, include_category: bool,
+    omit_quantity: bool = False,
+) -> list:
     """Resolve the header keys for a render.
 
     None keeps the legacy layout (QUOTE_COLUMNS plus an optional
     trailing Category); an explicit key list is used as given.
     Unknown keys are refused loudly — never dropped silently.
+    Price-only renders omit the stock column from the default layout;
+    an explicit template keeps it with Unknown cells.
     """
     if columns is None:
         keys = ["brand", "model", "capacity", "grade", "supplier",
                 "quantity", "price", "currency", "rule"]
+        if omit_quantity:
+            keys.remove("quantity")
         if include_category:
             keys.append("category")
         return keys
@@ -455,16 +470,23 @@ def render_quote_csv(
     *,
     include_category: bool = False,
     columns: list | None = None,
+    document_policy: str = "stock",
 ) -> bytes:
     """Render quote lines as CSV bytes.
 
     include_category appends a trailing Category column for quotes
     whose lines carry categories; per-run quotes stay untouched.
     columns selects an explicit template key list instead.
+    document_policy price_only drops the stock column from the
+    default layout; explicit templates keep it with Unknown cells.
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    keys = _render_columns(columns, include_category=include_category)
+    keys = _render_columns(
+        columns,
+        include_category=include_category,
+        omit_quantity=document_policy == "price_only",
+    )
     writer.writerow([QUOTE_COLUMN_HEADERS[key] for key in keys])
     for line in quote["lines"]:
         cells = _quote_cells(line, numbers=False)
@@ -477,19 +499,26 @@ def render_quote_xlsx(
     *,
     include_category: bool = False,
     columns: list | None = None,
+    document_policy: str = "stock",
 ) -> bytes:
     """Render quote lines as xlsx bytes (prices as numbers).
 
     include_category appends a trailing Category column for quotes
     whose lines carry categories; per-run quotes stay untouched.
     columns selects an explicit template key list instead.
+    document_policy price_only drops the stock column from the
+    default layout; explicit templates keep it with Unknown cells.
     """
     from openpyxl import Workbook
 
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Quote"
-    keys = _render_columns(columns, include_category=include_category)
+    keys = _render_columns(
+        columns,
+        include_category=include_category,
+        omit_quantity=document_policy == "price_only",
+    )
     sheet.append([QUOTE_COLUMN_HEADERS[key] for key in keys])
     for line in quote["lines"]:
         cells = _quote_cells(line, numbers=True)

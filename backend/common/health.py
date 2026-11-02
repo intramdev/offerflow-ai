@@ -25,12 +25,25 @@ def health_view(request):
         database = "reachable"
     except Exception:
         database = "unreachable"
+    # Running-role check for the isolation switch: True means the
+    # runtime role bypasses row policy (migrate to a restricted role);
+    # False means restricted; None means not applicable/unreachable.
+    # No role name is exposed.
+    role_privileged = None
+    if database == "reachable" and connection.vendor == "postgresql":
+        try:
+            from organizations.context import current_role_is_privileged
+
+            role_privileged = current_role_is_privileged()
+        except Exception:
+            role_privileged = None
     healthy = provider_ok and database == "reachable"
     payload = {
         "status": "ok" if healthy else "degraded",
         "mode": "simulated" if simulated else "live",
         "provider": provider_name,
         "database": database,
+        "runtime_role_privileged": role_privileged,
         "version": settings.APP_VERSION,
     }
     return JsonResponse(payload, status=200 if healthy else 503)

@@ -433,6 +433,9 @@ class ColumnMappingMemory(models.Model):
 
     When an upload's ordered headers fingerprint matches a remembered
     signature, the stored mapping is proposed instead of asking again.
+    Profiles are scoped by organization, signature, and supplier, so one
+    supplier's interpretation never overwrites or leaks into another's;
+    every proposal names its source profile.
     """
 
     organization = models.ForeignKey(
@@ -453,7 +456,7 @@ class ColumnMappingMemory(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=["organization", "signature"],
+                fields=["organization", "signature", "supplier_hint"],
                 name="unique_org_mapping_memory",
             )
         ]

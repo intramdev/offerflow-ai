@@ -26,14 +26,16 @@ tokens_spent is the grand total and is never reset. New paid allowances
 start at zero and require explicit per-organization approval: refusing
 loudly is the default, spending is the opt-in.
 
-Token estimates are conservative upper bounds (see estimate_text_tokens),
-never predictions: over-reserving only costs temporary headroom, while
+Token estimates are documented conservative bounds (see
+estimate_text_tokens), never predictions and never a certified absolute
+bill cap: over-reserving only costs temporary headroom, while
 under-reserving could overspend. Observed usage always wins at reconcile.
 """
 
 from __future__ import annotations
 
 import calendar
+import json
 from dataclasses import dataclass
 from datetime import date, timedelta
 
@@ -60,35 +62,68 @@ class Reservation:
 
 # --- Conservative token estimation ---------------------------------------
 # Without the serving model's tokenizer, estimates must bound real usage
-# from above for the content this app sends: supplier JSON that mixes
-# latin text, numbers, and occasionally CJK characters. Typical BPE rates
-# are ~4 chars/token for English but ~1-2 chars/token for CJK, so ceil
-# (chars/3) covers both with margin. REQUEST_OVERHEAD_TOKENS covers
-# message framing plus the JSON-schema preamble the provider attaches to
-# every structured-output call. Observed usage reconciles exactly, so a
-# generous bound only costs temporary headroom — never real spend.
+# from above for the content this app sends. The bound rests on stated
+# assumptions about the configured provider family (Meta Chat Completions
+# over a Llama-family BPE vocabulary), not on a proven universal law:
+# ASCII-heavy text encodes near ~4 chars/token, so ceil(ascii/3) keeps
+# margin; non-ASCII characters (CJK, accented Latin, emoji) commonly
+# cost at least one token each and fall back to byte pieces for rare
+# glyphs, so each counts two. One code-point pass is cheap next to a
+# network call.
+#
+# estimate_request_tokens additionally serializes the response schema
+# that travels on every structured-output call: the schema is prompt
+# tokens and must be reserved. REQUEST_OVERHEAD_TOKENS covers only the
+# fixed chat envelope (roles, model name, message framing, and the
+# json_schema wrapper keys) — never the schema body or payload text.
+# Observed usage reconciles exactly, so a generous bound only costs
+# temporary headroom, never real spend.
 CHARS_PER_TOKEN_BOUND = 3
+NON_ASCII_TOKENS_PER_CHAR = 2
 REQUEST_OVERHEAD_TOKENS = 64
 
 
 def estimate_text_tokens(text: str) -> int:
-    """Conservative upper bound on tokens for one text payload."""
+    """Conservative token bound for one text payload (see notes above)."""
     if not text:
         return 0
-    return max(1, -(-len(text) // CHARS_PER_TOKEN_BOUND))
+    ascii_chars = 0
+    for char in text:
+        if ord(char) < 128:
+            ascii_chars += 1
+    other_chars = len(text) - ascii_chars
+    return max(
+        1,
+        -(-ascii_chars // CHARS_PER_TOKEN_BOUND)
+        + other_chars * NON_ASCII_TOKENS_PER_CHAR,
+    )
 
 
-def estimate_request_tokens(*, texts: list[str], max_output_tokens: int) -> int:
+def estimate_schema_tokens(schema: dict) -> int:
+    """Conservative bound for a serialized structured-output schema.
+
+    Uses default JSON spacing, close to what the SDK sends on the wire,
+    with sorted keys so the bound is deterministic.
+    """
+    return estimate_text_tokens(json.dumps(schema, sort_keys=True))
+
+
+def estimate_request_tokens(
+    *, texts: list[str], max_output_tokens: int, schema: dict | None = None
+) -> int:
     """Conservative reservation size for one permitted request.
 
-    Covers the bounded input, the full permitted output (the model may
-    legally emit up to max_output_tokens), and protocol overhead. Callers
-    that cannot afford this must shrink their request limits first —
-    the reservation never silently assumes a smaller call.
+    Covers the bounded input texts, the serialized response schema when
+    the call uses structured output, the full permitted output (the
+    model may legally emit up to max_output_tokens), and protocol
+    overhead. Callers that cannot afford this must shrink their request
+    limits first — the reservation never silently assumes a smaller call.
     """
     if max_output_tokens < 0:
         raise ValueError("max_output_tokens must be non-negative.")
     incoming = sum(estimate_text_tokens(text or "") for text in texts)
+    if schema is not None:
+        incoming += estimate_schema_tokens(schema)
     return incoming + int(max_output_tokens) + REQUEST_OVERHEAD_TOKENS
 
 

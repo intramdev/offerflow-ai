@@ -13,6 +13,8 @@ import {
   ApiError,
   createPreview,
   createPreviewFromText,
+  isMessageCandidate,
+  type MessageCandidate,
   type Preview,
 } from "@/lib/api";
 import { UploadDropzone } from "./UploadDropzone";
@@ -24,17 +26,40 @@ export default function UploadPage() {
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [pasted, setPasted] = React.useState("");
-  const [assistRevision, setAssistRevision] = React.useState(0);
+  const [candidate, setCandidate] = React.useState<MessageCandidate | null>(null);
 
   async function onFile(file: File) {
     if (!active) return;
     setBusy(true);
     setError(null);
+    setCandidate(null);
     try {
       const created = await createPreview(active.organization, file);
-      setPreview(created);
+      if (isMessageCandidate(created)) {
+        setCandidate(created);
+      } else {
+        setPreview(created);
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Upload failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onCandidateImport() {
+    if (!active || !candidate) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await createPreviewFromText(
+        active.organization,
+        candidate.text,
+      );
+      setCandidate(null);
+      setPreview(created);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Preview failed.");
     } finally {
       setBusy(false);
     }
@@ -62,9 +87,11 @@ export default function UploadPage() {
     .filter((line) => line.trim() !== "").length;
 
   // While a preview is open the floating assistant can propose changes
-  // to it; applying swaps in the fresh preview and bumps the revision
-  // so the editor merges the assisted values.
+  // to it; applying swaps in the fresh preview, whose bumped draft
+  // revision tells the editor to merge the assisted values.
   const previewKey = preview?.key ?? null;
+  const previewRef = React.useRef(preview);
+  previewRef.current = preview;
   React.useEffect(() => {
     if (!previewKey || !preview) return;
     assist.register({
@@ -73,8 +100,8 @@ export default function UploadPage() {
       filename: preview.filename,
       onApplied: (next) => {
         setPreview(next);
-        setAssistRevision((revision) => revision + 1);
       },
+      getRevision: () => previewRef.current?.draft?.revision ?? null,
     });
     return () => assist.unregister(previewKey);
   }, [previewKey]);
@@ -150,7 +177,7 @@ export default function UploadPage() {
         </div>
         <MappingEditor
           preview={preview}
-          assistRevision={assistRevision}
+          onPreview={setPreview}
           onDone={() => setPreview(null)}
         />
       </div>
@@ -166,6 +193,35 @@ export default function UploadPage() {
         </p>
       </div>
       {error ? <ErrorNotice message={error} /> : null}
+      {candidate ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Import {candidate.filename} as a message?</CardTitle>
+            <CardDescription>{candidate.explanation}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-sm text-muted-foreground">
+              {candidate.total_chars.toLocaleString("en-US")} characters, no
+              table headers — the message lane reads one product per line.
+              {candidate.truncated
+                ? " Only the first 256,000 characters are carried over."
+                : ""}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={() => void onCandidateImport()} disabled={busy}>
+                {busy ? "Loading preview…" : "Import as message"}
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => setCandidate(null)}
+                disabled={busy}
+              >
+                Discard
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
       <UploadDropzone disabled={busy} onFile={(file) => void onFile(file)} />
       <Card>
         <CardHeader>

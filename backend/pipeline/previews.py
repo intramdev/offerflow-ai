@@ -16,7 +16,10 @@ from django.conf import settings
 from django.core.exceptions import PermissionDenied, ValidationError
 
 from common.storage import LocalFileAdapter
-from organizations.services import authorize_organization_access
+from organizations.services import (
+    authorize_organization_access,
+    require_organization_role,
+)
 from pipeline.models import ColumnMappingMemory, SourceFile
 from pipeline.normalize import (
     compute_offer_status,
@@ -30,10 +33,14 @@ from pipeline.parsing import (
     HEADER_TOKENS,
     MESSAGE_COLUMN,
     REQUIRED_COLUMNS,
+    HeaderNotFound,
     MappingRequired,
+    MessageCandidateFile,
     UnsupportedFile,
+    candidate_message_text,
     check_upload_safety,
     column_letter,
+    discover_sheets,
     header_signature,
     parse_upload,
 )
@@ -99,11 +106,13 @@ def _gc_previews() -> None:
                 adapter.delete(f"previews/{key}.json")
 
 
-def _derive_sheet(content, original_name, limits, message_fallback):
-    """Parse preview bytes into headers, map, sources, missing, row count.
+def _derive_sheet(content, original_name, limits, message_fallback,
+                  sheet_name=None):
+    """Parse preview bytes into headers, map, sources, missing, rows, sheet.
 
-    Shared by creation and assist-apply so re-derived previews always
-    match what a fresh upload of the same bytes would show.
+    Shared by creation, sheet switching, and assist-apply so re-derived
+    previews always match what a fresh upload of the same bytes and
+    selected sheet would show.
     """
     try:
         sheet = parse_upload(
@@ -113,6 +122,7 @@ def _derive_sheet(content, original_name, limits, message_fallback):
             max_cols=limits["max_cols"],
             header_scan_rows=limits["header_scan_rows"],
             message_fallback=message_fallback,
+            sheet_name=sheet_name,
         )
         return (
             sheet.headers,
@@ -120,6 +130,7 @@ def _derive_sheet(content, original_name, limits, message_fallback):
             sheet.sources,
             [],
             len(sheet.rows),
+            sheet.sheet,
         )
     except MappingRequired as exc:
         return (
@@ -128,7 +139,56 @@ def _derive_sheet(content, original_name, limits, message_fallback):
             exc.sources,
             exc.missing,
             len(exc.rows),
+            exc.sheet or sheet_name,
         )
+
+
+def _default_sheet(entries: list):
+    """First visible discovered section, or None when there is nothing."""
+    for entry in entries:
+        if entry.get("visible", True):
+            return entry["name"]
+    return None
+
+
+def _sheet_block(entries: list, selected):
+    """Public sheet-selection block: available, selected, omitted, notice."""
+    omitted = [
+        entry["name"] for entry in entries
+        if entry["name"] != selected and entry.get("visible", True)
+    ]
+    hidden = sum(1 for entry in entries if not entry.get("visible", True))
+    notice = None
+    if omitted:
+        dropped = ", ".join(repr(name) for name in omitted)
+        notice = (
+            f"Sheet {selected!r} selected — {dropped} will not be "
+            "imported. Switch sheets to import a different one."
+        )
+        if hidden:
+            notice += f" {hidden} hidden sheet(s) skipped."
+    elif hidden:
+        notice = f"{hidden} hidden sheet(s) skipped."
+    return {
+        "available": entries,
+        "selected": selected,
+        "omitted": omitted,
+        "notice": notice,
+    }
+
+
+def _validate_sheet(entries: list, wanted, *, filename: str) -> str:
+    """Resolve an explicit sheet choice against discovery, or refuse."""
+    names = [entry["name"] for entry in entries]
+    if wanted not in names:
+        seen = ", ".join(names) or "(none)"
+        raise ValidationError(
+            f"Sheet {wanted!r} not found in {filename}. Available: {seen}."
+        )
+    entry = names.index(wanted)
+    if not entries[entry].get("visible", True):
+        raise ValidationError(f"Sheet {wanted!r} is hidden.")
+    return wanted
 
 
 def _load_preview(key: str) -> dict:
@@ -140,6 +200,10 @@ def _load_preview(key: str) -> dict:
         raise ValidationError("Unknown or expired preview.") from None
 
 
+def _memory_supplier(value) -> str:
+    return ("" if value is None else str(value)).strip()[:255]
+
+
 def remember_mapping(
     *,
     organization,
@@ -149,22 +213,27 @@ def remember_mapping(
     constants=None,
     ignored=None,
 ):
-    """Store a confirmed header-signature to mapping reuse record."""
+    """Store a confirmed header-signature to mapping reuse record.
+
+    Profiles are scoped by organization, header signature, AND supplier:
+    one supplier's confirmed interpretation never overwrites another's.
+    """
     signature = header_signature(headers)
     clean_constants = {str(k): v for k, v in (constants or {}).items()}
     clean_ignored = [str(name) for name in (ignored or [])]
     stored_mapping = {
         str(k): v for k, v in mapping.items() if k not in clean_ignored
     }
+    supplier = _memory_supplier(supplier_hint)
     memory, created = ColumnMappingMemory.objects.get_or_create(
         organization=organization,
         signature=signature,
+        supplier_hint=supplier,
         defaults={
             "headers": list(headers),
             "mapping": stored_mapping,
             "constants": clean_constants,
             "ignored": clean_ignored,
-            "supplier_hint": (supplier_hint or "")[:255],
         },
     )
     if not created:
@@ -174,21 +243,52 @@ def remember_mapping(
         memory.mapping = stored_mapping
         memory.constants = clean_constants
         memory.ignored = clean_ignored
-        if supplier_hint:
-            memory.supplier_hint = supplier_hint[:255]
         memory.use_count = F("use_count") + 1
         memory.save()
     return memory
 
 
-def lookup_memory(*, organization, headers: list):
-    """Return the remembered mapping for ordered headers, if any."""
-    try:
-        return ColumnMappingMemory.objects.get(
-            organization=organization, signature=header_signature(headers)
+def lookup_memory(*, organization, headers: list, supplier=None):
+    """Return the remembered mapping for ordered headers, if any.
+
+    Message pastes share one header signature, so a message-lane lookup
+    only matches when the confirmed supplier equals the remembered one:
+    a new supplier never inherits another supplier's identity, currency,
+    or grades. Table lanes fall back to the most recently used profile
+    for the signature; it stays a visible proposal the reviewer edits.
+    """
+    signature = header_signature(headers)
+    if list(headers) == [MESSAGE_COLUMN]:
+        wanted = _memory_supplier(supplier).lower()
+        if not wanted:
+            return None
+        return (
+            ColumnMappingMemory.objects.filter(
+                organization=organization, signature=signature
+            )
+            .exclude(supplier_hint="")
+            .order_by("-last_used_at")
+            .filter(supplier_hint__iexact=wanted)
+            .first()
         )
-    except ColumnMappingMemory.DoesNotExist:
-        return None
+    if supplier:
+        match = (
+            ColumnMappingMemory.objects.filter(
+                organization=organization, signature=signature
+            )
+            .filter(supplier_hint__iexact=_memory_supplier(supplier))
+            .order_by("-last_used_at")
+            .first()
+        )
+        if match is not None:
+            return match
+    return (
+        ColumnMappingMemory.objects.filter(
+            organization=organization, signature=signature
+        )
+        .order_by("-last_used_at")
+        .first()
+    )
 
 
 def _memory_usable(memory: ColumnMappingMemory, headers: list) -> bool:
@@ -337,9 +437,80 @@ def _with_currency_default(mapping: dict, constants: dict, default_currency: str
     return merged, labels, applied
 
 
+def _message_lane_accepts(content: bytes, original_name: str, limits: dict) -> bool:
+    """True when the paste/message lane can read these upload bytes."""
+    try:
+        parse_upload(
+            content,
+            original_name,
+            max_rows=limits["max_rows"],
+            max_cols=limits["max_cols"],
+            header_scan_rows=limits["header_scan_rows"],
+            message_fallback=True,
+        )
+    except UnsupportedFile:
+        return False
+    return True
+
+
+def _render_message_samples(*, content: bytes, merged: dict, applied: dict,
+                              sheet, draft_rules, document_policy: str,
+                              constants) -> dict:
+    """Sample rows for the message lane, driven by the confirmed draft.
+
+    Records, joins, section values, and terminal derivation come from
+    the same derive_record_cells the worker imports, so the preview
+    shows exactly what confirm would import. Explicitly submitted set
+    values win over derived ones; derived values win over the
+    organization currency default.
+    """
+    from pipeline.draft import derive_record_cells
+
+    lines = _content_lines(content)
+    derived = derive_record_cells(lines, draft_rules or [])
+    explicit = set((constants or {}))
+    rows = []
+    for record_id, info in list(derived.items())[:SAMPLE_ROWS]:
+        text = "\n".join(lines[number - 1] for number in info["lines"])
+        cells = {"message": text}
+        cells.update(merged)
+        for name, value in info["cells"].items():
+            if name not in explicit:
+                cells[name] = value
+        fields = normalize_cells(dict(cells))
+        status, gaps, reason = compute_offer_status(
+            fields, document_policy=document_policy
+        )
+        rows.append(
+            {
+                "index": info["lines"][0],
+                "record": record_id,
+                "lines": info["lines"],
+                "cells": cells,
+                "terminal": info["terminal"],
+                "normalized": {key: _safe(value) for key, value in fields.items()},
+                "status": status,
+                "issues": [gap["question"] for gap in gaps]
+                + ([reason] if reason else []),
+            }
+        )
+    return {
+        "complete": True,
+        "missing": [],
+        "detected": sheet.column_map,
+        "sources": sheet.sources,
+        "applied_defaults": applied,
+        "rows": rows,
+        "record_count": len(derived),
+    }
+
+
 def _render_samples(content: bytes, filename: str, mapping: dict,
                     constants=None, ignored=None, default_currency="",
-                    message_fallback: bool = False) -> dict:
+                    message_fallback: bool = False,
+                    sheet_name=None, exclude_lines=(),
+                    draft_rules=None, document_policy: str = "stock") -> dict:
+    skip = set(exclude_lines or ())
     limits = _limits()
     merged, labels, applied = _with_currency_default(
         mapping, constants, default_currency, ignored
@@ -356,6 +527,7 @@ def _render_samples(content: bytes, filename: str, mapping: dict,
             ignored_columns=ignored or None,
             constant_sources=labels or None,
             message_fallback=message_fallback,
+            sheet_name=sheet_name,
         )
     except MappingRequired as exc:
         return {
@@ -366,13 +538,28 @@ def _render_samples(content: bytes, filename: str, mapping: dict,
             "applied_defaults": applied,
             "rows": [
                 {"index": row.index, "cells": row.data}
-                for row in exc.rows[:SAMPLE_ROWS]
-            ],
+                for row in exc.rows
+                if row.index not in skip
+            ][:SAMPLE_ROWS],
         }
+    if message_fallback:
+        return _render_message_samples(
+            content=content,
+            merged=merged,
+            applied=applied,
+            sheet=sheet,
+            draft_rules=draft_rules,
+            document_policy=document_policy,
+            constants=constants,
+        )
     rows = []
-    for row in sheet.rows[:SAMPLE_ROWS]:
+    for row in [row for row in sheet.rows if row.index not in skip][
+        :SAMPLE_ROWS
+    ]:
         fields = normalize_cells(dict(row.data))
-        status, gaps, reason = compute_offer_status(fields)
+        status, gaps, reason = compute_offer_status(
+            fields, document_policy=document_policy
+        )
         rows.append(
             {
                 "index": row.index,
@@ -472,9 +659,29 @@ def _create_preview(
     _reject_duplicate(
         organization=organization, user=user, original_name=original_name, digest=digest
     )
-    headers, detected, sources, missing, total_rows = _derive_sheet(
-        content, original_name, limits, message_fallback
-    )
+    try:
+        entries = discover_sheets(content, original_name)
+    except UnsupportedFile as exc:
+        raise ValidationError(str(exc)) from exc
+    selected = _default_sheet(entries)
+    try:
+        headers, detected, sources, missing, total_rows, derived = _derive_sheet(
+            content, original_name, limits, message_fallback, selected
+        )
+    except HeaderNotFound as exc:
+        if (
+            extension in (".txt", ".csv")
+            and not message_fallback
+            and _message_lane_accepts(content, original_name, limits)
+        ):
+            text, truncated, total_chars = candidate_message_text(content)
+            raise MessageCandidateFile(
+                text, truncated=truncated, total_chars=total_chars
+            ) from exc
+        raise ValidationError(str(exc)) from exc
+    except UnsupportedFile as exc:
+        raise ValidationError(str(exc)) from exc
+    selected = derived or selected
     # Only the message fallback produces the synthetic message column;
     # header matching only ever yields canonical names.
     message_lines = detected == {MESSAGE_COLUMN: 0}
@@ -506,6 +713,7 @@ def _create_preview(
     key = secrets.token_urlsafe(24)
     adapter = _adapter()
     adapter.save_bytes(f"previews/{key}.bin", content)
+    sheets = _sheet_block(entries, selected)
     meta = {
         "organization_id": organization.id,
         "user_id": user.id,
@@ -517,6 +725,16 @@ def _create_preview(
         "detected": detected,
         "sources": sources,
         "message_lines": message_lines,
+        "sheet": selected,
+        "sheets": entries,
+        "sheets_omitted": sheets["omitted"],
+        "revision": 1,
+        "rules": [],
+        "document_policy": "stock",
+        "history": [],
+        "next_rule_id": 1,
+        "excluded_lines": [],
+        "applied_constants": {},
     }
     adapter.save_bytes(f"previews/{key}.json", json.dumps(meta).encode("utf-8"))
     _gc_previews()
@@ -528,6 +746,9 @@ def _create_preview(
         proposed_ignored,
         organization.default_currency,
         message_fallback=message_fallback,
+        sheet_name=selected,
+        draft_rules=[],
+        document_policy="stock",
     )
     record_audit(
         organization.id,
@@ -535,8 +756,21 @@ def _create_preview(
         "preview_created",
         "preview",
         key,
-        {"filename": original_name[:255], "sha256": digest},
+        {
+            "filename": original_name[:255],
+            "sha256": digest,
+            "sheet": selected,
+            "sheets_omitted": sheets["omitted"],
+        },
     )
+    if message_lines:
+        from pipeline.draft import derive_records
+
+        _records, _unresolved, _sections = derive_records(
+            _content_lines(content), []
+        )
+    else:
+        _records, _unresolved, _sections = [], [], []
     return {
         "key": key,
         "filename": original_name[:255],
@@ -554,14 +788,96 @@ def _create_preview(
         "proposed_constants": proposed_constants,
         "proposed_ignored": proposed_ignored,
         "samples": samples,
+        "sheets": sheets,
+        "draft": _draft_block(
+            meta,
+            lines=[],
+            records=_records,
+            unresolved=_unresolved,
+            sections=_sections,
+        ),
     }
 
 
+def _ensure_sheets(key: str, meta: dict, content: bytes) -> dict:
+    """Backfill discovery for previews created before sheet tracking."""
+    if "sheets" in meta:
+        return meta
+    try:
+        entries = discover_sheets(content, meta["filename"])
+    except UnsupportedFile as exc:
+        raise ValidationError(str(exc)) from exc
+    selected = meta.get("sheet") or _default_sheet(entries)
+    block = _sheet_block(entries, selected)
+    meta.update(
+        {
+            "sheet": selected,
+            "sheets": entries,
+            "sheets_omitted": block["omitted"],
+        }
+    )
+    _adapter().save_bytes(f"previews/{key}.json", json.dumps(meta).encode("utf-8"))
+    return meta
+
+
+def _switch_preview_sheet(key: str, meta: dict, content: bytes, wanted: str):
+    """Re-derive a preview for another discovered sheet and persist it.
+
+    Returns (meta, missing, total_rows, block). Old-sheet column
+    positions are meaningless under the new headers: render resets to
+    the fresh detection, confirm validates the submitted mapping
+    against the new headers instead.
+    """
+    meta = _ensure_sheets(key, meta, content)
+    selected = _validate_sheet(meta["sheets"], wanted, filename=meta["filename"])
+    try:
+        headers, detected, sources, missing, total, derived = _derive_sheet(
+            content,
+            meta["filename"],
+            _limits(),
+            bool(meta.get("message_lines")),
+            selected,
+        )
+    except UnsupportedFile as exc:
+        raise ValidationError(str(exc)) from exc
+    selected = derived or selected
+    block = _sheet_block(meta["sheets"], selected)
+    meta.update(
+        {
+            "headers": headers,
+            "detected": detected,
+            "sources": sources,
+            "sheet": selected,
+            "sheets_omitted": block["omitted"],
+        }
+    )
+    _adapter().save_bytes(f"previews/{key}.json", json.dumps(meta).encode("utf-8"))
+    return meta, missing, total, block
+
+
 def render_preview(*, key: str, user, mapping: dict,
-                   constants=None, ignored=None) -> dict:
-    """Re-render sample rows for an adjusted mapping."""
-    meta = _load_preview(key)
+                   constants=None, ignored=None, sheet=None) -> dict:
+    """Re-render sample rows for an adjusted mapping (or another sheet)."""
+    meta = _ensure_draft(_load_preview(key))
     organization = authorize_organization_access(user, meta["organization_id"])
+    try:
+        content = _adapter().read_bytes(f"previews/{key}.bin")
+    except FileNotFoundError:
+        raise ValidationError("Unknown or expired preview.") from None
+    meta = _ensure_sheets(key, meta, content)
+    switched = None
+    if sheet is not None and sheet != meta.get("sheet"):
+        meta, missing, total, _block = _switch_preview_sheet(
+            key, meta, content, sheet
+        )
+        # Old-sheet positions cannot apply to the new headers.
+        mapping, constants, ignored = {}, {}, []
+        switched = {
+            "headers": _header_entries(meta["headers"]),
+            "detected": meta["detected"],
+            "missing": missing,
+            "total_rows": total,
+        }
     _submitted, effective, clean_constants, clean_ignored = _clean_positions(
         mapping,
         meta["headers"],
@@ -570,11 +886,39 @@ def render_preview(*, key: str, user, mapping: dict,
         constants=constants,
         ignored=ignored,
     )
-    try:
-        content = _adapter().read_bytes(f"previews/{key}.bin")
-    except FileNotFoundError:
-        raise ValidationError("Unknown or expired preview.") from None
-    return {
+    message_lane = meta.get("message_lines") is True
+    memory_info = None
+    supplier = (clean_constants.get("supplier") or "").strip()
+    if supplier:
+        memory = lookup_memory(
+            organization=organization,
+            headers=meta["headers"],
+            supplier=supplier,
+        )
+        if memory is not None:
+            memory_info = {
+                "supplier_hint": memory.supplier_hint,
+                "use_count": memory.use_count,
+                "last_used_at": memory.last_used_at.isoformat(),
+                "constants": {
+                    str(k): v
+                    for k, v in (memory.constants or {}).items()
+                    if k in HEADER_TOKENS
+                },
+                "reason": (
+                    f"Saved profile for {memory.supplier_hint} "
+                    f"(used {memory.use_count} times)."
+                ),
+            }
+    if message_lane:
+        from pipeline.draft import derive_records
+
+        _records, _unresolved, _sections = derive_records(
+            _content_lines(content), meta.get("rules") or []
+        )
+    else:
+        _records, _unresolved, _sections = [], [], []
+    payload = {
         "mapping": effective,
         "constants": clean_constants,
         "ignored": clean_ignored,
@@ -585,12 +929,69 @@ def render_preview(*, key: str, user, mapping: dict,
             clean_constants,
             clean_ignored,
             organization.default_currency,
-            message_fallback=meta.get("message_lines") is True,
+            message_fallback=message_lane,
+            sheet_name=meta.get("sheet"),
+            exclude_lines=meta.get("excluded_lines") or [],
+            draft_rules=meta.get("rules") or [],
+            document_policy=meta.get("document_policy", "stock"),
+        ),
+        "sheets": _sheet_block(meta.get("sheets") or [], meta.get("sheet")),
+        "memory": memory_info,
+        "draft": _draft_block(
+            meta,
+            lines=[],
+            records=_records,
+            unresolved=_unresolved,
+            sections=_sections,
+        ),
+    }
+    if switched is not None:
+        payload["switched"] = switched
+    return payload
+
+
+def get_preview_draft(*, key: str, user) -> dict:
+    """Return the persisted draft so a refresh resumes where it left off."""
+    meta = _ensure_draft(_load_preview(key))
+    organization = authorize_organization_access(user, meta["organization_id"])
+    organization  # membership verified; the draft carries no secrets.
+    try:
+        content = _adapter().read_bytes(f"previews/{key}.bin")
+    except FileNotFoundError:
+        raise ValidationError("Unknown or expired preview.") from None
+    if bool(meta.get("message_lines")):
+        from pipeline.draft import derive_records
+
+        records, unresolved, sections = derive_records(
+            _content_lines(content), meta.get("rules") or []
+        )
+    else:
+        records, unresolved, sections = [], [], []
+    return {
+        "key": key,
+        "filename": meta["filename"][:255],
+        "extension": meta["extension"],
+        "size_bytes": len(content),
+        "sha256": meta["sha256"],
+        "headers": _header_entries(meta["headers"]),
+        "detected": meta["detected"],
+        "sources": meta["sources"],
+        "message_lines": bool(meta.get("message_lines")),
+        "sheet": meta.get("sheet"),
+        "sheets": _sheet_block(meta.get("sheets") or [], meta.get("sheet")),
+        "applied_constants": meta.get("applied_constants", {}),
+        "draft": _draft_block(
+            meta,
+            lines=[],
+            records=records,
+            unresolved=unresolved,
+            sections=sections,
         ),
     }
 
 
-def _supplier_hint(content: bytes, filename: str, mapping: dict, constants: dict) -> str:
+def _supplier_hint(content: bytes, filename: str, mapping: dict, constants: dict,
+                   sheet_name=None) -> str:
     if "supplier" in (constants or {}):
         return str(constants["supplier"]).strip()[:255]
     limits = _limits()
@@ -602,6 +1003,7 @@ def _supplier_hint(content: bytes, filename: str, mapping: dict, constants: dict
             max_cols=limits["max_cols"],
             header_scan_rows=limits["header_scan_rows"],
             column_overrides=mapping or None,
+            sheet_name=sheet_name,
         )
     except UnsupportedFile:
         return ""
@@ -612,12 +1014,32 @@ def _supplier_hint(content: bytes, filename: str, mapping: dict, constants: dict
 
 
 def confirm_preview(*, key: str, user, mapping: dict,
-                    constants=None, ignored=None):
-    """Validate a full mapping and start the import run."""
+                    constants=None, ignored=None, sheet=None, revision=None):
+    """Validate a full mapping and start the import run.
+
+    Snapshots the confirmed draft revision — rules, exclusions, policy,
+    and derived record lines — into the run, so the worker imports
+    exactly what the user reviewed instead of re-extracting.
+    """
+    from pipeline.draft import derive_records
     from pipeline.uploads import store_upload_run
 
-    meta = _load_preview(key)
+    meta = _ensure_draft(_load_preview(key))
     organization = authorize_organization_access(user, meta["organization_id"])
+    require_organization_role(user, meta["organization_id"])
+    if revision is not None and revision != meta.get("revision", 1):
+        raise DraftConflictError(meta.get("revision", 1), revision)
+    try:
+        content = _adapter().read_bytes(f"previews/{key}.bin")
+    except FileNotFoundError:
+        raise ValidationError("Unknown or expired preview.") from None
+    meta = _ensure_sheets(key, meta, content)
+    if sheet is not None and sheet != meta.get("sheet"):
+        # The submitted mapping is validated against the NEW headers;
+        # a stale old-sheet mapping fails honestly in _clean_positions.
+        meta, _missing, _total, _block = _switch_preview_sheet(
+            key, meta, content, sheet
+        )
     message_lines = meta.get("message_lines") is True
     if message_lines and (mapping or ignored):
         raise ValidationError(
@@ -642,15 +1064,34 @@ def confirm_preview(*, key: str, user, mapping: dict,
         original_name=meta["filename"],
         digest=meta["sha256"],
     )
+    draft_globals = {
+        rule["field"]: rule["value"]
+        for rule in meta.get("rules") or []
+        if rule["kind"] == "global"
+    }
+    merged_constants = {**draft_globals, **clean_constants}
     run_mapping = {
         "headers": meta["headers"],
         "detected": meta["detected"],
         "confirmed": submitted,
-        "constants": clean_constants,
+        "constants": merged_constants,
         "ignored": clean_ignored,
+        "sheet": meta.get("sheet"),
+        "sheets_omitted": meta.get("sheets_omitted", []),
+        "draft_revision": meta.get("revision", 1),
+        "draft_rules": meta.get("rules") or [],
+        "excluded_lines": meta.get("excluded_lines") or [],
+        "document_policy": meta.get("document_policy", "stock"),
     }
     if message_lines:
         run_mapping["free_text"] = True
+        records, _unresolved, _sections = derive_records(
+            _content_lines(content), meta.get("rules") or []
+        )
+        run_mapping["record_lines"] = [
+            {"id": record["id"], "lines": record["lines"]}
+            for record in records
+        ]
     run = store_upload_run(
         organization=organization,
         user=user,
@@ -662,10 +1103,11 @@ def confirm_preview(*, key: str, user, mapping: dict,
         organization=organization,
         headers=meta["headers"],
         mapping=effective,
-        constants=clean_constants,
+        constants=merged_constants,
         ignored=clean_ignored,
         supplier_hint=_supplier_hint(
-            content, meta["filename"], effective, clean_constants
+            content, meta["filename"], effective, merged_constants,
+            sheet_name=meta.get("sheet"),
         ),
     )
     adapter = _adapter()
@@ -689,6 +1131,19 @@ class AssistRefused(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class DraftConflictError(Exception):
+    """The writer's draft revision is stale; reload before retrying."""
+
+    def __init__(self, revision_actual: int, revision_expected):
+        super().__init__(
+            f"Draft is at revision {revision_actual}; request targeted "
+            f"{revision_expected}. Reload the preview and review the "
+            "latest rules before retrying."
+        )
+        self.revision_actual = revision_actual
+        self.revision_expected = revision_expected
 
 
 ASSIST_PREVIEW_LINES = 40
@@ -741,7 +1196,13 @@ def _assist_preview_context(*, meta, content, organization) -> dict:
     chars = 0
     truncated = False
     all_lines = _content_lines(content)
-    for number, text in enumerate(all_lines, start=1):
+    excluded = set(meta.get("excluded_lines") or [])
+    live = [
+        (number, text)
+        for number, text in enumerate(all_lines, start=1)
+        if number not in excluded
+    ]
+    for number, text in live:
         stripped = text.strip()
         if not stripped:
             continue
@@ -750,14 +1211,48 @@ def _assist_preview_context(*, meta, content, organization) -> dict:
             break
         numbered.append({"line": number, "text": stripped[:200]})
         chars += len(stripped)
+    from pipeline.draft import derive_records as _derive_assist_records
+
+    rules = meta.get("rules") or []
+    records, unresolved, sections = _derive_assist_records(all_lines, rules)
+    shown = {entry["line"] for entry in numbered}
     context.update(
         {
             "lines": numbered,
             "line_count": len(all_lines),
-            "total_rows": sum(1 for text in all_lines if text.strip()),
+            "total_rows": sum(1 for _number, text in live if text.strip()),
             "truncated": truncated,
+            "document_policy": meta.get("document_policy", "stock"),
+            "rules": rules[-50:],
+            "rule_count": len(rules),
+            "records": [
+                {
+                    "id": record["id"],
+                    "lines": record["lines"],
+                    "class": record["class"],
+                    "section": record["section"],
+                }
+                for record in records[:60]
+            ],
+            "record_count": len(records),
+            "sections": sections,
+            "unresolved": unresolved[:20],
+            "unresolved_count": len(unresolved),
         }
     )
+    if truncated:
+        # The line quote cut off: section headers beyond the cutoff
+        # still travel with their record counts, so later segments
+        # keep their inherited context instead of losing it silently.
+        context["sections_beyond_cutoff"] = [
+            {
+                "header_line": section["header_line"],
+                "text": all_lines[section["header_line"] - 1].strip()[:120],
+                "records": len(section["records"]),
+            }
+            for section in sections
+            if section["header_line"] not in shown
+        ]
     return context
 
 
@@ -809,6 +1304,41 @@ def _dropped_previews(content, drops) -> list:
         {"line": number, "text": lines[number - 1].strip()[:120]}
         for number in drops
     ]
+
+
+def _clean_assist_operations(raw, *, message_lines, content, rules, policy) -> list:
+    """Validate model-proposed typed operations against the live draft.
+
+    Every op must validate exactly as a user-submitted op would; an
+    unsupported or contradictory proposal fails the whole turn loudly
+    instead of reaching the chat as an appliable card.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValidationError("operations must be a list.")
+    if not raw:
+        return []
+    if not message_lines and any(
+        (op.get("op") if isinstance(op, dict) else None) != "global"
+        for op in raw
+    ):
+        raise ValidationError(
+            "Only set values apply to table previews; line operations "
+            "need pasted message lines."
+        )
+    from pipeline.draft import DraftError, validate_operations
+
+    try:
+        _pending, _policy, _per_op = validate_operations(
+            list(raw),
+            lines=_content_lines(content),
+            rules=rules,
+            policy=policy,
+        )
+    except DraftError as exc:
+        raise ValidationError(str(exc)) from exc
+    return [dict(op) for op in raw]
 
 
 def assist_preview(*, key: str, user, conversation) -> dict:
@@ -885,6 +1415,13 @@ def assist_preview(*, key: str, user, conversation) -> dict:
             message_lines=bool(meta.get("message_lines")),
             content=content,
         )
+        operations = _clean_assist_operations(
+            result.get("operations", []),
+            message_lines=bool(meta.get("message_lines")),
+            content=content,
+            rules=meta.get("rules") or [],
+            policy=meta.get("document_policy", "stock"),
+        )
     except ValidationError as error:
         from common.meta import ProposalUnusable
 
@@ -892,65 +1429,189 @@ def assist_preview(*, key: str, user, conversation) -> dict:
         unusable.tokens = spent["total"]
         raise unusable from error
     usage = result.get("usage", {})
+    if context["message_lines"]:
+        context_coverage = {
+            "scope": "message_lines",
+            "lines_shown": len(context["lines"]),
+            "total_rows": context["total_rows"],
+            "truncated": context["truncated"],
+        }
+    else:
+        context_coverage = {
+            "scope": "headers",
+            "lines_shown": 0,
+            "total_rows": 0,
+            "truncated": False,
+        }
     return {
         "message": result.get("message", ""),
         "proposal": {
             "set_constants": constants,
             "drop_lines": drops,
             "dropped_previews": _dropped_previews(content, drops),
+            "operations": operations,
         },
+        "context_coverage": context_coverage,
         "tokens": usage.get("total_tokens", 0),
     }
 
 
-def apply_preview_assist(*, key: str, user, set_constants, drop_lines) -> dict:
-    """Apply user-confirmed assist values: re-quote bytes, re-derive preview.
+def _ensure_draft(meta: dict) -> dict:
+    """Backfill draft keys for previews created before versioning."""
+    meta.setdefault("revision", 1)
+    meta.setdefault("rules", [])
+    meta.setdefault("document_policy", "stock")
+    meta.setdefault("history", [])
+    meta.setdefault("next_rule_id", 1)
+    meta.setdefault("excluded_lines", [])
+    meta.setdefault("applied_constants", {})
+    return meta
 
-    Dropped lines are removed from the quoted bytes and the preview is
-    re-derived exactly as a fresh upload of the remaining bytes, so the
-    lane (message or table) always matches the content. Set values merge
-    into the preview's applied constants.
+
+def _summarize_operations(ops: list) -> str:
+    kinds: dict = {}
+    for op in ops:
+        name = op.get("op") if isinstance(op, dict) else "?"
+        kinds[name] = kinds.get(name, 0) + 1
+    return ", ".join(f"{count}x {name}" for name, count in sorted(kinds.items()))
+
+
+def _draft_block(meta: dict, *, lines, records, unresolved, sections) -> dict:
+    _lines = lines  # derivation inputs stay explicit at call sites.
+    return {
+        "revision": meta.get("revision", 1),
+        "document_policy": meta.get("document_policy", "stock"),
+        "rules": meta.get("rules", []),
+        "excluded_lines": meta.get("excluded_lines", []),
+        "records": records,
+        "unresolved": unresolved,
+        "sections": sections,
+        "history": meta.get("history", []),
+    }
+
+
+def apply_preview_assist(
+    *, key: str, user, set_constants, drop_lines, operations=None, revision=None
+) -> dict:
+    """Apply user-confirmed operations to the preview draft.
+
+    Legacy set/drop values fold into typed operations so one engine
+    validates everything. The original bytes are never rewritten:
+    exclusions are recorded rules and headers/detection stay as first
+    read. Every change bumps the revision; a stale writer gets a
+    DraftConflictError instead of silently overwriting.
     """
+    from pipeline.draft import (
+        DraftConflict,
+        DraftError,
+        apply_operations,
+        derive_records,
+    )
     from pipeline.jobs import record_audit
 
-    meta = _load_preview(key)
+    meta = _ensure_draft(_load_preview(key))
     organization = authorize_organization_access(user, meta["organization_id"])
-    constants = _clean_assist_constants(set_constants)
-    content = _adapter().read_bytes(f"previews/{key}.bin")
-    drops = _clean_assist_drops(
-        drop_lines, message_lines=bool(meta.get("message_lines")), content=content
-    )
-    if not constants and not drops:
-        raise ValidationError("Nothing to apply.")
-    previews = _dropped_previews(content, drops)
-    if drops:
-        dropped = set(drops)
-        kept = [
-            text
-            for number, text in enumerate(_content_lines(content), start=1)
-            if number not in dropped
-        ]
-        content = "\n".join(kept).encode("utf-8")
-        _adapter().save_bytes(f"previews/{key}.bin", content)
+    require_organization_role(user, meta["organization_id"])
     try:
-        headers, detected, sources, missing, total_rows = _derive_sheet(
-            content, meta["filename"], _limits(), bool(meta.get("message_lines"))
+        content = _adapter().read_bytes(f"previews/{key}.bin")
+    except FileNotFoundError:
+        raise ValidationError("Unknown or expired preview.") from None
+    message_lines = bool(meta.get("message_lines"))
+    constants = _clean_assist_constants(set_constants)
+    drops = _clean_assist_drops(
+        drop_lines, message_lines=message_lines, content=content
+    )
+    ops = [dict(op) for op in (operations or [])]
+    for name, value in constants.items():
+        ops.append({"op": "global", "field": name, "value": value})
+    if drops:
+        ops.append({"op": "exclude_lines", "lines": drops})
+    if not ops:
+        raise ValidationError("Nothing to apply.")
+    if not message_lines and any(
+        (op.get("op") if isinstance(op, dict) else None) != "global" for op in ops
+    ):
+        raise ValidationError("Only set values apply to table previews.")
+    lines = _content_lines(content)
+    try:
+        rules, policy = apply_operations(
+            ops,
+            lines=lines,
+            rules=meta.get("rules") or [],
+            revision_actual=meta.get("revision", 1),
+            revision_expected=revision,
+            policy=meta.get("document_policy", "stock"),
         )
-    except UnsupportedFile as exc:
+    except DraftConflict as exc:
+        raise DraftConflictError(meta.get("revision", 1), revision) from exc
+    except DraftError as exc:
         raise ValidationError(str(exc)) from exc
-    message_lines = detected == {MESSAGE_COLUMN: 0}
-    applied = {**meta.get("applied_constants", {}), **constants}
-    meta.update(
+    next_id = meta.get("next_rule_id", 1)
+    for rule in rules:
+        if "id" not in rule:
+            rule["id"] = f"r{next_id}"
+            next_id += 1
+    if message_lines:
+        records, unresolved, sections = derive_records(lines, rules)
+        if not records:
+            raise ValidationError("That would leave no readable lines.")
+    else:
+        records, unresolved, sections = [], [], []
+    applied = dict(meta.get("applied_constants", {}))
+    for rule in rules:
+        if rule["kind"] == "global":
+            applied[rule["field"]] = rule["value"]
+    excluded = sorted(
         {
-            "sha256": hashlib.sha256(content).hexdigest(),
-            "headers": headers,
-            "detected": detected,
-            "sources": sources,
-            "message_lines": message_lines,
-            "applied_constants": applied,
+            number
+            for rule in rules
+            if rule["kind"] == "exclude_lines"
+            for number in rule["lines"]
         }
     )
-    _adapter().save_bytes(f"previews/{key}.json", json.dumps(meta).encode("utf-8"))
+    new_revision = meta.get("revision", 1) + 1
+    history = list(meta.get("history", []))
+    history.append(
+        {
+            "revision": new_revision,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "by": user.id,
+            "summary": _summarize_operations(ops),
+            "operations": ops,
+        }
+    )
+    meta.update(
+        {
+            "revision": new_revision,
+            "rules": rules,
+            "document_policy": policy,
+            "next_rule_id": next_id,
+            "history": history[-50:],
+            "applied_constants": applied,
+            "excluded_lines": excluded,
+        }
+    )
+    _adapter().save_bytes(
+        f"previews/{key}.json", json.dumps(meta).encode("utf-8")
+    )
+    headers = meta["headers"]
+    detected = meta["detected"]
+    sources = meta["sources"]
+    missing = [
+        name
+        for name in REQUIRED_COLUMNS
+        if detected.get(name) is None and applied.get(name) in (None, "")
+    ]
+    if message_lines:
+        total_rows = len(records)
+    else:
+        _h, _d, _s, _m, total_rows, _derived = _derive_sheet(
+            content,
+            meta["filename"],
+            _limits(),
+            False,
+            meta.get("sheet"),
+        )
     proposed = {} if message_lines else dict(detected)
     samples = _render_samples(
         content,
@@ -960,6 +1621,10 @@ def apply_preview_assist(*, key: str, user, set_constants, drop_lines) -> dict:
         [],
         organization.default_currency,
         message_fallback=message_lines,
+        sheet_name=meta.get("sheet"),
+        exclude_lines=excluded,
+        draft_rules=rules,
+        document_policy=policy,
     )
     record_audit(
         organization.id,
@@ -967,13 +1632,20 @@ def apply_preview_assist(*, key: str, user, set_constants, drop_lines) -> dict:
         "preview_assisted",
         "preview",
         key,
-        {"set_constants": sorted(constants), "dropped_lines": drops},
+        {
+            "set_constants": sorted(constants),
+            "dropped_lines": drops,
+            "operations": len(ops),
+            "revision": new_revision,
+        },
     )
     return {
         "applied": {
             "set_constants": constants,
             "drop_lines": drops,
-            "dropped_previews": previews,
+            "dropped_previews": _dropped_previews(content, drops),
+            "operations": ops,
+            "revision": new_revision,
         },
         "preview": {
             "key": key,
@@ -992,5 +1664,15 @@ def apply_preview_assist(*, key: str, user, set_constants, drop_lines) -> dict:
             "proposed_constants": dict(applied),
             "proposed_ignored": [],
             "samples": samples,
+            "sheets": _sheet_block(
+                meta.get("sheets") or [], meta.get("sheet")
+            ),
+            "draft": _draft_block(
+                meta,
+                lines=lines,
+                records=records,
+                unresolved=unresolved,
+                sections=sections,
+            ),
         },
     }

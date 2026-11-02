@@ -7,6 +7,7 @@ from django.template.response import TemplateResponse
 from pipeline.models import (
     AssistantFlag,
     Category,
+    ColumnMappingMemory,
     CustomerQuote,
     ImportRun,
     OperatorSpend,
@@ -191,6 +192,20 @@ class ProductAliasAdmin(admin.ModelAdmin):
     )
     list_filter = ("organization",)
     search_fields = ("alias_norm", "canonical_model", "supplier_norm")
+    readonly_fields = ("use_count", "last_used_at", "created_at")
+
+
+@admin.register(ColumnMappingMemory)
+class ColumnMappingMemoryAdmin(admin.ModelAdmin):
+    list_display = (
+        "organization",
+        "supplier_hint",
+        "signature",
+        "use_count",
+        "last_used_at",
+    )
+    list_filter = ("organization",)
+    search_fields = ("supplier_hint", "signature")
     readonly_fields = ("use_count", "last_used_at", "created_at")
 
 

@@ -234,6 +234,59 @@ function AnswerForm({ review, onAnswered }: { review: Review; onAnswered: () => 
   );
 }
 
+function SheetSummary({ mapping }: { mapping: Record<string, unknown> }) {
+  const sheet = typeof mapping?.sheet === "string" ? mapping.sheet : "";
+  const omitted = Array.isArray(mapping?.sheets_omitted)
+    ? (mapping.sheets_omitted as unknown[]).filter(
+        (name): name is string => typeof name === "string",
+      )
+    : [];
+  if (!sheet && omitted.length === 0) return null;
+  return (
+    <p className="mt-1 text-sm text-muted-foreground">
+      {sheet ? <>Sheet {sheet}</> : null}
+      {sheet && omitted.length > 0 ? " · " : null}
+      {omitted.length > 0 ? <>not imported: {omitted.join(", ")}</> : null}
+    </p>
+  );
+}
+
+function ContextCoverageNotice({
+  mapping,
+}: {
+  mapping: Record<string, unknown>;
+}) {
+  const coverage = mapping?.context_coverage as
+    | {
+        segments?: unknown;
+        partial?: unknown;
+        dropped_lines?: unknown;
+      }
+    | null
+    | undefined;
+  if (!coverage || typeof coverage !== "object") return null;
+  const segments = typeof coverage.segments === "number" ? coverage.segments : 0;
+  const dropped =
+    typeof coverage.dropped_lines === "number" ? coverage.dropped_lines : 0;
+  if (coverage.partial === true) {
+    return (
+      <p className="mt-1 text-sm font-medium text-amber-700 dark:text-amber-400">
+        Partial document context: {dropped} line{dropped === 1 ? "" : "s"}{" "}
+        omitted from model context across {segments} segment
+        {segments === 1 ? "" : "s"}. All rows were still read as data.
+      </p>
+    );
+  }
+  if (segments > 1) {
+    return (
+      <p className="mt-1 text-sm text-muted-foreground">
+        Full context coverage across {segments} segments.
+      </p>
+    );
+  }
+  return null;
+}
+
 function RemapDialog({
   run,
   open,
@@ -552,6 +605,8 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
           {run.simulated ? " (simulated)" : ""} · {run.counts.offers} offers,{" "}
           {run.counts.open_reviews} open questions.
         </p>
+        <SheetSummary mapping={run.mapping} />
+        <ContextCoverageNotice mapping={run.mapping} />
         {run.error ? <div className="mt-3"><ErrorNotice message={run.error} /></div> : null}
         {error ? <div className="mt-3"><ErrorNotice message={error} /></div> : null}
         {ACTIVE.has(run.status) ? (

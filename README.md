@@ -6,10 +6,10 @@ key; paid Muse features activate per company with credits.
 Supplier information arrives in messy spreadsheets and documents. OfferFlow AI
 turns them into validated customer quotes through a checkable pipeline: upload,
 preview the mapping, interpret, validate, review the ambiguous rows with a
-person, approve, and export. Nothing is ever guessed silently —
-unreadable rows pause for a decision or are excluded with a stated
-reason, and AI assistance only proposes changes that wait for you to
-confirm or adjust.
+person, approve, and export. Unreadable rows pause for a decision
+or are excluded with a stated reason, every imported value keeps a
+link back to its source cell or line, and AI assistance only proposes
+changes that wait for you to confirm or adjust.
 
 Built by **Gian Paolo Cipicchia** for **IN.TRA.M s.r.o.** for the **Meta
 Global AI Developer Hackathon**, organized by Cerebral Valley. Independent
@@ -24,13 +24,18 @@ for it.
   anything is imported. Columns can be ignored or replaced with a fixed
   value, and remembered mappings are proposed for repeat suppliers.
 - **Paste-text import** — paste a supplier message (WhatsApp/Telegram
-  text) into the text box instead of a file. A deterministic message
-  lane parses supplier headers, grade sections, and `Name - price`
-  rows into the same mapping preview, inheriting each row's grade and
-  currency before any model is involved. With the model lane up, the
-  preview assistant opens automatically and proposes mapping/value
-  fixes as an explicit draft you apply or discard; your own edits
-  always win.
+  text) into the text box instead of a file. Each line becomes one
+  candidate record; the app does not pre-guess suppliers, grades, or
+  prices. You explain what the lines mean in the chat, the assistant
+  proposes typed interpretation changes (which number is the price,
+  which lines are headers, which grade a section carries), and each
+  change lands in the preview only after you apply it. Applied rules
+  persist with the draft, survive refreshes, and shape the final
+  import exactly as previewed; your own edits always win.
+- **Price-only lists** — when a message carries prices but no stock,
+  confirm the price-only policy: quantities stay unknown and are
+  omitted from output instead of being invented. Stock lists keep
+  requiring a real quantity per row.
 - **Local interpretation** — capacities (`1TB` → gigabytes), European
   decimals, 3-letter currency codes, lock states, and grades are parsed
   deterministically. Files that read cleanly import in seconds with no
@@ -76,8 +81,9 @@ for it.
   Public privacy and terms pages disclose processing and rights.
 - **Profile and accessibility** — each user edits name, email, theme
   (light/dark/system, light by default), typeface, text size,
-  high-contrast, and reduced motion; preferences travel with the account
-  and meet EN 301 549/WCAG AA aims.
+  high-contrast, and reduced motion; preferences travel with the account.
+  The interface is designed toward EN 301 549/WCAG AA, which is a
+  design goal, not a certified conformance claim.
 - **Admin activity dashboard** — staff see per-user sign-ins and token
   spend ranked top-down (7/30 days or all time), plus live token and
   sign-in charts on the admin home page.
@@ -115,16 +121,16 @@ cannot read.
 | Model reads rows local parsing cannot (gap rows only) | No — gaps always ask the reviewer | Yes, in bounded chunks with live progress |
 | Model matching + categorization lanes | Memory/normalized lanes only; the rest asks for review | Yes, bounded single-shot calls |
 | Help assistant chat bubble | Hidden (no model lane) | Visible; every turn spends credits |
-| Paste-text import | Yes, fully deterministic | Same, plus preview assistant |
-| Preview assistant (sees only the pending paste preview) | Chat hidden; mapping is manual | Proposes drafts, applies only on your click |
+| Paste-text import | Yes: candidates plus your manual rules | Same, plus typed proposals from the preview assistant |
+| Preview assistant (sees only the pending paste preview) | Chat hidden; mapping is manual | Proposes typed changes as cards; applies only on your click |
 | Monthly credit allowances, spend log, grand total | Visible, zero spend | Enforced per company |
 | Admin-managed key/model, budget + pause controls | Key section empty | Full control |
 | Assistant abuse flags + bans | No traffic to flag | Guard, flags, ban, deactivation |
 | Any network traffic to a model provider | None, by construction | Only for gaps, matching, categories, preview assistance, chat — only with budget |
 
 Local-first routing keeps paid use minimal: clean files import free even
-with a key configured, and a 357-row file with a handful of gaps costs a
-few thousand tokens instead of a full-file pass.
+with a key configured, and a file with a handful of gaps spends tokens
+only on those gap rows instead of a full-file pass.
 
 ## Quickstart (simulated, no key needed)
 
@@ -199,15 +205,29 @@ accepted still reconcile honestly.
 
 ## Verification
 
-- Backend: `docker compose exec backend python manage.py test` — 652
-  tests, 641 green. The 11 failures (RLS/test-crew setup) are
-  pre-existing, inherited from commit 15bc67f and unrelated to these
-  corrections. Focused flow/spending/assist/preview sets (127 tests)
-  all pass, all inference mocked.
-- Frontend: production `npm run build` renders all 27 routes.
+- Backend: `docker compose exec backend python manage.py test` — 763
+  tests: 724 pass, 1 skipped, 38 fail. All 38 reproduce identically
+  on clean HEAD `2181317` (verified by stashing all work and
+  rerunning: 44 issues there; this work fixes 6 and adds 110 tests,
+  all passing). The 38 are ambient-provider assertions, SQLite-only
+  RLS checks, and category/currency/quote-API errors that still need
+  a separate triage pass. Focused flow, spending, assist, preview,
+  draft, and generalization sets (300+ tests) all pass with mocked
+  inference.
+- Tenant isolation: 22 PostgreSQL tests pass against a disposable
+  server under the actual restricted runtime role (`iso_app`, no
+  superuser, no bypass). See the runbook for the disposable-server
+  procedure. This does not prove the live stack has switched roles —
+  that switch needs owner credentials and is still pending.
+- Frontend: `docker compose exec frontend npx tsc --noEmit` is clean
+  and production `npm run build` renders all 25 routes.
 - Simulated mode emits zero model traffic by construction: no key is
   configured, the worker has no external route, and every synthetic
   artifact is labeled.
+- Live Meta evaluation: **NOT RUN**. The mocked suites above verify
+  contracts and failure paths; they say nothing about model accuracy.
+  See `backend/LIVE_EVAL_PLAN.md` for the bounded plan awaiting owner
+  authorization.
 
 ## Development and data
 

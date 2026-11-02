@@ -284,3 +284,88 @@ class StatusTests(SimpleTestCase):
             )
             self.assertEqual(status, "ok", f"lock_raw={raw!r}")
             self.assertEqual(gaps, [], f"lock_raw={raw!r}")
+
+
+class TerminalSpanTests(SimpleTestCase):
+    def test_span_binds_token(self):
+        from pipeline.normalize import terminal_amount
+
+        text = "> Phone 18 Pro 256GB - 417"
+        found = terminal_amount(text)
+        self.assertIsNotNone(found)
+        token, start, end = found
+        self.assertEqual(token, "417")
+        self.assertEqual(text[start:end], "417")
+
+    def test_capacity_and_glued_numbers_never_terminal(self):
+        from pipeline.normalize import terminal_amount
+
+        self.assertIsNone(terminal_amount("iPhone 8 64GB"))
+        self.assertIsNone(terminal_amount("SKU123"))
+        self.assertIsNone(terminal_amount("P1+ - Like New"))
+
+    def test_trailing_currency_word_is_kept(self):
+        from pipeline.normalize import terminal_amount
+
+        found = terminal_amount("Phone Z - 417 USD")
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], "417")
+
+    def test_markings_detected(self):
+        from pipeline.normalize import has_quantity_marking
+
+        for marked in ("Phone Z x5 450", "qty: 3", "10 pcs", "Stock 7"):
+            self.assertTrue(has_quantity_marking(marked), marked)
+        for plain in ("Phone Z 450", "P1+ - Like New", ""):
+            self.assertFalse(has_quantity_marking(plain), plain)
+
+
+class RoleGroundingTests(SimpleTestCase):
+    def test_capacity_number_cannot_ground_quantity(self):
+        local = {"message": "> Phone 18 Pro 256GB - 417"}
+        merged = merge_interpreted_cells(local, {"quantity": "256"})
+        self.assertNotIn("quantity", merged)
+
+    def test_marked_quantity_grounds(self):
+        local = {"message": "Phone Z x5 450"}
+        merged = merge_interpreted_cells(local, {"quantity": "5"})
+        self.assertEqual(merged["quantity"], "5")
+
+    def test_optional_cells_adopted_when_source_empty(self):
+        local = {"message": "Phone Z 450", "brand": ""}
+        merged = merge_interpreted_cells(
+            local, {"brand": "Apple", "conditions": "Ready in DXB"}
+        )
+        self.assertEqual(merged["brand"], "Apple")
+        self.assertEqual(merged["conditions"], "Ready in DXB")
+
+    def test_source_optional_cells_win(self):
+        local = {"message": "Phone Z 450", "brand": "Pear"}
+        merged = merge_interpreted_cells(local, {"brand": "Apple"})
+        self.assertEqual(merged["brand"], "Pear")
+
+
+class PriceOnlyPolicyTests(SimpleTestCase):
+    def test_absent_quantity_gaps_under_stock(self):
+        fields = full_fields(quantity=None, quantity_raw="")
+        status, gaps, _reason = compute_offer_status(fields)
+        self.assertEqual(status, "needs_input")
+        self.assertIn("quantity", {gap["field"] for gap in gaps})
+
+    def test_absent_quantity_ok_under_price_only(self):
+        fields = full_fields(quantity=None, quantity_raw="")
+        status, gaps, _reason = compute_offer_status(
+            fields, document_policy="price_only"
+        )
+        self.assertEqual(status, "ok")
+        self.assertNotIn("quantity", {gap["field"] for gap in gaps})
+
+    def test_merge_respects_policy(self):
+        local = {"message": "Phone Z x3 450", "price": "450",
+                 "currency": "USD", "supplier": "Acme", "model": "Z"}
+        stock = merge_interpreted_cells(local, {"quantity": "3"})
+        self.assertEqual(stock["quantity"], "3")
+        priced = merge_interpreted_cells(
+            local, {"quantity": "3"}, document_policy="price_only"
+        )
+        self.assertNotIn("quantity", priced)

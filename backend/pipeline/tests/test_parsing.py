@@ -1,16 +1,22 @@
 """Tests for spreadsheet intake guards and header detection."""
 
 import io
+import os
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from django.test import SimpleTestCase
 from docx import Document
 from openpyxl import Workbook
 
 from pipeline.parsing import (
+    HeaderNotFound,
+    MappingRequired,
     UnsupportedFile,
+    candidate_message_text,
     check_archive_safety,
+    discover_sheets,
     parse_upload,
     parse_xlsx,
 )
@@ -48,6 +54,23 @@ def parse(content, **kwargs):
     options = {"max_rows": 2000, "max_cols": 100, "header_scan_rows": 20}
     options.update(kwargs)
     return parse_xlsx(content, **options)
+
+
+def make_multi_workbook(named_sheets):
+    """Build workbook bytes from [(title, rows, visible), ...]."""
+    workbook = Workbook()
+    first = True
+    for title, rows, visible in named_sheets:
+        sheet = workbook.active if first else workbook.create_sheet(title=title)
+        first = False
+        sheet.title = title
+        if not visible:
+            sheet.sheet_state = "hidden"
+        for row in rows:
+            sheet.append(row)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
 
 
 def parse_named(content, name, **kwargs):
@@ -327,3 +350,125 @@ class ParsingTests(SimpleTestCase):
                 constant_sources={"currency": "manual"},
             )
         self.assertIn("both a column and a set value", str(ctx.exception))
+
+
+PHONE_ROW = ["PhoneCo", "Pear", "P1", "128GB", "Black", "A", "Unlocked", 5, 299.99, "USD", ""]
+TABLET_ROW = ["TabCo", "Pear", "T1", "64GB", "White", "B", "Unlocked", 2, 199.0, "USD", ""]
+
+
+def two_sheet_workbook():
+    return make_multi_workbook(
+        [("Phones", [HEADERS, PHONE_ROW], True), ("Tablets", [HEADERS, TABLET_ROW], True)]
+    )
+
+
+FIXTURE_PROVIDER_ENV = {
+    "OFFERFLOW_PROVIDER": "fixture",
+    "OFFERFLOW_ALLOW_PAID": "false",
+    "OFFERFLOW_META_API_KEY": "",
+}
+
+
+def force_fixture_provider(testcase):
+    """Pin flow tests to the deterministic fixture provider.
+
+    Provider selection reads os.environ at call time, so an ambient paid
+    configuration would otherwise dispatch live model calls (and spend)
+    from tests whose expectations assume the fixture.
+    """
+    guard = mock.patch.dict(os.environ, FIXTURE_PROVIDER_ENV, clear=False)
+    guard.start()
+    testcase.addCleanup(guard.stop)
+
+
+class SheetDiscoveryTests(SimpleTestCase):
+    def test_discover_lists_worksheets_with_visibility(self):
+        content = make_multi_workbook(
+            [
+                ("Secret", [HEADERS, PHONE_ROW], False),
+                ("Phones", [HEADERS, PHONE_ROW], True),
+                ("Tablets", [HEADERS, TABLET_ROW], True),
+            ]
+        )
+        entries = discover_sheets(content, "sup.xlsx")
+        self.assertEqual([e["name"] for e in entries], ["Secret", "Phones", "Tablets"])
+        self.assertEqual([e["kind"] for e in entries], ["worksheet"] * 3)
+        self.assertEqual(
+            [e["visible"] for e in entries], [False, True, True]
+        )
+        self.assertTrue(all(e["rows"] >= 2 and e["cols"] >= 10 for e in entries))
+
+    def test_default_selects_first_visible_sheet(self):
+        content = make_multi_workbook(
+            [("Secret", [HEADERS, PHONE_ROW], False), ("Phones", [HEADERS, PHONE_ROW], True)]
+        )
+        sheet = parse_named(content, "sup.xlsx")
+        self.assertEqual(sheet.sheet, "Phones")
+        self.assertEqual(sheet.rows[0].data["supplier"], "PhoneCo")
+
+    def test_explicit_selection_parses_named_sheet(self):
+        sheet = parse_named(two_sheet_workbook(), "sup.xlsx", sheet_name="Tablets")
+        self.assertEqual(sheet.sheet, "Tablets")
+        self.assertEqual(sheet.rows[0].data["supplier"], "TabCo")
+        self.assertEqual(sheet.rows[0].data["model"], "T1")
+
+    def test_unknown_sheet_names_available(self):
+        with self.assertRaises(UnsupportedFile) as ctx:
+            parse_named(two_sheet_workbook(), "sup.xlsx", sheet_name="Nope")
+        self.assertIn("Available: Phones, Tablets", str(ctx.exception))
+
+    def test_hidden_sheet_refused(self):
+        content = make_multi_workbook(
+            [("Secret", [HEADERS, PHONE_ROW], False), ("Phones", [HEADERS, PHONE_ROW], True)]
+        )
+        with self.assertRaises(UnsupportedFile) as ctx:
+            parse_named(content, "sup.xlsx", sheet_name="Secret")
+        self.assertIn("is hidden", str(ctx.exception))
+
+    def test_headerless_table_raises_header_not_found(self):
+        content = make_workbook([["hello"], ["world"]])
+        with self.assertRaises(HeaderNotFound) as ctx:
+            parse_named(content, "sup.xlsx")
+        self.assertIn("No header row", str(ctx.exception))
+        self.assertIsInstance(ctx.exception, UnsupportedFile)
+
+    def test_mapping_required_carries_sheet(self):
+        content = make_multi_workbook(
+            [("Phones", [["Supplier", "Model", "Qty"], ["Acme", "P1", 2]], True)]
+        )
+        with self.assertRaises(MappingRequired) as ctx:
+            parse_named(content, "sup.xlsx")
+        self.assertEqual(ctx.exception.sheet, "Phones")
+
+    def test_discover_docx_tables_and_selection(self):
+        content = make_docx([[HEADERS, PHONE_ROW], [HEADERS, TABLET_ROW]])
+        entries = discover_sheets(content, "sup.docx")
+        self.assertEqual([e["name"] for e in entries], ["table1", "table2"])
+        self.assertEqual([e["kind"] for e in entries], ["table", "table"])
+        sheet = parse_named(content, "sup.docx", sheet_name="table2")
+        self.assertEqual(sheet.sheet, "table2")
+        self.assertEqual(sheet.rows[0].data["supplier"], "TabCo")
+        with self.assertRaises(UnsupportedFile) as ctx:
+            parse_named(content, "sup.docx", sheet_name="table9")
+        self.assertIn("Available: table1, table2", str(ctx.exception))
+
+    def test_discover_text_is_a_single_section(self):
+        entries = discover_sheets(b"a,b\n1,2\n", "chat.csv")
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["kind"], "text")
+        self.assertEqual(entries[0]["name"], "chat.csv")
+        self.assertEqual(entries[0]["rows"], 2)
+
+    def test_delimited_section_mismatch_refused(self):
+        with self.assertRaises(UnsupportedFile) as ctx:
+            parse_named(b"a,b\n1,2\n", "chat.csv", sheet_name="other")
+        self.assertIn("Available: chat.csv", str(ctx.exception))
+
+    def test_candidate_message_text_cap(self):
+        text, truncated, total = candidate_message_text(b"hello world")
+        self.assertEqual((text, truncated, total), ("hello world", False, 11))
+        big = b"x" * 300_000
+        text, truncated, total = candidate_message_text(big)
+        self.assertTrue(truncated)
+        self.assertEqual(total, 300_000)
+        self.assertEqual(len(text), 256_000)

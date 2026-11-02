@@ -22,11 +22,14 @@ from pipeline.models import (
 from pipeline.normalize import (
     LOCKED,
     REVIEWABLE_FIELDS,
+    has_quantity_marking,
     merge_interpreted_cells,
     normalize_cells,
+    parse_price,
     parse_quantity,
     parse_review_value,
 )
+from pipeline.normalize import terminal_amount as _terminal_span
 
 # The database stores prices at four decimals; anything within half a
 # ten-thousandth is storage rounding, not tampering.
@@ -92,10 +95,13 @@ def _prices_match(actual, expected) -> bool:
     return abs(Decimal(str(actual)) - Decimal(str(expected))) <= _PRICE_TOLERANCE
 
 
-def _expected_fields(offer) -> dict:
+def _expected_fields(offer, document_policy: str = "stock") -> dict:
     """Normalized evidence for one offer, model cells folded in narrowly."""
     row = offer.source_row
-    cells = merge_interpreted_cells(dict(row.data or {}), offer.interpreted or {})
+    cells = merge_interpreted_cells(
+        dict(row.data or {}), offer.interpreted or {},
+        document_policy=document_policy,
+    )
     return normalize_cells(cells)
 
 
@@ -118,6 +124,7 @@ def evaluate_validations(run) -> list:
         _check_quantities_reconcile(run),
         _check_provenance_complete(run),
         _check_rows_reconcile_with_evidence(run),
+        _check_roles_bound_to_evidence(run),
         _check_no_merge(run),
         _check_releasable_or_explicit_empty(run),
     ]
@@ -175,7 +182,9 @@ def _check_quantities_reconcile(run):
             # the same merged evidence the per-row gate authorizes, so a
             # model-filled quantity gap counts exactly once on each side.
             # Without a proposal this still yields None (unparseable).
-            raw = _expected_fields(offer)["quantity"]
+            raw = _expected_fields(
+                offer, (run.mapping or {}).get("document_policy", "stock")
+            )["quantity"]
         # An approved clarification supplies the quantity the raw
         # cell could not; only rows with neither stay unparseable.
         if raw is None and decided is None:
@@ -240,9 +249,10 @@ def _check_rows_reconcile_with_evidence(run):
         .exclude(status=OfferStatus.EXCLUDED)
         .order_by("id")
     )
+    policy = (run.mapping or {}).get("document_policy", "stock")
     for offer in offers:
         row = offer.source_row
-        expected = _expected_fields(offer)
+        expected = _expected_fields(offer, policy)
         bad_fields = []
         actual_map = {}
         expected_map = {}
@@ -265,15 +275,16 @@ def _check_rows_reconcile_with_evidence(run):
                 authorized = actual == want
             if not authorized:
                 note(attr, actual, want)
-        for attr, cell in (("brand", "brand"), ("color", "color")):
+        for attr in ("brand", "color", "conditions"):
+            # Optional cells may be adopted from the recorded proposal
+            # when the source left them empty (see
+            # merge_interpreted_cells), so they reconcile against the
+            # same merged expectation as every other field — not
+            # against raw source cells alone.
             actual = getattr(offer, attr)
-            want = str((row.data or {}).get(cell) or "").strip()
+            want = expected[attr]
             if actual != want:
                 note(attr, actual, want)
-        actual = offer.conditions
-        want = str((row.data or {}).get("conditions") or "")
-        if actual != want:
-            note("conditions", actual, want)
         if offer.lock_state == LOCKED:
             # Locked stock is never releasable, whatever the status says.
             if "lock_state" not in bad_fields:
@@ -303,6 +314,118 @@ def _check_rows_reconcile_with_evidence(run):
         "rows_reconcile_with_evidence",
         True,
         "Every offer traces to its source row or a recorded decision.",
+    )
+
+
+def _check_roles_bound_to_evidence(run):
+    """Terminal-scoped rows bind price and quantity to source spans.
+
+    Numeric presence is necessary but insufficient: a terminal-scoped
+    offer's price must equal the terminal token re-read from its own
+    line at the recorded span, and its quantity must be absent, marked
+    on the line, or human-decided. Capacity/model digits can never
+    satisfy either role through this gate.
+    """
+    if (run.mapping or {}).get("free_text") is not True:
+        return _result(
+            run,
+            "roles_bound_to_evidence",
+            True,
+            "No message-lane numeric roles to bind.",
+        )
+    decisions = _live_decisions(run)
+    failures = []
+    scoped = 0
+    offers = (
+        run.offers.select_related("source_row")
+        .exclude(status=OfferStatus.EXCLUDED)
+        .order_by("id")
+    )
+    for offer in offers:
+        row = offer.source_row
+        provenance = row.provenance or {}
+        if not provenance.get("terminal_scope"):
+            continue
+        scoped += 1
+        text = (row.data or {}).get("message") or ""
+        bound = provenance.get("terminal") or {}
+        fields = []
+        expected = {}
+        actual = {}
+        found = _terminal_span(text)
+        price_decision = decisions.get((offer.id, "unit_price"))
+        price_decided = (
+            price_decision is not None
+            and _decided_value(price_decision, "unit_price") is not None
+        )
+        if not price_decided:
+            if found is None:
+                fields.append("unit_price")
+                expected["unit_price"] = "resolvable terminal amount"
+                actual["unit_price"] = "unresolvable"
+            else:
+                token, start, end = found
+                want = parse_price(token)
+                recorded = bound.get("span")
+                if recorded is not None and recorded != [start, end]:
+                    fields.append("unit_price")
+                    expected["unit_price"] = f"span {recorded}"
+                    actual["unit_price"] = f"span {[start, end]}"
+                elif want is None or not _prices_match(offer.unit_price, want):
+                    fields.append("unit_price")
+                    expected["unit_price"] = "" if want is None else str(want)
+                    actual["unit_price"] = (
+                        "" if offer.unit_price is None else str(offer.unit_price)
+                    )
+        currency_decision = decisions.get((offer.id, "currency"))
+        if bound.get("currency") and (
+            (currency_decision is None)
+            or _decided_value(currency_decision, "currency") is None
+        ):
+            if offer.currency != bound["currency"]:
+                fields.append("currency")
+                expected["currency"] = bound["currency"]
+                actual["currency"] = offer.currency or ""
+        quantity_decision = decisions.get((offer.id, "quantity"))
+        if (
+            offer.quantity is not None
+            and (
+                quantity_decision is None
+                or _decided_value(quantity_decision, "quantity") is None
+            )
+            and not has_quantity_marking(text)
+        ):
+            fields.append("quantity")
+            expected["quantity"] = "absent or marked on the line"
+            actual["quantity"] = str(offer.quantity)
+        if fields:
+            failures.append(
+                {
+                    "offer_id": offer.id,
+                    "sheet": row.sheet,
+                    "row": row.index,
+                    "fields": fields,
+                    "expected": expected,
+                    "actual": actual,
+                }
+            )
+    if failures:
+        return _result(
+            run,
+            "roles_bound_to_evidence",
+            False,
+            f"{len(failures)} terminal-scoped offer(s) misbind numeric roles.",
+            {"offers": failures},
+        )
+    if not scoped:
+        return _result(
+            run, "roles_bound_to_evidence", True, "No terminal-scoped rows."
+        )
+    return _result(
+        run,
+        "roles_bound_to_evidence",
+        True,
+        f"{scoped} terminal-scoped offer(s) bind to their source spans.",
     )
 
 

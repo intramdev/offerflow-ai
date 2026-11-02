@@ -33,6 +33,28 @@ class UnsupportedFile(Exception):
     """The uploaded file cannot be safely parsed."""
 
 
+class HeaderNotFound(UnsupportedFile):
+    """No header row in the scanned rows (message lane may still read it)."""
+
+
+class MessageCandidateFile(UnsupportedFile):
+    """A .txt/.csv upload the message lane can read as pasted text.
+
+    Subclasses UnsupportedFile so plain callers still treat it as a
+    refusal; the preview endpoint translates it into an explicit
+    "Import as message" offer instead of a bare header failure.
+    """
+
+    def __init__(self, text: str, *, truncated: bool, total_chars: int) -> None:
+        self.text = text
+        self.truncated = truncated
+        self.total_chars = total_chars
+        super().__init__(
+            "No table headers found. This looks like pasted chat text — "
+            "import it as a message instead."
+        )
+
+
 class MappingRequired(UnsupportedFile):
     """Headers were found but required columns are missing.
 
@@ -42,13 +64,15 @@ class MappingRequired(UnsupportedFile):
     """
 
     def __init__(
-        self, *, headers: list, column_map: dict, sources: dict, missing: list, rows: list
+        self, *, headers: list, column_map: dict, sources: dict, missing: list, rows: list,
+        sheet: str = "",
     ) -> None:
         self.headers = list(headers)
         self.column_map = dict(column_map)
         self.sources = dict(sources)
         self.missing = list(missing)
         self.rows = list(rows)
+        self.sheet = sheet
         seen = ", ".join(h for h in headers if h) or "(none)"
         super().__init__(
             f"Missing required columns: {', '.join(missing)}. "
@@ -103,6 +127,9 @@ MESSAGE_COLUMN = "message"
 
 ACCEPTED_EXTENSIONS = frozenset({".xlsx", ".xls", ".csv", ".txt", ".tsv", ".docx"})
 ARCHIVE_EXTENSIONS = frozenset({".xlsx", ".docx"})
+
+#: Discovery cap: a hostile workbook could list thousands of empty sheets.
+MAX_DISCOVERED_SHEETS = 64
 LEGACY_DOC_MESSAGE = (
     "Legacy .doc files cannot be read reliably. "
     "Save the document as .docx and upload it again."
@@ -316,7 +343,7 @@ def _table_to_sheet(
             break
     if header_index is None:
         if not message_fallback:
-            raise UnsupportedFile("No header row found in the scanned rows.")
+            raise HeaderNotFound("No header row found in the scanned rows.")
         content_rows = [
             row
             for row in rows
@@ -444,6 +471,7 @@ def _table_to_sheet(
             sources=sources,
             missing=missing,
             rows=data,
+            sheet=title,
         )
     return ParsedSheet(
         sheet=title,
@@ -453,6 +481,139 @@ def _table_to_sheet(
         rows=data,
         sources=sources,
     )
+
+
+def _select_xlsx_sheet(workbook, sheet_name: str | None):
+    """Pick an explicit worksheet or the first visible one."""
+    names = [candidate.title for candidate in workbook.worksheets]
+    if sheet_name is not None:
+        for candidate in workbook.worksheets:
+            if candidate.title == sheet_name:
+                if candidate.sheet_state != "visible":
+                    raise UnsupportedFile(
+                        f"Worksheet {sheet_name!r} is hidden."
+                    )
+                return candidate
+        seen = ", ".join(names) or "(none)"
+        raise UnsupportedFile(
+            f"Worksheet {sheet_name!r} not found. Available: {seen}."
+        )
+    for candidate in workbook.worksheets:
+        if candidate.sheet_state == "visible":
+            return candidate
+    raise UnsupportedFile("Workbook has no visible worksheet.")
+
+
+def _select_xls_sheet(book, sheet_name: str | None):
+    """Pick an explicit .xls sheet or the first visible one."""
+    names = [candidate.name for candidate in book.sheets()]
+    if sheet_name is not None:
+        for candidate in book.sheets():
+            if candidate.name == sheet_name:
+                if candidate.visibility != 0:
+                    raise UnsupportedFile(
+                        f"Worksheet {sheet_name!r} is hidden."
+                    )
+                return candidate
+        seen = ", ".join(names) or "(none)"
+        raise UnsupportedFile(
+            f"Worksheet {sheet_name!r} not found. Available: {seen}."
+        )
+    for candidate in book.sheets():
+        if candidate.visibility == 0:
+            return candidate
+    if not book.nsheets:
+        raise UnsupportedFile("Workbook has no visible worksheet.")
+    return book.sheet_by_index(0)
+
+
+def discover_sheets(content: bytes, filename: str) -> list:
+    """List every selectable section without parsing rows.
+
+    Worksheets for xlsx/xls (hidden ones flagged, never defaulted),
+    tables for docx, one text section for delimited files. Raises
+    UnsupportedFile for unreadable bytes, unknown extensions, or
+    legacy .doc — the same refusals as parse_upload.
+    """
+    extension = _extension_of(filename)
+    if extension == ".xlsx":
+        try:
+            workbook = load_workbook(
+                io.BytesIO(content), read_only=True, data_only=True
+            )
+        except Exception as exc:
+            raise UnsupportedFile(
+                "File is not a readable spreadsheet."
+            ) from exc
+        sheets = workbook.worksheets
+        if len(sheets) > MAX_DISCOVERED_SHEETS:
+            raise UnsupportedFile("Workbook lists too many worksheets.")
+        return [
+            {
+                "name": candidate.title,
+                "kind": "worksheet",
+                "visible": candidate.sheet_state == "visible",
+                "rows": candidate.max_row or 0,
+                "cols": candidate.max_column or 0,
+            }
+            for candidate in sheets
+        ]
+    if extension == ".xls":
+        try:
+            book = xlrd.open_workbook(file_contents=content)
+        except Exception as exc:
+            raise UnsupportedFile(
+                "File is not a readable spreadsheet."
+            ) from exc
+        sheets = book.sheets()
+        if len(sheets) > MAX_DISCOVERED_SHEETS:
+            raise UnsupportedFile("Workbook lists too many worksheets.")
+        return [
+            {
+                "name": candidate.name,
+                "kind": "worksheet",
+                "visible": candidate.visibility == 0,
+                "rows": candidate.nrows,
+                "cols": candidate.ncols,
+            }
+            for candidate in sheets
+        ]
+    if extension == ".docx":
+        try:
+            document = Document(io.BytesIO(content))
+        except Exception as exc:
+            raise UnsupportedFile("File is not a readable document.") from exc
+        if len(document.tables) > MAX_DISCOVERED_SHEETS:
+            raise UnsupportedFile("Document lists too many tables.")
+        return [
+            {
+                "name": f"table{index + 1}",
+                "kind": "table",
+                "visible": True,
+                "rows": len(table.rows),
+                "cols": max((len(row.cells) for row in table.rows), default=0),
+            }
+            for index, table in enumerate(document.tables)
+        ]
+    if extension in (".csv", ".txt", ".tsv"):
+        title = (filename or "upload").rsplit("/", 1)[-1]
+        try:
+            lines = _decode_text(content).splitlines()
+        except UnsupportedFile:
+            raise
+        return [
+            {
+                "name": title,
+                "kind": "text",
+                "visible": True,
+                "rows": len(lines),
+                "cols": None,
+            }
+        ]
+    if extension == ".doc":
+        raise UnsupportedFile(LEGACY_DOC_MESSAGE)
+    accepted = ", ".join(sorted(e[1:] for e in ACCEPTED_EXTENSIONS))
+    raise UnsupportedFile(f"Accepted formats: {accepted}.")
 
 
 def parse_xlsx(
@@ -465,19 +626,14 @@ def parse_xlsx(
     column_constants: dict | None = None,
     ignored_columns: list | None = None,
     constant_sources: dict | None = None,
+    sheet_name: str | None = None,
 ) -> ParsedSheet:
-    """Parse the first visible worksheet into canonical raw rows."""
+    """Parse one worksheet into canonical raw rows (first visible by default)."""
     try:
         workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=False)
     except Exception as exc:
         raise UnsupportedFile("File is not a readable spreadsheet.") from exc
-    sheet = None
-    for candidate in workbook.worksheets:
-        if candidate.sheet_state == "visible":
-            sheet = candidate
-            break
-    if sheet is None:
-        raise UnsupportedFile("Workbook has no visible worksheet.")
+    sheet = _select_xlsx_sheet(workbook, sheet_name)
     if sheet.max_row is not None and sheet.max_row > max_rows:
         raise UnsupportedFile("Worksheet exceeds the row intake limit.")
     if sheet.max_column is not None and sheet.max_column > max_cols:
@@ -509,6 +665,7 @@ def parse_xls(
     column_constants: dict | None = None,
     ignored_columns: list | None = None,
     constant_sources: dict | None = None,
+    sheet_name: str | None = None,
 ) -> ParsedSheet:
     """Parse a legacy .xls workbook. Cached values are read as plain data;
     nothing is ever evaluated."""
@@ -516,15 +673,7 @@ def parse_xls(
         book = xlrd.open_workbook(file_contents=content)
     except Exception as exc:
         raise UnsupportedFile("File is not a readable spreadsheet.") from exc
-    sheet = None
-    for candidate in book.sheets():
-        if candidate.visibility == 0:
-            sheet = candidate
-            break
-    if sheet is None:
-        if not book.nsheets:
-            raise UnsupportedFile("Workbook has no visible worksheet.")
-        sheet = book.sheet_by_index(0)
+    sheet = _select_xls_sheet(book, sheet_name)
     if sheet.nrows > max_rows:
         raise UnsupportedFile("Worksheet exceeds the row intake limit.")
     if sheet.ncols > max_cols:
@@ -555,6 +704,25 @@ def _decode_text(content: bytes) -> str:
     raise UnsupportedFile("File could not be decoded as text.")
 
 
+#: Cap for the "Import as message" candidate payload; the from-text
+#: endpoint enforces its own byte limits on the actual import.
+MESSAGE_CANDIDATE_MAX_CHARS = 256_000
+
+
+def candidate_message_text(content: bytes) -> tuple:
+    """Decode upload bytes for a message-candidate offer.
+
+    Returns (text, truncated, total_chars) with the same codecs as
+    the delimited reader, so the offered text is exactly what the
+    message lane would read.
+    """
+    text = _decode_text(content)
+    total = len(text)
+    if total > MESSAGE_CANDIDATE_MAX_CHARS:
+        return text[:MESSAGE_CANDIDATE_MAX_CHARS], True, total
+    return text, False, total
+
+
 def _sniff_delimiter(sample_lines: list) -> str:
     """Pick the delimiter with a consistent nonzero count per line.
 
@@ -570,6 +738,14 @@ def _sniff_delimiter(sample_lines: list) -> str:
     return ","
 
 
+def _require_text_section(sheet_name: str | None, title: str) -> None:
+    """Delimited input has exactly one text section; refuse anything else."""
+    if sheet_name is not None and sheet_name != title:
+        raise UnsupportedFile(
+            f"Section {sheet_name!r} not found. Available: {title}."
+        )
+
+
 def parse_delimited(
     content: bytes,
     title: str,
@@ -583,8 +759,10 @@ def parse_delimited(
     constant_sources: dict | None = None,
     forced_delimiter: str | None = None,
     message_fallback: bool = False,
+    sheet_name: str | None = None,
 ) -> ParsedSheet:
     """Parse csv/txt/tsv bytes with a sniffed (or forced) delimiter."""
+    _require_text_section(sheet_name, title)
     text = _decode_text(content)
     sample = [line for line in text.splitlines() if line.strip()][:5]
     delimiter = forced_delimiter or _sniff_delimiter(sample)
@@ -617,11 +795,14 @@ def parse_docx(
     column_constants: dict | None = None,
     ignored_columns: list | None = None,
     constant_sources: dict | None = None,
+    sheet_name: str | None = None,
 ) -> ParsedSheet:
-    """Parse the richest table of a .docx document.
+    """Parse one table of a .docx document.
 
-    The first fully readable table wins; otherwise the table with the most
-    recognized columns is reported so the reviewer can finish its mapping.
+    By default the first fully readable table wins; otherwise the table
+    with the most recognized columns is reported so the reviewer can
+    finish its mapping. An explicit table name (table1, table2, …)
+    selects exactly that table instead.
     """
     try:
         document = Document(io.BytesIO(content))
@@ -629,6 +810,28 @@ def parse_docx(
         raise UnsupportedFile("File is not a readable document.") from exc
     if not document.tables:
         raise UnsupportedFile("Document contains no tables.")
+    names = [f"table{index + 1}" for index in range(len(document.tables))]
+    if sheet_name is not None:
+        if sheet_name not in names:
+            seen = ", ".join(names)
+            raise UnsupportedFile(
+                f"Table {sheet_name!r} not found. Available: {seen}."
+            )
+        table = document.tables[names.index(sheet_name)]
+        rows = [
+            [(cell.text.strip(), False) for cell in row.cells] for row in table.rows
+        ]
+        return _table_to_sheet(
+            rows,
+            sheet_name,
+            max_rows=max_rows,
+            max_cols=max_cols,
+            header_scan_rows=header_scan_rows,
+            column_overrides=column_overrides,
+            column_constants=column_constants,
+            ignored_columns=ignored_columns,
+            constant_sources=constant_sources,
+        )
     best: MappingRequired | None = None
     for index, table in enumerate(document.tables):
         rows = [
@@ -668,6 +871,7 @@ def parse_upload(
     ignored_columns: list | None = None,
     constant_sources: dict | None = None,
     message_fallback: bool = False,
+    sheet_name: str | None = None,
 ) -> ParsedSheet:
     """Dispatch bytes to the reader matching the filename extension.
 
@@ -675,6 +879,8 @@ def parse_upload(
     extensions and legacy .doc with guidance. message_fallback (pasted
     text only) lets headerless single-column delimited text become
     message rows; spreadsheets and documents never fall back.
+    sheet_name selects one worksheet/table (see discover_sheets);
+    delimited input has a single text section and must match it.
     """
     extension = _extension_of(filename)
     options = {
@@ -685,6 +891,7 @@ def parse_upload(
         "column_constants": column_constants,
         "ignored_columns": ignored_columns,
         "constant_sources": constant_sources,
+        "sheet_name": sheet_name,
     }
     if extension == ".xlsx":
         return parse_xlsx(content, **options)
@@ -694,9 +901,11 @@ def parse_upload(
         return parse_docx(content, **options)
     if extension == ".tsv":
         title = (filename or "upload").rsplit("/", 1)[-1]
+        _require_text_section(sheet_name, title)
         return parse_delimited(content, title, forced_delimiter="\t", **options)
     if extension in (".csv", ".txt"):
         title = (filename or "upload").rsplit("/", 1)[-1]
+        _require_text_section(sheet_name, title)
         return parse_delimited(
             content, title, message_fallback=message_fallback, **options
         )

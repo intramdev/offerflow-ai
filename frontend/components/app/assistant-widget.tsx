@@ -3,6 +3,7 @@
 import Image from "next/image";
 import * as React from "react";
 
+import { summarizeOperation } from "@/components/app/draft-ops";
 import { useOrg } from "@/components/app/org-context";
 import { usePreviewAssist } from "@/components/app/preview-assist-context";
 import { Button } from "@/components/ui/button";
@@ -27,12 +28,15 @@ interface Bubble extends AssistantTurn {
 interface PendingProposal {
   bubbleKey: number;
   proposal: PreviewAssistProposal;
+  /** Checked operation cards, by index into proposal.operations. */
+  selected: boolean[];
 }
 
 function isEmptyProposal(proposal: PreviewAssistProposal): boolean {
   return (
     Object.keys(proposal.set_constants).length === 0 &&
-    proposal.drop_lines.length === 0
+    proposal.drop_lines.length === 0 &&
+    (proposal.operations ?? []).length === 0
   );
 }
 
@@ -133,11 +137,25 @@ export function AssistantWidget() {
       return;
     }
     const bubble = pushTurn("assistant", answer.message, answer.tokens);
+    const notes: string[] = [];
     if (answer.hint) {
-      setNotice(answer.hint);
+      notes.push(answer.hint);
+    }
+    const coverage = answer.context_coverage;
+    if (coverage?.truncated) {
+      notes.push(
+        `The assistant could only read ${coverage.lines_shown} of ${coverage.total_rows} pasted lines, so suggestions may miss later content.`,
+      );
+    }
+    if (notes.length > 0) {
+      setNotice(notes.join(" "));
     }
     if (!isEmptyProposal(answer.proposal)) {
-      setPending({ bubbleKey: bubble.key, proposal: answer.proposal });
+      setPending({
+        bubbleKey: bubble.key,
+        proposal: answer.proposal,
+        selected: (answer.proposal.operations ?? []).map(() => true),
+      });
     } else {
       setPending(null);
     }
@@ -186,6 +204,9 @@ export function AssistantWidget() {
 
   async function applyPending() {
     if (!session || !pending || busy || applying) return;
+    const operations = (pending.proposal.operations ?? []).filter(
+      (_, index) => pending.selected[index] !== false,
+    );
     setError("");
     setNotice("");
     setApplying(true);
@@ -193,6 +214,8 @@ export function AssistantWidget() {
       const result = await applyPreviewAssist(session.key, {
         set_constants: pending.proposal.set_constants,
         drop_lines: pending.proposal.drop_lines,
+        operations,
+        revision: session.getRevision(),
       });
       const parts: string[] = [];
       const names = Object.keys(result.applied.set_constants);
@@ -205,16 +228,31 @@ export function AssistantWidget() {
         const count = result.applied.drop_lines.length;
         parts.push(`dropped ${count} line${count === 1 ? "" : "s"}`);
       }
+      const opCount = (result.applied.operations ?? []).length;
+      if (opCount > 0) {
+        parts.push(
+          `applied ${opCount} interpretation change${opCount === 1 ? "" : "s"}`,
+        );
+      }
       session.onApplied(result.preview);
       setPending(null);
       pushTurn(
         "assistant",
-        `Applied — ${parts.join("; ")}. The preview on this page is updated.`,
+        `Applied — ${parts.join("; ")}. The preview on this page is updated (revision ${result.applied.revision}).`,
       );
     } catch (err) {
-      setError(
-        err instanceof ApiError ? err.message : "Could not apply the proposal.",
-      );
+      if (err instanceof ApiError && err.status === 409) {
+        // Another tab changed the draft: the page already shows the
+        // newest preview, so keep the proposal and let the user
+        // review the rules panel, adjust the selection, and retry.
+        setError(
+          `${err.message} Review the rules on this page, then apply again or discard.`,
+        );
+      } else {
+        setError(
+          err instanceof ApiError ? err.message : "Could not apply the proposal.",
+        );
+      }
     } finally {
       setApplying(false);
     }
@@ -270,7 +308,7 @@ export function AssistantWidget() {
                   <>
                     I can see this pending preview
                     {session.messageLines
-                      ? " — tell me values to set for every line or line numbers to drop, and I will propose the change for you to apply."
+                      ? " — explain what the lines mean (supplier, grade sections, which number is the price) and I will propose typed interpretation changes for you to review and apply."
                       : " — tell me values to set for every row, and I will propose the change for you to apply."}
                   </>
                 ) : assistDraft ? (
@@ -334,13 +372,62 @@ export function AssistantWidget() {
                     ))}
                   </ul>
                 ) : null}
+                {(pending.proposal.operations ?? []).length > 0 ? (
+                  <ul className="mt-2 space-y-2">
+                    {(pending.proposal.operations ?? []).map((op, index) => {
+                      const summary = summarizeOperation(op);
+                      const checked = pending.selected[index] !== false;
+                      return (
+                        <li
+                          key={index}
+                          className="flex items-start gap-2 rounded-md border border-border px-2 py-1.5"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={applying || busy}
+                            onChange={() =>
+                              setPending((current) =>
+                                current
+                                  ? {
+                                      ...current,
+                                      selected: current.selected.map(
+                                        (was, at) =>
+                                          at === index ? !was : was,
+                                      ),
+                                    }
+                                  : current,
+                              )
+                            }
+                            aria-label={`Include: ${summary.title}`}
+                            className="mt-1"
+                          />
+                          <span>
+                            <span className="block font-medium">
+                              {summary.title}
+                            </span>
+                            {summary.detail ? (
+                              <span className="block text-xs text-muted-foreground">
+                                {summary.detail}
+                              </span>
+                            ) : null}
+                          </span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : null}
                 <div className="mt-3 flex gap-2">
                   <Button
                     size="sm"
                     onClick={() => void applyPending()}
                     disabled={applying || busy}
                   >
-                    {applying ? "Applying…" : "Apply to preview"}
+                    {applying
+                      ? "Applying…"
+                      : (pending.proposal.operations ?? []).length > 0
+                        ? `Apply ${pending.selected.filter(Boolean).length} of ${(pending.proposal.operations ?? []).length} to preview`
+                        : "Apply to preview"}
                   </Button>
                   <Button
                     size="sm"

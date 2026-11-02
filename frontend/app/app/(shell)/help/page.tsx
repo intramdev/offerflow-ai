@@ -79,7 +79,8 @@ export default function HelpPage() {
       <Section id="upload" title="Upload & preview">
         <P>
           Drop a supplier file on the <strong>Upload</strong> page. OfferFlow
-          reads XLSX, XLS, CSV, TXT, TSV, DOC, and DOCX. Nothing is stored
+          reads XLSX, XLS, CSV, TXT, TSV, and DOCX (legacy DOC is refused
+          with guidance; ZIP archives are not supported). Nothing is stored
           until you confirm: the file is parsed and you get a preview first.
         </P>
         <Note>
@@ -88,9 +89,14 @@ export default function HelpPage() {
         </Note>
         <P>
           You can also paste a supplier message (WhatsApp/Telegram text) into
-          the text box instead of a file: OfferFlow parses it into the same
-          preview, inheriting grade sections and currency per row, and the
-          preview assistant opens automatically to propose mapping fixes.
+          the text box instead of a file. Each line becomes one candidate
+          product — nothing is pre-guessed. Explain what the lines mean in
+          the chat (the assistant opens automatically), review each
+          proposed change as a card, and apply the ones you agree with.
+          Applied rules are listed in the rules panel with a revision
+          number, survive refreshes, and shape the import exactly as
+          previewed. Price lists without stock use the price-only policy:
+          quantities stay unknown instead of being invented.
         </P>
       </Section>
 
@@ -215,8 +221,11 @@ export default function HelpPage() {
         <P>
           When a paste preview is on screen, the chat switches to
           preview-assistant mode: it can see only that preview, proposes
-          changes as an explicit draft, and applies them only when you click{" "}
-          <strong>Apply to preview</strong> — your own edits always win.
+          each change as a card you can tick or untick, and applies them
+          only when you click{" "}<strong>Apply to preview</strong> — your
+          own edits always win. If the preview changed elsewhere meanwhile,
+          applying fails safely and asks you to review the newest rules
+          first.
         </P>
       </Section>
 
@@ -225,8 +234,8 @@ export default function HelpPage() {
           The <strong>Profile</strong> page holds your name, email, and
           reading preferences: light, dark, or system theme; typeface and
           text size; high-contrast colors; and reduced motion. All of it is
-          saved with your account and follows EN 301 549 / WCAG 2.1 AA
-          guidance.
+          saved with your account. The design aims at EN 301 549 /
+          WCAG 2.1 AA; that is a goal, not a certified claim.
         </P>
       </Section>
 

@@ -362,6 +362,30 @@ class RuleServiceTests(TestCase):
         self.assertEqual(sheet["J2"].value, "Phones")
         self.assertEqual(sheet["G2"].value, 100)
 
+    def test_price_only_csv_omits_stock_column(self):
+        run = self._run()
+        self._offer(run, 2, quantity=None)
+        quote = build_quote(run)
+        text = render_quote_csv(quote, document_policy="price_only").decode(
+            "utf-8"
+        )
+        rows = text.strip().splitlines()
+        self.assertNotIn("Quantity", rows[0])
+        self.assertNotIn("Unknown", rows[1])
+
+    def test_explicit_template_labels_unknown_stock(self):
+        run = self._run()
+        self._offer(run, 2, quantity=None)
+        quote = build_quote(run)
+        text = render_quote_csv(
+            quote,
+            columns=["model", "quantity", "price"],
+            document_policy="price_only",
+        ).decode("utf-8")
+        rows = text.strip().splitlines()
+        self.assertIn("Quantity", rows[0])
+        self.assertIn("Unknown", rows[1])
+
 
 @override_settings(PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])
 class RuleApiTests(TestCase):

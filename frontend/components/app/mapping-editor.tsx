@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import * as React from "react";
 
+import { DraftPreview } from "@/components/app/draft-preview";
 import { ErrorNotice } from "@/components/app/error-notice";
 import {
   FieldMapper,
@@ -13,9 +14,11 @@ import {
   type FieldSelection,
 } from "@/components/app/field-mapper";
 import { useOrg } from "@/components/app/org-context";
+import { RulesPanel } from "@/components/app/rules-panel";
 import { StatusBadge } from "@/components/app/status-badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select } from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -36,11 +39,11 @@ import {
 
 export function MappingEditor({
   preview,
-  assistRevision = 0,
+  onPreview,
   onDone,
 }: {
   preview: Preview;
-  assistRevision?: number;
+  onPreview: (next: Preview) => void;
   onDone: () => void;
 }) {
   const router = useRouter();
@@ -138,12 +141,29 @@ export function MappingEditor({
   const assisted = React.useRef<Set<string>>(new Set());
   const selectionRef = React.useRef(selection);
   selectionRef.current = selection;
+  // Every confirmed change — chat proposal, rules-panel edit — arrives
+  // as a new preview object with a bumped draft revision. Merge its
+  // constants into untouched fields and resample quietly.
+  const seenPreview = React.useRef<{ key: string; revision: number } | null>(
+    null,
+  );
   React.useEffect(() => {
-    if (assistRevision === 0) return;
+    const revision = preview.draft?.revision ?? 0;
+    const seen = seenPreview.current;
+    if (seen === null) {
+      // Mount: the selection was already built from this preview.
+      seenPreview.current = { key: preview.key, revision };
+      return;
+    }
+    if (seen.key !== preview.key) {
+      seenPreview.current = { key: preview.key, revision };
+      return;
+    }
+    if (seen.revision === revision) return;
+    seenPreview.current = { key: preview.key, revision };
     const current = selectionRef.current;
     const next: FieldSelection = { ...current };
     const constants = preview.proposed_constants ?? {};
-    const names = new Set(Object.keys(constants));
     for (const [field, raw] of Object.entries(constants)) {
       if (touched.current.has(field)) continue;
       const choice = current[field];
@@ -152,7 +172,15 @@ export function MappingEditor({
       }
       next[field] = { kind: "custom", position: "", value: String(raw) };
     }
-    assisted.current = names;
+    // Assisted values follow the draft: dropping the global rule that
+    // set a field clears it again, unless the user typed there since.
+    for (const field of assisted.current) {
+      if (touched.current.has(field)) continue;
+      if (!(field in constants)) {
+        next[field] = { kind: "", position: "", value: "" };
+      }
+    }
+    assisted.current = new Set(Object.keys(constants));
     setSamples(preview.samples);
     setError(null);
     // change() would mark fields touched; refresh quietly instead.
@@ -160,7 +188,48 @@ export function MappingEditor({
     setSelection(next);
     timer.current = setTimeout(() => void refresh(next), 400);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [assistRevision]);
+  }, [preview]);
+
+  async function switchSheet(name: string) {
+    if (messageLines || name === preview.sheets.selected) return;
+    if (timer.current) clearTimeout(timer.current);
+    setRendering(true);
+    setError(null);
+    try {
+      const result = await renderPreview(preview.key, {}, {}, [], name);
+      if (!result.switched) {
+        setError("The sheet did not change. Try again.");
+        return;
+      }
+      // Old-sheet positions cannot apply to the new headers: take the
+      // fresh detection exactly as the backend stored it.
+      const fresh = selectionFromProposed(
+        result.mapping,
+        result.constants,
+        result.ignored,
+      );
+      touched.current.clear();
+      assisted.current.clear();
+      setSelection(fresh);
+      setSamples(result.samples);
+      onPreview({
+        ...preview,
+        headers: result.switched.headers,
+        detected: result.switched.detected,
+        missing: result.switched.missing,
+        total_rows: result.switched.total_rows,
+        proposed: result.mapping,
+        proposed_constants: result.constants,
+        proposed_ignored: result.ignored,
+        samples: result.samples,
+        sheets: result.sheets,
+      });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not switch sheets.");
+    } finally {
+      setRendering(false);
+    }
+  }
 
   async function confirm() {
     setBusy(true);
@@ -172,10 +241,22 @@ export function MappingEditor({
         payload.mapping,
         payload.constants,
         payload.ignored,
+        preview.sheets.selected,
+        preview.draft?.revision ?? null,
       );
       router.push(`/app/runs/${run.id}`);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Import failed to start.");
+      if (err instanceof ApiError && err.status === 409) {
+        // Our revision is stale: another tab changed the draft after
+        // this page loaded it. Say so plainly — retrying blindly
+        // would import a different interpretation than shown.
+        setError(
+          `${err.message} This page may be showing an older revision — ` +
+            "if another tab changed this preview, discard it and start over.",
+        );
+      } else {
+        setError(err instanceof ApiError ? err.message : "Import failed to start.");
+      }
       setBusy(false);
     }
   }
@@ -194,9 +275,46 @@ export function MappingEditor({
   // Message lines map nothing: interpretation plus human reviews cover
   // every gap, so nothing blocks confirmation.
   const missing = messageLines ? [] : missingRequired(selection);
+  const visibleSheets = (preview.sheets?.available ?? []).filter(
+    (entry) => entry.visible,
+  );
 
   return (
     <div className="space-y-6">
+      {preview.sheets?.notice ? (
+        <div
+          className="rounded-md border border-border bg-muted px-4 py-3 text-sm"
+          role="status"
+        >
+          {preview.sheets.notice}
+        </div>
+      ) : null}
+      {!messageLines && visibleSheets.length > 1 ? (
+        <div className="flex flex-wrap items-center gap-3">
+          <label
+            htmlFor="preview-sheet"
+            className="text-sm font-medium"
+          >
+            Sheet to import
+          </label>
+          <Select
+            id="preview-sheet"
+            value={preview.sheets.selected ?? ""}
+            onChange={(event) => void switchSheet(event.target.value)}
+            disabled={rendering || busy}
+            aria-label="Sheet to import"
+          >
+            {visibleSheets.map((entry) => (
+              <option key={entry.name} value={entry.name}>
+                {entry.name}
+                {entry.rows !== null && entry.rows !== undefined
+                  ? ` (${entry.rows} rows)`
+                  : ""}
+              </option>
+            ))}
+          </Select>
+        </div>
+      ) : null}
       {preview.memory ? (
         <div className="rounded-md border border-border bg-muted px-4 py-3 text-sm">
           Recognized this layout — you mapped it {preview.memory.use_count}{" "}
@@ -261,6 +379,17 @@ export function MappingEditor({
           ) : null}
         </CardContent>
       </Card>
+
+      {messageLines && preview.draft ? (
+        <DraftPreview draft={preview.draft} />
+      ) : null}
+      {messageLines && preview.draft ? (
+        <RulesPanel
+          previewKey={preview.key}
+          draft={preview.draft}
+          onPreview={onPreview}
+        />
+      ) : null}
 
       <Card>
         <CardHeader>
@@ -403,7 +532,10 @@ export function MappingEditor({
       {error ? <ErrorNotice message={error} /> : null}
 
       <div className="flex flex-wrap gap-2">
-        <Button onClick={() => void confirm()} disabled={busy || missing.length > 0}>
+        <Button
+          onClick={() => void confirm()}
+          disabled={busy || rendering || missing.length > 0}
+        >
           {busy ? "Importing…" : "Confirm and import"}
         </Button>
         <Button variant="outline" onClick={() => void cancel()} disabled={busy}>

@@ -18,7 +18,7 @@ from pipeline.export import create_export, normalized_digest
 from pipeline.jobs import cancel_run, process_import_run
 from pipeline.models import OfferStatus, ReviewStatus, RunStatus
 from pipeline.review import answer_request, approve_run
-from pipeline.tests.test_parsing import HEADERS, make_workbook
+from pipeline.tests.test_parsing import HEADERS, force_fixture_provider, make_workbook
 from pipeline.uploads import create_upload
 
 User = get_user_model()
@@ -54,6 +54,7 @@ MIXED_ROWS = [
 @override_settings(PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])
 class PipelineFlowTests(TestCase):
     def setUp(self):
+        force_fixture_provider(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         file_override = override_settings(OFFERFLOW_FILE_ROOT=self.tmp.name)
@@ -804,6 +805,122 @@ class PipelineFlowTests(TestCase):
         )
         self.assertEqual(calls.count(), 1)
         self.assertEqual(calls[0].quantity, 14)
+
+    def test_message_segments_inherit_head_and_cover_all_rows(self):
+        from types import SimpleNamespace
+
+        from pipeline.jobs import _message_segments
+
+        head = ["Northstar Devices", "Available from 02 Nov", "P1+ - Like New"]
+        body = [
+            f"> Phone {i:02d} 128GB Black grade A warehouse {i} - {100 + i}"
+            for i in range(60)
+        ]
+        body.insert(45, "P9+ - Special Grade")
+        texts = head + body
+        rows = [
+            SimpleNamespace(index=i + 1, data={"message": text})
+            for i, text in enumerate(texts)
+        ]
+        segments, coverage = _message_segments(rows)
+        covered = [row.index for seg in segments for row in seg["rows"]]
+        self.assertEqual(sorted(covered), list(range(1, len(texts) + 1)))
+        self.assertGreater(len(segments), 1)
+        for seg in segments:
+            self.assertIn("Northstar Devices", seg["context"])
+            self.assertLessEqual(len(seg["context"]), 2000)
+        contexts = " ".join(seg["context"] for seg in segments)
+        self.assertIn("P9+ - Special Grade", contexts)
+        self.assertEqual(coverage["total_rows"], len(texts))
+        self.assertEqual(coverage["segments"], len(segments))
+        self.assertFalse(coverage["partial"])
+
+    def test_message_segments_flag_partial_when_head_overflows(self):
+        from types import SimpleNamespace
+
+        from pipeline.jobs import _message_segments
+
+        head = [
+            f"Supplier Metropolitan Trading Consortium division {i} " + "x" * 500
+            for i in range(5)
+        ]
+        texts = head + ["> Phone 18 Pro 256GB - 417"]
+        rows = [
+            SimpleNamespace(index=i + 1, data={"message": text})
+            for i, text in enumerate(texts)
+        ]
+        segments, coverage = _message_segments(rows)
+        self.assertTrue(coverage["partial"])
+        self.assertGreater(coverage["dropped_lines"], 0)
+        for seg in segments:
+            self.assertLessEqual(len(seg["context"]), 2000)
+        # Earliest head line (supplier identity) survives the squeeze.
+        self.assertIn("division 0", segments[0]["context"])
+
+    def test_long_message_interprets_every_segment(self):
+        from unittest import mock
+
+        lines = ["Northstar Devices", "Available from 02 Nov", "P1+ - Like New"]
+        lines += [
+            f"> Phone {i:02d} 128GB Black grade A warehouse {i} - {100 + i}"
+            for i in range(60)
+        ]
+        lines.insert(48, "P9+ - Special Grade")
+        text = "\n".join(lines) + "\n"
+        self.assertGreater(len(text), 2000)
+        uploaded = SimpleUploadedFile(
+            "pasted-text-20261102-160000.txt",
+            text.encode("utf-8"),
+            content_type="text/plain",
+        )
+        run = create_upload(
+            organization=self.org, user=self.user, uploaded_file=uploaded
+        )
+        run.mapping = {
+            "confirmed": {},
+            "constants": {
+                "supplier": "Northstar Devices",
+                "currency": "USD",
+                "grade": "P1+",
+            },
+            "ignored": [],
+            "free_text": True,
+        }
+        run.save(update_fields=["mapping", "updated_at"])
+        seen = []
+        fake = mock.Mock()
+        fake.name = "meta"
+        fake.is_simulated = False
+
+        def fake_interpret(payload, on_chunk=None):
+            seen.append(payload)
+            return {
+                "simulated": False,
+                "provider": "meta",
+                "model": "test-model",
+                "rows": [
+                    {"index": entry["index"], "fields": {"model": "Phone"}}
+                    for entry in payload["rows"]
+                ],
+            }
+
+        fake.interpret_table.side_effect = fake_interpret
+        with mock.patch("pipeline.jobs.get_provider", return_value=fake):
+            self.assertEqual(process_import_run(run.id), "ok")
+        self.assertGreater(len(seen), 1)
+        covered = {entry["index"] for payload in seen for entry in payload["rows"]}
+        expected = set(
+            run.source_rows.order_by("index").values_list("index", flat=True)
+        )
+        self.assertEqual(covered, expected)
+        self.assertTrue(
+            any("P9+ - Special Grade" in payload["context"] for payload in seen)
+        )
+        run.refresh_from_db()
+        coverage = run.mapping["context_coverage"]
+        self.assertEqual(coverage["segments"], len(seen))
+        self.assertEqual(coverage["total_rows"], len(lines))
+        self.assertFalse(coverage["partial"])
 
     def test_cancel_approved_run_refused(self):
         run = self.upload_and_process([HEADERS, row()])

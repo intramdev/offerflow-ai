@@ -207,7 +207,10 @@ def answer_request(*, review: ReviewRequest, user, choice: str = "", value=_MISS
         raise ValidationError(f"Unknown review kind {review.kind!r}.")
     offer.save()
 
-    status, gaps, reason = compute_offer_status(_offer_fields(offer))
+    policy = (review.run.mapping or {}).get("document_policy", "stock")
+    status, gaps, reason = compute_offer_status(
+        _offer_fields(offer), document_policy=policy
+    )
     offer.status = status
     offer.exclusion_reason = reason
     offer.save()

@@ -61,6 +61,63 @@ _GROUNDED_NUMERIC_CELLS = frozenset({"quantity", "capacity", "price"})
 _NUMBER_TOKEN_RE = re.compile(r"\d[\d.,]*")
 _PLAIN_NUMBER_RE = re.compile(r"^\d+(\.\d+)?$")
 
+# Optional cells the merge may adopt when the source left them empty.
+# They never create gaps, so they are handled outside the gap mapping.
+OPTIONAL_ADOPTABLE_CELLS = frozenset({"brand", "color", "conditions"})
+
+# A number glued to a storage unit is capacity, never stock: neither a
+# model proposal nor the quantity gate may read "256" from "256GB".
+_CAPACITY_TOKEN_RE = re.compile(r"(\d[\d.,]*)\s*(?:gb|tb|mb)\b", re.IGNORECASE)
+
+# Explicit stock markings. Under a confirmed terminal-price rule only a
+# marked number may become stock quantity; anything else stays unknown.
+_QUANTITY_MARK_RE = re.compile(
+    r"(?:\b(?:qty|quantity|pcs|pieces|units?|stock)(?:\s*:)?\s*\d"
+    r"|\b[x×]\s*\d"
+    r"|\d+\s*(?:pcs|pieces|units?)\b)",
+    re.IGNORECASE,
+)
+
+_TERMINAL_TRAILING_WORD_RE = re.compile(r"\s+[A-Za-z]{3}\s*$")
+_TERMINAL_TRAILING_PUNCT_RE = re.compile(r"[^\w]+$")
+_TERMINAL_NUMBER_RE = re.compile(r"(\d[\d.,]*)\s*$")
+_TERMINAL_SEPARATORS = frozenset([" ", "\t", ":", ";", "|", "-", ",", "–", "—", ">", "(", ")"])
+
+
+def has_quantity_marking(text: str) -> bool:
+    """Whether a line carries an explicit stock-quantity marking."""
+    return bool(_QUANTITY_MARK_RE.search(text or ""))
+
+
+def _strip_trailing_word(text: str) -> str:
+    """Drop one trailing 3-letter word such as a currency code."""
+    return _TERMINAL_TRAILING_WORD_RE.sub("", text)
+
+
+def terminal_amount(text: str) -> tuple[str, int, int] | None:
+    """Return the terminal number token and its source span, if resolvable.
+
+    The terminal token is the last number in the line once trailing
+    punctuation and one trailing 3-letter word (a currency code such as
+    "USD") are stripped. It must be separated from the text before it,
+    so "128GB" never resolves and model/capacity digits keep their own
+    roles. Returns (token, start, end) or None when no terminal number
+    can be bound to a span.
+    """
+    if not text or not isinstance(text, str):
+        return None
+    candidate = text.strip()
+    candidate = _TERMINAL_TRAILING_PUNCT_RE.sub("", candidate)
+    candidate = _strip_trailing_word(candidate)
+    candidate = _TERMINAL_TRAILING_PUNCT_RE.sub("", candidate)
+    match = _TERMINAL_NUMBER_RE.search(candidate)
+    if not match:
+        return None
+    start = match.start(1)
+    if start > 0 and candidate[start - 1] not in _TERMINAL_SEPARATORS:
+        return None
+    return match.group(1), start, match.end(1)
+
 
 def parse_capacity(raw) -> int | None:
     """Read whole gigabytes from values like 128, "128GB", "1TB", "1024MB".
@@ -270,7 +327,15 @@ def classify_lock(raw) -> str:
     return UNKNOWN
 
 
-def _proposal_grounded(proposal, message: str) -> bool:
+def _capacity_spans(message: str) -> list:
+    """Source spans of numbers glued to a storage unit (capacity role)."""
+    spans = []
+    for match in _CAPACITY_TOKEN_RE.finditer(message):
+        spans.append((match.start(1), match.end(1)))
+    return spans
+
+
+def _proposal_grounded(proposal, message: str, cell: str | None = None) -> bool:
     """Check that every number in a proposal occurs in the message line.
 
     Numbers compare digit-for-digit after stripping separators, so a
@@ -278,11 +343,20 @@ def _proposal_grounded(proposal, message: str) -> bool:
     Unambiguous plain numbers ("450.00" vs "450") also match by exact
     decimal equality. A proposal with no digits at all passes here —
     the normalizer either reads it or leaves the gap for a human.
+
+    Stock quantity proposals must additionally avoid the capacity role:
+    a number glued to GB/TB/MB never grounds "quantity", so "256" from
+    "256GB" cannot become stock.
     """
     tokens = _NUMBER_TOKEN_RE.findall("" if proposal is None else str(proposal))
     if not tokens:
         return True
-    line_tokens = _NUMBER_TOKEN_RE.findall(message)
+    excluded = _capacity_spans(message) if cell == "quantity" else []
+    line_tokens = []
+    for match in _NUMBER_TOKEN_RE.finditer(message):
+        if any(start <= match.start() < end for start, end in excluded):
+            continue
+        line_tokens.append(match.group(0))
     line_digits = {
         re.sub(r"\D", "", token)
         for token in line_tokens
@@ -309,7 +383,9 @@ def _plain_equal(left: str, right: str) -> bool:
         return False
 
 
-def merge_interpreted_cells(local_cells: dict, interpreted_cells: dict) -> dict:
+def merge_interpreted_cells(
+    local_cells: dict, interpreted_cells: dict, document_policy: str = "stock"
+) -> dict:
     """Fold a model proposal into source cells without overwriting reads.
 
     Only cells for fields the local read could not fill come from the
@@ -321,9 +397,14 @@ def merge_interpreted_cells(local_cells: dict, interpreted_cells: dict) -> dict:
     must additionally be grounded: every number in the proposal has to
     occur in the source line. An ungrounded proposal is dropped, leaving
     the gap open for a human instead of silently adopting invention.
+    Optional cells (brand, color, conditions) are adopted when the
+    source left them empty, so a correct proposal is preserved rather
+    than dropped for being optional.
     """
     fields = normalize_cells(local_cells)
-    _status, gaps, _reason = compute_offer_status(fields)
+    _status, gaps, _reason = compute_offer_status(
+        fields, document_policy=document_policy
+    )
     wanted = {
         GAP_CELL_FIELDS[gap["field"]]
         for gap in gaps
@@ -339,8 +420,17 @@ def merge_interpreted_cells(local_cells: dict, interpreted_cells: dict) -> dict:
         if (
             message is not None
             and key in _GROUNDED_NUMERIC_CELLS
-            and not _proposal_grounded(proposal, message)
+            and not _proposal_grounded(proposal, message, key)
         ):
+            continue
+        merged[key] = proposal
+    for key in OPTIONAL_ADOPTABLE_CELLS:
+        if key not in interpreted_cells:
+            continue
+        if str(local_cells.get(key) or "").strip():
+            continue
+        proposal = interpreted_cells[key]
+        if proposal is None or not str(proposal).strip():
             continue
         merged[key] = proposal
     return merged
@@ -391,7 +481,9 @@ def _short(raw) -> str:
     return text[:120]
 
 
-def compute_offer_status(fields: dict) -> tuple[str, list, str]:
+def compute_offer_status(
+    fields: dict, document_policy: str = "stock"
+) -> tuple[str, list, str]:
     """Decide ok/excluded/needs_input for normalized fields.
 
     Returns the status, the list of review gaps, and an exclusion reason.
@@ -399,6 +491,8 @@ def compute_offer_status(fields: dict) -> tuple[str, list, str]:
     Brand, color, and conditions are optional and never block release.
     Lock info that is simply absent also blocks nothing; only lock text
     that was provided but cannot be read asks for confirmation.
+    Under the price_only document policy an absent quantity stays unknown
+    instead of raising a gap; stock lists still require it.
     """
     from pipeline.models import OfferStatus
 
@@ -473,7 +567,7 @@ def compute_offer_status(fields: dict) -> tuple[str, list, str]:
                 "choices": [LOCKED, UNLOCKED],
             }
         )
-    if fields.get("quantity") is None:
+    if fields.get("quantity") is None and document_policy != "price_only":
         gaps.append(
             {
                 "field": "quantity",

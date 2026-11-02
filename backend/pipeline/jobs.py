@@ -93,6 +93,8 @@ def _ask_mapping(run: ImportRun, exc) -> None:
         "confirmed": {},
         "constants": stored.get("constants") or {},
         "ignored": stored.get("ignored") or [],
+        "sheet": stored.get("sheet"),
+        "sheets_omitted": stored.get("sheets_omitted", []),
     }
     if stored.get("free_text") is True:
         run.mapping["free_text"] = True
@@ -186,12 +188,27 @@ def remap_run(*, run: ImportRun, user, mapping: dict,
     transition_run(run, RunStatus.UPLOADED)
     run.error = ""
     run.save(update_fields=["error", "updated_at"])
+    from pipeline.previews import _supplier_hint
+
+    try:
+        hint_bytes = LocalFileAdapter(settings.OFFERFLOW_FILE_ROOT).read_bytes(
+            run.source_file.storage_key
+        )
+    except (AttributeError, OSError, ValueError):
+        hint_bytes = b""
     remember_mapping(
         organization=run.organization,
         headers=headers,
         mapping=effective,
         constants=clean_constants,
         ignored=clean_ignored,
+        supplier_hint=_supplier_hint(
+            hint_bytes,
+            run.source_file.original_name if run.source_file else "",
+            effective,
+            clean_constants,
+            sheet_name=stored.get("sheet"),
+        ),
     )
     record_audit(
         run.organization_id,
@@ -272,9 +289,17 @@ def _fail_unresolvable_run(run_id: int) -> None:
     which is also the only place this fallback can run); the
     restricted runtime fails closed and leaves the run untouched.
     """
+    import logging
+
     try:
         run = ImportRun.objects.get(pk=run_id)
     except ImportRun.DoesNotExist:
+        logging.getLogger(__name__).error(
+            "Run %s is unresolvable and invisible to the worker role; "
+            "leaving it untouched. If this persists, run "
+            "provision_runtime and check tenant provisioning.",
+            run_id,
+        )
         return
     if run.status in TERMINAL_STATUSES:
         return
@@ -375,6 +400,10 @@ def _parse_step(run: ImportRun) -> bool:
         effective, constants, run.organization.default_currency, ignored
     )
     free_text = stored.get("free_text") is True
+    if free_text:
+        return _parse_message_rows(
+            run, stored, content, constants, dict(merged)
+        )
     try:
         sheet = parse_upload(
             content,
@@ -386,7 +415,8 @@ def _parse_step(run: ImportRun) -> bool:
             column_constants=merged or None,
             ignored_columns=ignored or None,
             constant_sources=labels or None,
-            message_fallback=free_text,
+            message_fallback=False,
+            sheet_name=stored.get("sheet"),
         )
     except MappingRequired as exc:
         _ask_mapping(run, exc)
@@ -403,6 +433,8 @@ def _parse_step(run: ImportRun) -> bool:
         "constants": constants,
         "ignored": ignored,
         "applied_defaults": applied,
+        "sheet": sheet.sheet,
+        "sheets_omitted": stored.get("sheets_omitted", []),
     }
     if free_text:
         run.mapping["free_text"] = True
@@ -425,23 +457,200 @@ def _parse_step(run: ImportRun) -> bool:
     return False
 
 
+def _parse_message_rows(run, stored: dict, content: bytes, constants: dict,
+                        merged: dict) -> bool:
+    """Build message-lane source rows from the confirmed draft revision.
+
+    Records, joins, section values, and terminal derivation come from
+    the same derive_record_cells the preview rendered, and the derived
+    record set must equal the snapshot confirm stored: the worker
+    imports exactly what the user reviewed, never a fresh independent
+    extraction. Direct uploads without a preview confirm derive with no
+    rules, so every non-blank line becomes one candidate record.
+    """
+    from pipeline.draft import derive_record_cells, terminal_scope_lines
+    from pipeline.parsing import MESSAGE_COLUMN
+
+    lines = content.decode("utf-8", errors="replace").split("\n")
+    rules = stored.get("draft_rules") or []
+    try:
+        derived = derive_record_cells(lines, rules)
+    except KeyError as exc:
+        raise ValueError(
+            "Confirmed draft rules are unreadable; remap to continue."
+        ) from exc
+    snapshot = stored.get("record_lines")
+    if snapshot is not None:
+        current = [
+            {"id": record_id, "lines": info["lines"]}
+            for record_id, info in derived.items()
+        ]
+        if current != snapshot:
+            raise ValueError(
+                "Confirmed draft does not match the stored source; refusing "
+                "to import. Remap to continue."
+            )
+    covered = terminal_scope_lines(lines, rules)
+    explicit = set((constants or {}))
+    sheet_name = run.source_file.original_name if run.source_file else ""
+    rows = []
+    for record_id, info in derived.items():
+        first = info["lines"][0]
+        data = {"message": "\n".join(lines[n - 1] for n in info["lines"])}
+        data.update(merged)
+        for name, value in info["cells"].items():
+            # Explicit confirm-time values win; confirmed draft values
+            # win over the organization currency default.
+            if name not in explicit:
+                data[name] = value
+        provenance = {
+            "sheet": sheet_name,
+            "row": first,
+            "record": record_id,
+            "lines": info["lines"],
+        }
+        if info["terminal"] is not None:
+            provenance["terminal"] = info["terminal"]
+        if first in covered:
+            provenance["terminal_scope"] = True
+        rows.append(
+            SourceRow(
+                organization_id=run.organization_id,
+                run=run,
+                index=first,
+                sheet=sheet_name,
+                data=data,
+                provenance=provenance,
+            )
+        )
+    applied = {
+        key: value
+        for key, value in (stored.get("applied_defaults") or {}).items()
+    }
+    if not applied and merged.keys() - explicit:
+        applied = {
+            key: merged[key] for key in merged.keys() - explicit
+        }
+    if applied.get("currency") and all(
+        "currency" in info["cells"] for info in derived.values()
+    ):
+        # A confirmed rule supplied every currency; the org default
+        # filled nothing, so it must not be reported as applied.
+        del applied["currency"]
+    run.mapping = {
+        "headers": stored.get("headers") or [MESSAGE_COLUMN],
+        "detected": stored.get("detected") or {MESSAGE_COLUMN: 0},
+        "confirmed": stored.get("confirmed") or {},
+        "constants": constants,
+        "ignored": stored.get("ignored") or [],
+        "applied_defaults": applied,
+        "sheet": stored.get("sheet"),
+        "sheets_omitted": stored.get("sheets_omitted", []),
+        "free_text": True,
+        "draft_revision": stored.get("draft_revision"),
+        "draft_rules": rules,
+        "record_lines": snapshot
+        if snapshot is not None
+        else [
+            {"id": record_id, "lines": info["lines"]}
+            for record_id, info in derived.items()
+        ],
+        "excluded_lines": stored.get("excluded_lines") or [],
+        "document_policy": stored.get("document_policy", "stock"),
+    }
+    run.save(update_fields=["mapping", "updated_at"])
+    SourceRow.objects.filter(run=run).delete()
+    SourceRow.objects.bulk_create(rows)
+    transition_run(run, RunStatus.INTERPRETATION)
+    return False
+
+
 # Pasted lines quoted back to the model as shared interpretation context,
-# so header lines (supplier name, date) inform every product row. Cut on a
-# line boundary; the provider refuses over-cap calls rather than guessing.
+# so header lines (supplier name, date) inform every product row. Long
+# pastes split into segments on line boundaries; every segment inherits
+# the document head and every row belongs to exactly one segment. The
+# coverage record says what the model saw. Context is auxiliary — rows
+# always travel as data — but when even head + one segment overflows the
+# budget, oldest non-head lines drop first and coverage.partial turns
+# True instead of silently claiming a complete read.
 MESSAGE_CONTEXT_CHARS = 2000
+MESSAGE_HEAD_LINES = 5
 
 
-def _message_context(rows) -> str:
-    lines = []
+def _message_segments(rows) -> tuple[list, dict]:
+    """Split message rows into headed context segments with coverage.
+
+    Returns (segments, coverage). Each segment holds its rows plus the
+    context string to send alongside them. Coverage records segment
+    counts and whether any context line had to be dropped (partial).
+    """
+    rows = list(rows)
+    texts = {}
     for row in rows:
-        text = (row.data or {}).get("message")
-        if isinstance(text, str) and text.strip():
-            lines.append(text.strip())
-    context = "\n".join(lines)
-    if len(context) > MESSAGE_CONTEXT_CHARS:
-        cut = context.rfind("\n", 0, MESSAGE_CONTEXT_CHARS)
-        context = context[: cut if cut > 0 else MESSAGE_CONTEXT_CHARS]
-    return context
+        raw = (row.data or {}).get("message")
+        texts[id(row)] = (
+            raw.strip() if isinstance(raw, str) and raw.strip() else ""
+        )
+    head_rows = [row for row in rows if texts[id(row)]][:MESSAGE_HEAD_LINES]
+    head_ids = {id(row) for row in head_rows}
+    head_chars = sum(len(texts[id(row)]) + 1 for row in head_rows)
+    pack_budget = MESSAGE_CONTEXT_CHARS - head_chars
+    if pack_budget < MESSAGE_CONTEXT_CHARS // 4:
+        pack_budget = MESSAGE_CONTEXT_CHARS // 4
+    segments: list = []
+    current: list = []
+    current_chars = 0
+    for row in rows:
+        size = len(texts[id(row)]) + 1
+        if current and current_chars + size > pack_budget:
+            segments.append(current)
+            current = []
+            current_chars = 0
+        current.append(row)
+        current_chars += size
+    if current or not segments:
+        segments.append(current)
+    built = []
+    dropped_lines = 0
+    for seg in segments:
+        picked = [(row, texts[id(row)]) for row in head_rows]
+        picked += [
+            (row, texts[id(row)])
+            for row in seg
+            if texts[id(row)] and id(row) not in head_ids
+        ]
+        initial = len(picked)
+        while picked and len("\n".join(text for _, text in picked)) > MESSAGE_CONTEXT_CHARS:
+            drop_at = next(
+                (
+                    pos
+                    for pos, (row, _text) in enumerate(picked)
+                    if id(row) not in head_ids
+                ),
+                None,
+            )
+            if drop_at is None:
+                drop_at = len(picked) - 1
+            picked.pop(drop_at)
+        dropped_here = initial - len(picked)
+        dropped_lines += dropped_here
+        built.append(
+            {
+                "rows": seg,
+                "context": "\n".join(text for _, text in picked),
+                "dropped_lines": dropped_here,
+            }
+        )
+    coverage = {
+        "strategy": "segmented",
+        "segments": len(built),
+        "total_rows": len(rows),
+        "message_rows": sum(1 for row in rows if texts[id(row)]),
+        "head_lines": len(head_rows),
+        "partial": dropped_lines > 0,
+        "dropped_lines": dropped_lines,
+    }
+    return built, coverage
 
 
 def _is_message_row(row) -> bool:
@@ -449,9 +658,54 @@ def _is_message_row(row) -> bool:
     return isinstance(text, str) and bool(text.strip())
 
 
-def _interpret_step(run: ImportRun) -> None:
-    from common.meta import ProviderError as MetaProviderError
+def _constrain_proposals(interpreted: dict, rows, *, allowed: set,
+                         has_marking) -> None:
+    """Enforce confirmed numeric roles on model proposals, in place.
 
+    Unknown proposal keys are dropped and listed under "_unsupported".
+    On terminal-scoped lines a proposed stock quantity survives only
+    with an explicit stock marking on the line; anything else is popped
+    into "_dropped" with its reason, leaving the gap for a human. Both
+    markers travel into offer.interpreted, so the run detail shows what
+    the model tried and why the application refused it.
+    """
+    by_index = {row.index: row for row in rows}
+    for index, proposal in interpreted.items():
+        if not isinstance(proposal, dict):
+            continue
+        unsupported = sorted(
+            key
+            for key in proposal
+            if not key.startswith("_") and key not in allowed
+        )
+        for key in unsupported:
+            del proposal[key]
+        if unsupported:
+            proposal["_unsupported"] = unsupported
+        row = by_index.get(index)
+        if row is None or "quantity" not in proposal:
+            continue
+        if not (row.provenance or {}).get("terminal_scope"):
+            continue
+        text = (row.data or {}).get("message") or ""
+        if has_marking(text):
+            continue
+        dropped = proposal.setdefault("_dropped", {})
+        dropped["quantity"] = {
+            "value": proposal.pop("quantity"),
+            "reason": (
+                "terminal_price rule: the line carries no stock marking, "
+                "so no number on it may become stock."
+            ),
+        }
+
+
+def _interpret_step(run: ImportRun) -> None:
+    from common.meta import FIELDS as MODEL_FIELDS
+    from common.meta import ProviderError as MetaProviderError
+    from pipeline.normalize import has_quantity_marking
+
+    policy = (run.mapping or {}).get("document_policy", "stock")
     rows = list(run.source_rows.order_by("index"))
     # Local-first: the model copies the same cells the localizer reads, so
     # rows that normalize cleanly never need a paid call. Only gap rows go
@@ -461,12 +715,15 @@ def _interpret_step(run: ImportRun) -> None:
     for row in rows:
         cells = dict(row.data or {})
         fields = normalize_cells(cells)
-        status, gaps, reason = compute_offer_status(fields)
+        status, gaps, reason = compute_offer_status(
+            fields, document_policy=policy
+        )
         local[row.index] = (cells, fields, status, gaps, reason)
         if gaps:
             gap_rows.append(row)
     interpreted = None
     non_product: set = set()
+    coverage = None
     if not gap_rows:
         provider_name, simulated = "local", True
     else:
@@ -480,11 +737,40 @@ def _interpret_step(run: ImportRun) -> None:
         run.provider_name = provider_name
         run.simulated = simulated
         run.save(update_fields=["provider_name", "simulated", "updated_at"])
-        payload = {
-            "rows": [{"index": row.index, "data": row.data} for row in gap_rows]
-        }
+        payloads = []
         if (run.mapping or {}).get("free_text") is True:
-            payload["context"] = _message_context(rows)
+            segments, coverage = _message_segments(rows)
+            stored = run.mapping or {}
+            stored["context_coverage"] = coverage
+            run.mapping = stored
+            run.save(update_fields=["mapping", "updated_at"])
+            owner = {
+                id(row): pos for pos, seg in enumerate(segments) for row in seg["rows"]
+            }
+            grouped: list = [[] for _ in segments]
+            for row in gap_rows:
+                grouped[owner[id(row)]].append(row)
+            for pos, seg_rows in enumerate(grouped):
+                if not seg_rows:
+                    continue
+                payloads.append(
+                    {
+                        "rows": [
+                            {"index": row.index, "data": row.data}
+                            for row in seg_rows
+                        ],
+                        "context": segments[pos]["context"],
+                    }
+                )
+        else:
+            payloads.append(
+                {
+                    "rows": [
+                        {"index": row.index, "data": row.data}
+                        for row in gap_rows
+                    ]
+                }
+            )
 
         provider_model = getattr(getattr(provider, "_config", None), "model", "")
         if not isinstance(provider_model, str):
@@ -513,22 +799,30 @@ def _interpret_step(run: ImportRun) -> None:
             if cancelled:
                 raise RunCancelled(f"Run {run.id} was cancelled.")
 
-        result = provider.interpret_table(payload, on_chunk=_note_chunk)
-        if not result.get("simulated", True):
-            interpreted = {
-                item["index"]: item.get("fields", {})
-                for item in result.get("rows", [])
-            }
-            non_product = {
-                item["index"]
-                for item in result.get("rows", [])
-                if item.get("is_product") is False
-            }
+        any_real = False
+        merged: dict = {}
+        excluded: set = set()
+        for payload in payloads:
+            result = provider.interpret_table(payload, on_chunk=_note_chunk)
+            if result.get("simulated", True):
+                continue
+            any_real = True
+            for item in result.get("rows", []):
+                merged[item["index"]] = item.get("fields", {})
+                if item.get("is_product") is False:
+                    excluded.add(item["index"])
+        if any_real:
+            interpreted = merged
+            non_product = excluded
             for row in gap_rows:
                 if row.index not in interpreted:
                     raise MetaProviderError(
                         f"Model omitted row {row.index}; refusing partial use."
                     )
+            _constrain_proposals(
+                interpreted, rows, allowed=set(MODEL_FIELDS),
+                has_marking=has_quantity_marking,
+            )
             # Spend and progress were recorded live per chunk via the
             # callback, so even a later-failing run keeps its honest
             # partial accounting.
@@ -545,6 +839,7 @@ def _interpret_step(run: ImportRun) -> None:
             "provider": provider_name,
             "simulated": simulated,
             "model_rows": len(gap_rows),
+            "context_coverage": coverage or {},
         },
     )
     NormalizedOffer.objects.filter(run=run).delete()
@@ -554,14 +849,20 @@ def _interpret_step(run: ImportRun) -> None:
     for row in rows:
         if interpreted is not None and row.index in interpreted:
             cells = merge_interpreted_cells(
-                dict(row.data), interpreted[row.index]
+                dict(row.data), interpreted[row.index],
+                document_policy=policy,
             )
             fields = normalize_cells(cells)
-            status, gaps, reason = compute_offer_status(fields)
-            if row.index in non_product and _is_message_row(row):
+            status, gaps, reason = compute_offer_status(
+                fields, document_policy=policy
+            )
+            scoped = bool((row.provenance or {}).get("terminal_scope"))
+            if row.index in non_product and _is_message_row(row) and not scoped:
                 # Header, title, date, or note line: set aside visibly as
                 # an excluded offer, never silently dropped. Spreadsheet
-                # rows ignore the flag — mapped cells are products.
+                # rows ignore the flag — mapped cells are products — and
+                # so do terminal-scoped lines, whose product standing the
+                # user already confirmed with a terminal-price rule.
                 status = OfferStatus.EXCLUDED
                 gaps = []
                 reason = "Line carries no product offer (header or note)."

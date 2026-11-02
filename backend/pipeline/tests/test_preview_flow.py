@@ -17,7 +17,12 @@ from pipeline.models import (
     RunStatus,
     SourceFile,
 )
-from pipeline.tests.test_parsing import HEADERS, make_workbook
+from pipeline.tests.test_parsing import (
+    HEADERS,
+    force_fixture_provider,
+    make_workbook,
+    two_sheet_workbook,
+)
 
 User = get_user_model()
 
@@ -40,6 +45,7 @@ def odd_row():
 )
 class PreviewFlowTests(TestCase):
     def setUp(self):
+        force_fixture_provider(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         file_override = override_settings(OFFERFLOW_FILE_ROOT=self.tmp.name)
@@ -136,8 +142,12 @@ class PreviewFlowTests(TestCase):
         self.assertTrue(second.data["samples"]["complete"])
         confirm2 = self._confirm(second.data["key"], second.data["proposed"])
         self.assertEqual(confirm2.status_code, 201, confirm2.content)
-        memory = ColumnMappingMemory.objects.get()
-        self.assertEqual(memory.use_count, 2)
+        # Each supplier keeps its own profile: the second confirm seeds
+        # Beta's row instead of overwriting Acme's.
+        hints = set(
+            ColumnMappingMemory.objects.values_list("supplier_hint", flat=True)
+        )
+        self.assertEqual(hints, {"Acme", "Beta"})
 
     def test_render_adjusts_samples(self):
         preview = self._preview(self.alice, self.org_a, [ODD_HEADERS, odd_row()])
@@ -245,15 +255,23 @@ class PreviewFlowTests(TestCase):
                 format="json",
             )
         self.assertEqual(confirm.status_code, 201, confirm.content)
-        # The remembered message mapping must not poison the next paste:
-        # no synthetic column leaks back in as a mappable position.
+        # An unrelated paste names no supplier, so no profile applies:
+        # the remembered supplier must not leak across suppliers.
         second = self._paste(self.alice, self.org_a, "Galaxy S24 256GB 520\n")
         self.assertEqual(second.status_code, 201, second.content)
         self.assertTrue(second.data["message_lines"])
         self.assertEqual(second.data["proposed"], {})
-        self.assertEqual(
-            second.data["proposed_constants"].get("supplier"), "Acme"
+        self.assertIsNone(second.data["memory"])
+        self.assertNotIn("supplier", second.data["proposed_constants"])
+        # Once the same supplier is known, its profile returns visibly.
+        render = self.client.post(
+            f"/api/pipeline/previews/{second.data['key']}/render/",
+            {"mapping": {}, "constants": {"supplier": "Acme"}},
+            format="json",
         )
+        self.assertEqual(render.status_code, 200, render.content)
+        self.assertEqual(render.data["memory"]["supplier_hint"], "Acme")
+        self.assertIn("Saved profile", render.data["memory"]["reason"])
 
     def test_duplicate_bytes_refused_on_second_preview(self):
         content = make_workbook([HEADERS, complete_row()])
@@ -566,3 +584,155 @@ class PreviewFlowTests(TestCase):
             format="json",
         )
         self.assertEqual(bad.status_code, 400)
+
+
+@override_settings(
+    PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"],
+    CELERY_TASK_ALWAYS_EAGER=True,
+    CELERY_TASK_EAGER_PROPAGATES=True,
+)
+class PreviewSheetTests(TestCase):
+    """Multi-sheet discovery/selection and the message-candidate offer."""
+
+    def setUp(self):
+        force_fixture_provider(self)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        file_override = override_settings(OFFERFLOW_FILE_ROOT=self.tmp.name)
+        file_override.enable()
+        self.addCleanup(file_override.disable)
+        self.alice = User.objects.create_user(
+            username="alice", email="alice@example.test", password="x"
+        )
+        self.org_a = Organization.objects.create(name="Org A")
+        Membership.objects.create(
+            user=self.alice, organization=self.org_a, role="owner"
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.alice)
+
+    def _preview_bytes(self, content, name="sup.xlsx"):
+        return self.client.post(
+            "/api/pipeline/previews/",
+            {
+                "organization_id": self.org_a.id,
+                "file": SimpleUploadedFile(name, content, CONTENT_TYPE),
+            },
+            format="multipart",
+        )
+
+    def test_preview_reports_selection_and_omission(self):
+        response = self._preview_bytes(two_sheet_workbook())
+        self.assertEqual(response.status_code, 201, response.content)
+        sheets = response.data["sheets"]
+        self.assertEqual(sheets["selected"], "Phones")
+        self.assertEqual(sheets["omitted"], ["Tablets"])
+        self.assertEqual(
+            [entry["name"] for entry in sheets["available"]],
+            ["Phones", "Tablets"],
+        )
+        self.assertIn("Tablets", sheets["notice"])
+        rows = response.data["samples"]["rows"]
+        self.assertEqual(rows[0]["cells"]["supplier"], "PhoneCo")
+
+    def test_render_switches_sheet_and_resets_mapping(self):
+        key = self._preview_bytes(two_sheet_workbook()).data["key"]
+        response = self.client.post(
+            f"/api/pipeline/previews/{key}/render/",
+            {"mapping": {}, "sheet": "Tablets"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertIn("switched", response.data)
+        self.assertEqual(response.data["sheets"]["selected"], "Tablets")
+        self.assertEqual(response.data["sheets"]["omitted"], ["Phones"])
+        rows = response.data["samples"]["rows"]
+        self.assertEqual(rows[0]["cells"]["supplier"], "TabCo")
+
+    def test_render_unknown_sheet_refused(self):
+        key = self._preview_bytes(two_sheet_workbook()).data["key"]
+        response = self.client.post(
+            f"/api/pipeline/previews/{key}/render/",
+            {"mapping": {}, "sheet": "Nope"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Phones, Tablets", response.data["detail"])
+
+    def test_confirm_switched_sheet_imports_tablets(self):
+        key = self._preview_bytes(two_sheet_workbook()).data["key"]
+        switched = self.client.post(
+            f"/api/pipeline/previews/{key}/render/",
+            {"mapping": {}, "sheet": "Tablets"},
+            format="json",
+        )
+        self.assertEqual(switched.status_code, 200, switched.content)
+        with self.captureOnCommitCallbacks(execute=True):
+            confirm = self.client.post(
+                f"/api/pipeline/previews/{key}/confirm/",
+                {"mapping": {}},
+                format="json",
+            )
+        self.assertEqual(confirm.status_code, 201, confirm.content)
+        run = ImportRun.objects.get(pk=confirm.data["id"])
+        self.assertEqual(run.mapping["sheet"], "Tablets")
+        self.assertEqual(run.mapping["sheets_omitted"], ["Phones"])
+        offers = self.client.get(f"/api/pipeline/runs/{run.id}/offers/")
+        self.assertEqual(offers.data[0]["supplier"], "TabCo")
+        self.assertEqual(offers.data[0]["model_name"], "T1")
+
+    def test_direct_upload_records_sheet_and_omission(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            upload = self.client.post(
+                "/api/pipeline/uploads/",
+                {
+                    "organization_id": self.org_a.id,
+                    "file": SimpleUploadedFile(
+                        "sup.xlsx", two_sheet_workbook(), CONTENT_TYPE
+                    ),
+                },
+                format="multipart",
+            )
+        self.assertEqual(upload.status_code, 201, upload.content)
+        run = ImportRun.objects.get(pk=upload.data["id"])
+        self.assertEqual(run.mapping["sheet"], "Phones")
+        self.assertEqual(run.mapping["sheets_omitted"], ["Tablets"])
+        offers = self.client.get(f"/api/pipeline/runs/{run.id}/offers/")
+        self.assertEqual(offers.data[0]["supplier"], "PhoneCo")
+
+    def test_headerless_txt_upload_offers_message_import(self):
+        text = "iPhone 15 128GB Black 450\nGalaxy S24 256GB 520\n"
+        response = self.client.post(
+            "/api/pipeline/previews/",
+            {
+                "organization_id": self.org_a.id,
+                "file": SimpleUploadedFile("chat.txt", text.encode(), "text/plain"),
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertTrue(response.data["message_candidate"])
+        self.assertEqual(response.data["text"], text)
+        self.assertFalse(response.data["truncated"])
+        self.assertIn("message", response.data["explanation"])
+        paste = self.client.post(
+            "/api/pipeline/previews/from-text/",
+            {"organization_id": self.org_a.id, "text": response.data["text"]},
+            format="json",
+        )
+        self.assertEqual(paste.status_code, 201, paste.content)
+        self.assertTrue(paste.data["message_lines"])
+
+    def test_tabular_csv_without_headers_stays_refusal(self):
+        response = self.client.post(
+            "/api/pipeline/previews/",
+            {
+                "organization_id": self.org_a.id,
+                "file": SimpleUploadedFile(
+                    "grid.csv", b"a,b,c\n1,2,3\n", "text/csv"
+                ),
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("No header row", response.data["detail"])

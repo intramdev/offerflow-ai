@@ -536,6 +536,91 @@ export interface PreviewSamples {
   rows: SampleRow[];
 }
 
+export interface PreviewSheetEntry {
+  name: string;
+  kind: "worksheet" | "table" | "text";
+  visible: boolean;
+  rows: number | null;
+  cols: number | null;
+}
+
+export interface PreviewSheets {
+  available: PreviewSheetEntry[];
+  selected: string | null;
+  omitted: string[];
+  notice: string | null;
+}
+
+export interface DraftRecordField {
+  value: string | number | null;
+  state: "unknown" | "user_confirmed" | "model_proposed" | "default_proposed" | "conflicting" | "excluded";
+  by: string | null;
+  rule: string | null;
+}
+
+export interface DraftRecord {
+  id: string;
+  lines: number[];
+  class: string;
+  section: number | null;
+  fields: Record<string, DraftRecordField>;
+}
+
+export interface DraftRule {
+  id?: string;
+  kind: string;
+  field?: string;
+  value?: string | number | null;
+  lines?: number[];
+  class?: string;
+  currency?: string;
+  scope?: string | { section_header_line: number };
+  header_line?: number;
+  header_text?: string;
+  label?: string;
+  record?: string;
+  policy?: string;
+  rule?: string;
+  reason?: string;
+}
+
+export interface DraftIssue {
+  scope: "document" | "record";
+  field: string;
+  record?: string;
+  reason: string;
+}
+
+export interface DraftSection {
+  header_line: number;
+  stop: number | null;
+  records: string[];
+}
+
+export interface DraftHistoryEntry {
+  revision: number;
+  at: string;
+  by: number;
+  summary: string;
+  operations: AssistOperation[];
+}
+
+export interface DraftBlock {
+  revision: number;
+  document_policy: "stock" | "price_only";
+  rules: DraftRule[];
+  excluded_lines: number[];
+  records: DraftRecord[];
+  unresolved: DraftIssue[];
+  sections: DraftSection[];
+  history: DraftHistoryEntry[];
+}
+
+export interface AssistOperation {
+  op: string;
+  [key: string]: unknown;
+}
+
 export interface Preview {
   key: string;
   filename: string;
@@ -553,17 +638,34 @@ export interface Preview {
   proposed_constants: Record<string, string | number>;
   proposed_ignored: string[];
   samples: PreviewSamples;
+  sheets: PreviewSheets;
+  draft: DraftBlock;
+}
+
+export interface MessageCandidate {
+  message_candidate: true;
+  filename: string;
+  text: string;
+  truncated: boolean;
+  total_chars: number;
+  explanation: string;
+}
+
+export function isMessageCandidate(
+  value: Preview | MessageCandidate,
+): value is MessageCandidate {
+  return (value as MessageCandidate).message_candidate === true;
 }
 
 export async function createPreview(
   organizationId: number,
   file: File,
-): Promise<Preview> {
+): Promise<Preview | MessageCandidate> {
   // No explicit Content-Type: the browser sets the multipart boundary.
   const form = new FormData();
   form.append("organization_id", String(organizationId));
   form.append("file", file);
-  return api<Preview>("/api/pipeline/previews/", { method: "POST", body: form });
+  return api<Preview | MessageCandidate>("/api/pipeline/previews/", { method: "POST", body: form });
 }
 
 export async function createPreviewFromText(
@@ -577,11 +679,20 @@ export async function createPreviewFromText(
   });
 }
 
+export interface RenderSwitched {
+  headers: HeaderEntry[];
+  detected: Record<string, number>;
+  missing: string[];
+  total_rows: number;
+}
+
 export interface RenderResult {
   mapping: Record<string, number>;
   constants: Record<string, string | number>;
   ignored: string[];
   samples: PreviewSamples;
+  sheets: PreviewSheets;
+  switched?: RenderSwitched;
 }
 
 export async function renderPreview(
@@ -589,11 +700,12 @@ export async function renderPreview(
   mapping: Record<string, number>,
   constants: Record<string, string> = {},
   ignored: string[] = [],
+  sheet?: string,
 ): Promise<RenderResult> {
   return api(`/api/pipeline/previews/${key}/render/`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mapping, constants, ignored }),
+    body: JSON.stringify({ mapping, constants, ignored, sheet }),
   });
 }
 
@@ -602,11 +714,13 @@ export async function confirmPreview(
   mapping: Record<string, number>,
   constants: Record<string, string> = {},
   ignored: string[] = [],
+  sheet?: string | null,
+  revision?: number | null,
 ): Promise<Run> {
   return api<Run>(`/api/pipeline/previews/${key}/confirm/`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mapping, constants, ignored }),
+    body: JSON.stringify({ mapping, constants, ignored, sheet, revision }),
   });
 }
 
@@ -618,11 +732,20 @@ export interface PreviewAssistProposal {
   set_constants: Record<string, string>;
   drop_lines: number[];
   dropped_previews: { line: number; text: string }[];
+  operations: AssistOperation[];
+}
+
+export interface PreviewAssistCoverage {
+  scope: string;
+  lines_shown: number;
+  total_rows: number;
+  truncated: boolean;
 }
 
 export interface PreviewAssistReply {
   message: string;
   proposal: PreviewAssistProposal;
+  context_coverage?: PreviewAssistCoverage;
   tokens: number;
   retriable?: boolean;
   hint?: string;
@@ -641,13 +764,18 @@ export async function assistPreview(
 }
 
 export interface PreviewAssistApplied {
-  applied: PreviewAssistProposal;
+  applied: PreviewAssistProposal & { revision: number };
   preview: Preview;
 }
 
 export async function applyPreviewAssist(
   key: string,
-  proposal: { set_constants: Record<string, string>; drop_lines: number[] },
+  proposal: {
+    set_constants: Record<string, string>;
+    drop_lines: number[];
+    operations?: AssistOperation[];
+    revision?: number | null;
+  },
 ): Promise<PreviewAssistApplied> {
   return api<PreviewAssistApplied>(
     `/api/pipeline/previews/${key}/assist/apply/`,

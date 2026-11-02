@@ -114,22 +114,24 @@ def _sdk_error(cls, message):
 
 
 def _one_row_cap(rows) -> int:
-    """Input cap that fits the system prompt plus exactly one row.
+    """Input cap that fits system prompt, schema, plus exactly one row.
 
-    Derived from the live prompt so prompt wording can evolve without
-    silently changing what the chunking tests exercise: every row still
-    travels alone, and any second row still forces a new chunk.
+    Derived from the live prompt and schema so wording can evolve
+    without silently changing what the chunking tests exercise: every
+    row still travels alone, and any second row still forces a new
+    chunk.
     """
-    from common.meta import SYSTEM_PROMPT
-    from pipeline.spending import estimate_text_tokens
+    from common.meta import RESPONSE_SCHEMA, SYSTEM_PROMPT
+    from pipeline.spending import estimate_schema_tokens, estimate_text_tokens
 
     system = estimate_text_tokens(SYSTEM_PROMPT)
+    schema = estimate_schema_tokens(RESPONSE_SCHEMA)
     widest = max(
         estimate_text_tokens(json.dumps(row, separators=(",", ":"))) + 1
         for row in rows
     )
-    cap = system + widest + 5
-    assert cap < system + 2 * widest, "cap must still force one row per chunk"
+    cap = system + schema + widest + 5
+    assert cap < system + schema + 2 * widest, "cap must force one row per chunk"
     return cap
 
 
@@ -571,6 +573,69 @@ class ReservationLifecycleTests(SpendingTests):
         with self.assertRaises(ValueError):
             estimate_request_tokens(texts=["x"], max_output_tokens=-1)
 
+    def test_estimate_bounds_non_latin_conservatively(self):
+        from pipeline.spending import estimate_text_tokens
+
+        # ASCII keeps the documented ceil(n/3) bound.
+        self.assertEqual(estimate_text_tokens("x" * 12), 4)
+        # Non-ASCII scripts (CJK, emoji, accented) commonly cost at
+        # least one token per character under BPE, so each counts two.
+        self.assertEqual(estimate_text_tokens("日本語テスト"), 12)
+        self.assertEqual(estimate_text_tokens("📱" * 4), 8)
+        self.assertEqual(estimate_text_tokens("abc日本語"), 7)
+        self.assertEqual(estimate_text_tokens("café ¥42000"), 7)
+
+    def test_request_estimate_accounts_for_response_schema(self):
+        from pipeline.spending import (
+            REQUEST_OVERHEAD_TOKENS,
+            estimate_request_tokens,
+            estimate_text_tokens,
+        )
+
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+        total = estimate_request_tokens(
+            texts=["system", "user payload"],
+            max_output_tokens=2000,
+            schema=schema,
+        )
+        self.assertEqual(
+            total,
+            estimate_text_tokens("system")
+            + estimate_text_tokens("user payload")
+            + 2000
+            + REQUEST_OVERHEAD_TOKENS
+            + estimate_text_tokens(json.dumps(schema, sort_keys=True)),
+        )
+
+    def test_dispatch_reservation_includes_schema(self):
+        from common.meta import RESPONSE_SCHEMA, SYSTEM_PROMPT
+        from pipeline.spending import estimate_text_tokens
+
+        max_output = 2000
+        body = {"rows": [{"index": 0, "data": {"a": 1}}]}
+        user_content = json.dumps(body, separators=(",", ":"))
+        # A budget covering the old schema-blind math must now refuse:
+        # the serialized response schema also travels on the request.
+        old_math = (
+            estimate_text_tokens(SYSTEM_PROMPT)
+            + estimate_text_tokens(user_content)
+            + max_output
+            + 64
+        )
+        schema_tokens = estimate_text_tokens(
+            json.dumps(RESPONSE_SCHEMA, sort_keys=True)
+        )
+        self.assertGreater(schema_tokens, 0)
+        self.allow(old_math)
+        script = _FakeResponse(
+            json.dumps({"rows": []}), _FakeUsage(10, 5)
+        )
+        provider, _holder = self.provider(script, max_output_tokens=max_output)
+        with self.assertRaises(ProviderError):
+            provider.interpret_table(
+                {"rows": [{"index": 0, "data": {"a": 1}}]}
+            )
+
     def test_reservation_covers_full_permitted_call(self):
         self.allow(100000)
         body = json.dumps({"rows": []})
@@ -753,7 +818,7 @@ class AssistEnvelopeTests(SpendingTests):
         # Dropping a grade banner would destroy the grades the
         # importer inherits from it; pin the preservation rule.
         self.assertIn("Never propose dropping section headers", ASSIST_PREVIEW_SYSTEM_PROMPT)
-        self.assertIn("would lose the values", ASSIST_PREVIEW_SYSTEM_PROMPT)
+        self.assertIn("confirm them with section_value instead", ASSIST_PREVIEW_SYSTEM_PROMPT)
 
     def test_assist_parses_constant_pairs(self):
         self.allow(100000)

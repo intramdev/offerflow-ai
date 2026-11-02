@@ -5,7 +5,7 @@ import tempfile
 from unittest import mock
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 from rest_framework.test import APIClient
 
 from common.meta import ASSISTANT_REFUSAL, MetaProvider, ProviderError
@@ -140,6 +140,51 @@ class PreviewAssistTests(TestCase):
         )
         self.assertEqual(render.status_code, 200, render.content)
         self.assertEqual(len(render.data["samples"]["rows"]), 4)
+
+    def test_assist_reports_context_coverage(self):
+        from organizations.models import AIProviderConfig as _Config
+
+        _Config.objects.create(model="admin-model")
+        long_paste = (
+            "\n".join(
+                f"line {i} iPhone 15 128GB {400 + i}" for i in range(50)
+            )
+            + "\n"
+        )
+        key = self._paste(self.alice, self.org_a, long_paste).data["key"]
+
+        def _fake(payload, on_chunk=None):
+            on_chunk(1, 1, 30, 12)
+            return self._envelope()
+
+        with self._paid_env(), mock.patch.object(
+            MetaProvider, "assist_preview", side_effect=_fake
+        ):
+            response = self._assist(key, "Summarize the paste.")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(
+            response.json()["context_coverage"],
+            {
+                "scope": "message_lines",
+                "lines_shown": 40,
+                "total_rows": 50,
+                "truncated": True,
+            },
+        )
+        short_key = self._paste(self.alice, self.org_a, PASTE).data["key"]
+        with self._paid_env(), mock.patch.object(
+            MetaProvider, "assist_preview", side_effect=_fake
+        ):
+            short = self._assist(short_key, "Summarize the paste.")
+        self.assertEqual(
+            short.json()["context_coverage"],
+            {
+                "scope": "message_lines",
+                "lines_shown": 4,
+                "total_rows": 4,
+                "truncated": False,
+            },
+        )
 
     def test_assist_refused_by_guard_spends_nothing(self):
         AIProviderConfig.objects.create(model="admin-model")
@@ -299,3 +344,135 @@ class PreviewAssistTests(TestCase):
         self.assertEqual(empty.status_code, 400)
         wipe = self._apply(key, set_constants={}, drop_lines=[1, 2, 3, 4])
         self.assertEqual(wipe.status_code, 400)
+
+
+class FoldAssistOperationsTests(SimpleTestCase):
+    def test_fold_valid_arrays(self):
+        from common.meta import _fold_assist_operations
+
+        ops = _fold_assist_operations(
+            {
+                "classify": [{"lines": [1], "class": "header"}],
+                "section_value": [
+                    {"header_line": 1, "field": "grade", "value": "P1+"}
+                ],
+                "terminal_price_document": [{"currency": "usd"}],
+                "terminal_price_section": [
+                    {"currency": "EUR", "section_header_line": 4}
+                ],
+                "join_lines": [{"lines": [5, 6]}],
+                "correct": [
+                    {"record": "L5-L6", "field": "grade", "value": "A"}
+                ],
+                "absent": [{"field": "quantity"}],
+            }
+        )
+        kinds = [op["op"] for op in ops]
+        self.assertEqual(
+            kinds,
+            ["classify", "section_value", "terminal_price",
+             "terminal_price", "join_lines", "correct", "absent"],
+        )
+        self.assertEqual(ops[2]["currency"], "usd")
+        self.assertEqual(ops[3]["section_header_line"], 4)
+
+    def test_fold_rejects_bad_shapes(self):
+        from common.meta import ProposalUnusable, _fold_assist_operations
+
+        for parsed in (
+            {"classify": [{"lines": [True], "class": "header"}]},
+            {"section_value": [{"header_line": "1", "field": "g",
+                                "value": "v"}]},
+            {"terminal_price_section": [{"currency": "USD"}]},
+            {"join_lines": [{"lines": "56"}]},
+            {"correct": [{"record": "L1", "field": "grade"}]},
+            {"absent": [{"field": 7}]},
+            {"classify": {"lines": [1]}},
+        ):
+            with self.assertRaises(ProposalUnusable, msg=parsed):
+                _fold_assist_operations(parsed)
+
+
+class AssistOperationsFlowTests(PreviewAssistTests):
+    def test_assist_proposes_typed_operations(self):
+        AIProviderConfig.objects.create(model="admin-model")
+        key = self._paste(self.alice, self.org_a, PASTE).data["key"]
+        seen = {}
+
+        def _fake(payload, on_chunk=None):
+            seen.update(payload)
+            on_chunk(1, 1, 30, 12)
+            return self._envelope(
+                operations=[
+                    {"op": "global", "field": "supplier",
+                     "value": "ACME Phones"},
+                    {"op": "terminal_price", "currency": "USD"},
+                ]
+            )
+
+        with self._paid_env(), mock.patch.object(
+            MetaProvider, "assist_preview", side_effect=_fake
+        ):
+            response = self._assist(key, "Final numbers are USD prices.")
+        self.assertEqual(response.status_code, 200, response.content)
+        body = response.json()
+        self.assertEqual(
+            body["proposal"]["operations"],
+            [
+                {"op": "global", "field": "supplier",
+                 "value": "ACME Phones"},
+                {"op": "terminal_price", "currency": "USD"},
+            ],
+        )
+        # The model proposed against the live draft, not bare lines.
+        self.assertEqual(seen["preview"]["record_count"], 4)
+        self.assertEqual(seen["preview"]["rules"], [])
+
+    def test_assist_rejects_contradictory_operations(self):
+        AIProviderConfig.objects.create(model="admin-model")
+        key = self._paste(self.alice, self.org_a, PASTE).data["key"]
+
+        def _fake(payload, on_chunk=None):
+            on_chunk(1, 1, 30, 12)
+            return self._envelope(
+                operations=[
+                    {"op": "terminal_price", "currency": "US"},
+                ]
+            )
+
+        with self._paid_env(), mock.patch.object(
+            MetaProvider, "assist_preview", side_effect=_fake
+        ):
+            response = self._assist(key, "Final numbers are prices.")
+        self.assertEqual(response.status_code, 200, response.content)
+        body = response.json()
+        self.assertTrue(body["retriable"])
+        self.assertEqual(body["proposal"]["operations"], [])
+
+    def test_assist_table_preview_rejects_line_operations(self):
+        AIProviderConfig.objects.create(model="admin-model")
+        self.client.force_authenticate(user=self.alice)
+        created = self.client.post(
+            "/api/pipeline/previews/from-text/",
+            {
+                "organization_id": self.org_a.id,
+                "text": "Supplier;Model;Price\nAcme;P1;10\n",
+            },
+            format="json",
+        )
+        key = created.data["key"]
+
+        def _fake(payload, on_chunk=None):
+            return self._envelope(
+                operations=[
+                    {"op": "section_value", "header_line": 1,
+                     "field": "grade", "value": "A"},
+                ]
+            )
+
+        with self._paid_env(), mock.patch.object(
+            MetaProvider, "assist_preview", side_effect=_fake
+        ):
+            response = self._assist(key, "Mark the section grade.")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertTrue(response.json()["retriable"])

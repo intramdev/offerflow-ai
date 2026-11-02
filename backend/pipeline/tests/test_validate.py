@@ -86,7 +86,7 @@ class ValidationTests(TestCase):
         self.add_offer(3, "7", 7)
         passed, results = run_validations(self.run)
         self.assertTrue(passed)
-        self.assertEqual(len(results), 7)
+        self.assertEqual(len(results), 8)
         self.assertEqual(
             {item.name for item in results},
             {
@@ -95,6 +95,7 @@ class ValidationTests(TestCase):
                 "quantities_reconcile",
                 "provenance_complete",
                 "rows_reconcile_with_evidence",
+                "roles_bound_to_evidence",
                 "no_incompatible_merge",
                 "releasable_or_explicit_empty",
             },
@@ -278,3 +279,120 @@ class ValidationTests(TestCase):
             item for item in results if item.name == "releasable_or_explicit_empty"
         )
         self.assertFalse(releasable.passed)
+
+
+class RolesGateTests(TestCase):
+    """Terminal-scoped rows bind price and quantity to source spans."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="u", password="x")
+        self.org = Organization.objects.create(name="Org")
+        Membership.objects.create(
+            user=self.user, organization=self.org, role="owner"
+        )
+        self.rule = RuleSetVersion.objects.get(version="v1")
+        self.source_file = SourceFile.objects.create(
+            organization=self.org,
+            uploaded_by=self.user,
+            original_name="paste.txt",
+            size_bytes=10,
+            sha256="ab" * 32,
+            storage_key="org/1",
+        )
+        self.run = ImportRun.objects.create(
+            organization=self.org,
+            source_file=self.source_file,
+            rule_version=self.rule,
+            status=RunStatus.VALIDATION,
+            mapping={"free_text": True},
+        )
+
+    def add_terminal_offer(self, price, quantity=None, currency="USD",
+                           scoped=True, text="> Phone 18 Pro 256GB - 417"):
+        from pipeline.normalize import terminal_amount
+
+        found = terminal_amount(text)
+        token, start, end = found
+        row = SourceRow.objects.create(
+            organization=self.org,
+            run=self.run,
+            index=5,
+            sheet="",
+            data={"message": text, "price": token, "currency": currency},
+            provenance={
+                "sheet": "",
+                "row": 5,
+                "terminal_scope": scoped,
+                "terminal": {"span": [start, end], "currency": currency,
+                             "line": 5},
+            },
+        )
+        return NormalizedOffer.objects.create(
+            organization=self.org,
+            run=self.run,
+            source_row=row,
+            supplier="Northstar",
+            model_name="Phone 18 Pro",
+            capacity_gb=256,
+            grade="A",
+            grade_raw="A",
+            lock_state="unlocked",
+            quantity=quantity,
+            unit_price=price,
+            currency=currency,
+            status=OfferStatus.OK,
+        )
+
+    def gate(self):
+        _passed, results = run_validations(self.run)
+        return next(
+            item for item in results if item.name == "roles_bound_to_evidence"
+        )
+
+    def test_bound_roles_pass(self):
+        self.add_terminal_offer(Decimal("417"))
+        result = self.gate()
+        self.assertTrue(result.passed, result.details)
+
+    def test_model_number_as_price_fails(self):
+        self.add_terminal_offer(Decimal("16"))
+        result = self.gate()
+        self.assertFalse(result.passed)
+        self.assertIn("unit_price", result.details["offers"][0]["fields"])
+
+    def test_capacity_as_quantity_fails(self):
+        self.add_terminal_offer(Decimal("417"), quantity=256)
+        result = self.gate()
+        self.assertFalse(result.passed)
+        self.assertIn("quantity", result.details["offers"][0]["fields"])
+
+    def test_marked_quantity_passes(self):
+        self.add_terminal_offer(
+            Decimal("417"), quantity=3, text="> Phone 18 Pro x3 - 417"
+        )
+        result = self.gate()
+        self.assertTrue(result.passed, result.details)
+
+    def test_decided_quantity_passes(self):
+        from pipeline.models import ReviewDecision
+
+        offer = self.add_terminal_offer(Decimal("417"), quantity=3)
+        request = ReviewRequest.objects.create(
+            organization=self.org,
+            run=self.run,
+            offer=offer,
+            kind="value",
+            field="quantity",
+            question="q",
+        )
+        ReviewDecision.objects.create(
+            organization=self.org, request=request,
+            decided_by=self.user, value="3",
+        )
+        result = self.gate()
+        self.assertTrue(result.passed, result.details)
+
+    def test_unscoped_rows_ignored(self):
+        self.add_terminal_offer(Decimal("16"), quantity=256, scoped=False)
+        result = self.gate()
+        self.assertTrue(result.passed, result.details)

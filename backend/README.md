@@ -46,7 +46,10 @@ curl http://127.0.0.1:8384/api/health/
 With the default `fixture` provider expect `"status": "ok"` and
 `"mode": "simulated"`. With `OFFERFLOW_PROVIDER=meta` the org-less probe
 reports degraded by design — paid dispatch requires an organization, so
-verify with a real upload instead.
+verify with a real upload instead. Health also reports
+`"runtime_role_privileged"`: `true` means the runtime database role
+bypasses row policy (single-role mode — run the isolation switch
+below); `false` means restricted; `null` means not applicable.
 
 Run the full test suite:
 
@@ -56,7 +59,28 @@ docker compose exec backend python manage.py test
 
 Row-policy tests require PostgreSQL and skip automatically on other
 engines; under Compose they run against the real database. Local runs use
-`OFFERFLOW_DB_ENGINE=sqlite`.
+`OFFERFLOW_DB_ENGINE=sqlite`. The restricted-role isolation module
+(`organizations.tests.test_isolation_pg`, 22 tests) only runs against a
+disposable server named by `OFFERFLOW_PG_ISOLATION_DSN` — never point it
+at the application database. The module accepts loopback DSNs only;
+the disposable server below shares the backend container's network
+namespace, so `127.0.0.1` inside the container reaches it and nothing
+else can:
+
+```sh
+docker run -d --name of-isolation-disposable \
+  --network container:offerflow-backend-1 \
+  -e POSTGRES_PASSWORD=disposable-only postgres:17.11
+sleep 8
+docker compose exec -T \
+  -e OFFERFLOW_PG_ISOLATION_DSN=postgres://postgres:disposable-only@127.0.0.1:5432/postgres \
+  backend python manage.py test organizations.tests.test_isolation_pg
+docker rm -f of-isolation-disposable
+```
+
+Passing here proves the policies and bootstrap work under a
+restricted role; it does not prove the live stack switched — check
+`runtime_role_privileged` on `/api/health/` for that.
 
 Only the backend API port is published, on loopback only (host 8384 →
 container 8000). PostgreSQL and RabbitMQ stay on the internal container
@@ -69,13 +93,18 @@ network with no published ports.
   `.doc` refused with guidance)
 - `POST api/pipeline/previews/` + `GET api/pipeline/previews/<key>/render/`
   — preview-first import with live mapping
-- `POST api/pipeline/previews/from-text/` — paste-text import with
-  deterministic message-lane parsing (supplier header, grade-section
-  inheritance, currency defaults) into the same mapping preview
+- `POST api/pipeline/previews/from-text/` — paste-text import. Each
+  non-empty line becomes one candidate record with stable 1-based
+  line numbers; nothing is pre-extracted. Returns the same mapping
+  preview plus a `draft` block (revision, confirmed rules, records,
+  unresolved issues, sections, history).
 - `POST api/pipeline/previews/<key>/assist/` + `.../assist/apply/` —
-  preview assistant: propose an edit draft, then apply it only after
-  the user clicks **Apply to preview** (user edits always win)
-- `POST api/pipeline/previews/<key>/confirm/` — import the preview
+  preview assistant: propose typed interpretation operations, then
+  apply them only after the user clicks **Apply to preview** (user
+  edits always win). Apply takes the draft `revision` and fails 409
+  when stale; unknown operation fields fail the turn outright.
+- `POST api/pipeline/previews/<key>/confirm/` — import the preview at
+  the given draft revision (stale revisions fail 409)
 - `GET api/pipeline/files/` + `PUT api/pipeline/files/<id>/` — file grid
   (search, rename, per-file currency date)
 - `GET api/pipeline/runs/<id>/` — run status with validations and progress
@@ -145,10 +174,12 @@ Cross-tenant identifiers answer 404.
    the input cap, each with its own budget reservation and live progress.
    Clean files import in seconds with zero model spend — even with a key
    configured, even with an exhausted budget.
-4. **Validate** — per-row status (ok / excluded / needs-input) plus six
-   file-level gates: review coverage, criticals complete, quantities
-   reconcile, provenance complete, no cross-supplier merge, and
-   releasable-or-explicit-empty.
+4. **Validate** — per-row status (ok / excluded / needs-input) plus
+   eight file-level gates: review coverage, criticals complete,
+   quantities reconcile, provenance complete, rows reconcile with
+   evidence, roles bound to evidence (prices and stock bind to their
+   source spans — a capacity or model number can never certify as a
+   price), no incompatible merge, and releasable-or-explicit-empty.
 5. **Review → approve → export** — reviewers answer or ignore records;
    approval binds to exact versions; exports are byte-identical artifacts.
 
@@ -156,13 +187,17 @@ Cancel stops a running worker at the next chunk boundary (no further paid
 calls) and shelves runs awaiting input or review. Approved runs cannot be
 cancelled — remap one to start over.
 
-Pasted text enters the same pipeline through a deterministic message
-lane: supplier header, location/date lines, grade sections, and
-`Name - price` rows become a preview with per-row grade inheritance
-and currency defaults before any model is involved. The preview
-assistant may then propose set/drop edits against that preview alone;
-nothing it drafts reaches the pipeline until the user clicks
-**Apply to preview**.
+Pasted text enters the same pipeline as a versioned draft: each line
+becomes one candidate record, and meaning arrives only through
+confirmed rules — your set values, plus typed operations the preview
+assistant proposes (which number is the price, which lines are
+headers, which grade a section carries, how multi-line products join)
+and you apply. Rules persist server-side with a revision number, so
+refreshes, long chats, and worker processing can never silently
+change the confirmed interpretation; proposal, rules-panel, and
+confirm calls all carry the revision and fail 409 when stale. A
+price-only policy covers lists that carry prices but no stock:
+quantities stay unknown and are omitted instead of invented.
 
 ## Simulated mode
 
@@ -262,9 +297,10 @@ via the standard User admin. Out-of-scope answers always return the
 same fixed refusal text.
 
 On the Upload page a preview-assistant mode receives only the pending
-paste preview — no stored company data — and proposes set/drop edits
-as an explicit draft. Nothing is applied until the user clicks
-**Apply to preview**; user edits always win over assisted values.
+paste preview — no stored company data — and proposes typed
+interpretation operations as reviewable cards. Nothing is applied
+until the user clicks **Apply to preview**; user edits always win
+over assisted values.
 
 ### GDPR self-service
 
@@ -304,6 +340,70 @@ docker compose -f compose.yaml -f compose.integration.yaml up -d --build backend
 New Python dependencies require the `--build`; code-only changes need just
 `docker compose restart worker`. The frontend dev server reloads live; no
 rebuild needed for UI changes.
+
+## Runtime isolation switch
+
+Fresh installs start in single-role mode: backend and worker connect as
+the bootstrap superuser, which bypasses every row policy
+(`runtime_role_privileged: true` on `/api/health/`, plus check
+`offerflow.W001`). The switch below provisions a restricted runtime
+role for backend AND worker (both read the same `.env`) while the
+superuser stays for migrations only. It never touches volumes or
+existing rows; every step is reversible.
+
+Run the steps in order, from the repository root, with the stack up:
+
+1. Back up (non-destructive; substitute your superuser credentials):
+   ```sh
+   docker compose exec -T -e PGPASSWORD='SUPERUSER_PASSWORD' db \
+     pg_dump -U offerflow -d offerflow -F c -f /tmp/offerflow-backup.dump
+   docker cp offerflow-db-1:/tmp/offerflow-backup.dump ./offerflow-backup.dump
+   ```
+   Keep the file until the switch is verified, then delete or vault it.
+2. In `.env`, set `OFFERFLOW_DB_ADMIN_USER`/`OFFERFLOW_DB_ADMIN_PASSWORD`
+   to the current superuser credentials (the same values the runtime
+   uses today). Restart to pick them up — behavior is unchanged:
+   ```sh
+   docker compose restart backend worker
+   ```
+3. Provision the restricted role (replace `RUNTIME_PASSWORD` with a fresh
+   URL-safe secret, e.g. from `openssl rand -base64 18 | tr -dc A-Za-z0-9`):
+   ```sh
+   docker compose exec -T backend python manage.py provision_runtime \
+     --app-role offerflow_app --app-password 'RUNTIME_PASSWORD'
+   ```
+   The command verifies role attributes, table grants, bootstrap
+   helpers, and every row policy, and fails loudly if any check fails.
+4. In `.env`, point the runtime at the new role:
+   `OFFERFLOW_DB_USER=offerflow_app` with the password from step 3.
+   Then restart both consumers:
+   ```sh
+   docker compose restart backend worker
+   ```
+5. Verify:
+   - `curl http://127.0.0.1:8384/api/health/` shows
+     `"runtime_role_privileged": false`.
+   - `docker compose exec -T backend python manage.py check` reports no
+     `offerflow.W001`.
+   - `docker compose exec -T backend python manage.py provision_runtime
+     --verify-only --app-role offerflow_app` passes.
+   - Sign in, upload a small file, and confirm the run processes (this
+     exercises the worker bootstrap under the restricted role); accept
+     one invitation to exercise the invitation resolver.
+6. From now on, run schema and superuser commands on the admin
+   connection: `migrate --database=admin`,
+   `createsuperuser --database=admin`. Plain `migrate` targets the
+   restricted runtime and fails by design.
+
+Rollback: restore the previous `OFFERFLOW_DB_USER`/`OFFERFLOW_DB_PASSWORD`
+in `.env` and `docker compose restart backend worker`. To remove the
+unused role afterwards: `docker compose exec -T db psql -U offerflow -d
+offerflow -c 'DROP ROLE IF EXISTS offerflow_app;'`.
+
+Caveat: the `db` container bootstraps its superuser from
+`OFFERFLOW_DB_*` only when its volume is created. If you ever recreate
+the `dbdata` volume, re-run this procedure from step 1 — and never run
+the isolation test module against the application database.
 
 ## Reset
 

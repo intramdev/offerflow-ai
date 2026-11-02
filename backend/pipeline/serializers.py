@@ -102,6 +102,7 @@ class OfferSerializer(serializers.ModelSerializer):
             "status",
             "exclusion_reason",
             "provenance",
+            "interpreted",
         ]
         read_only_fields = fields
 
@@ -256,6 +257,22 @@ class MappingSerializer(serializers.Serializer):
     ignored = serializers.ListField(
         child=serializers.CharField(), required=False, default=list
     )
+    sheet = serializers.CharField(required=False, max_length=255)
+    revision = serializers.IntegerField(min_value=1, required=False)
+
+    def validate(self, attrs):
+        unknown = set(self.initial_data or {}) - {
+            "mapping",
+            "constants",
+            "ignored",
+            "sheet",
+            "revision",
+        }
+        if unknown:
+            raise serializers.ValidationError(
+                f"Unsupported field(s): {', '.join(sorted(unknown))}."
+            )
+        return attrs
 
 
 class PricingRuleSerializer(serializers.ModelSerializer):
@@ -416,6 +433,23 @@ class PreviewAssistApplySerializer(serializers.Serializer):
     drop_lines = serializers.ListField(
         child=serializers.IntegerField(min_value=1), required=False, default=list
     )
+    operations = serializers.ListField(
+        child=serializers.DictField(), required=False, default=list
+    )
+    revision = serializers.IntegerField(min_value=1, required=False)
+
+    def validate(self, attrs):
+        unknown = set(self.initial_data or {}) - {
+            "set_constants",
+            "drop_lines",
+            "operations",
+            "revision",
+        }
+        if unknown:
+            raise serializers.ValidationError(
+                f"Unsupported field(s): {', '.join(sorted(unknown))}."
+            )
+        return attrs
 
 
 class CustomerQuoteSerializer(serializers.ModelSerializer):

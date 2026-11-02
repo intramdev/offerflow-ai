@@ -36,6 +36,31 @@ LOCKED = "locked"
 UNLOCKED = "unlocked"
 UNKNOWN = "unknown"
 
+# Gap field -> canonical source cell. Only these cells may come from a
+# model proposal; everything else stays exactly as the source read it.
+GAP_CELL_FIELDS = {
+    "supplier": "supplier",
+    "model_name": "model",
+    "capacity_gb": "capacity",
+    "grade": "grade",
+    "lock_state": "lock",
+    "quantity": "quantity",
+    "unit_price": "price",
+    "currency": "currency",
+}
+
+# Offer fields a human clarification may authorize. Anything else
+# (brand, color, conditions) always traces straight to source cells.
+REVIEWABLE_FIELDS = frozenset(GAP_CELL_FIELDS)
+
+# Proposed source cells whose numbers must occur in the message line
+# before the merge adopts them. Other gap cells (supplier, model,
+# grade, lock, currency) keep the existing merged-evidence treatment:
+# the per-row gate authorizes them and release approval covers them.
+_GROUNDED_NUMERIC_CELLS = frozenset({"quantity", "capacity", "price"})
+_NUMBER_TOKEN_RE = re.compile(r"\d[\d.,]*")
+_PLAIN_NUMBER_RE = re.compile(r"^\d+(\.\d+)?$")
+
 
 def parse_capacity(raw) -> int | None:
     """Read whole gigabytes from values like 128, "128GB", "1TB", "1024MB".
@@ -95,11 +120,30 @@ def parse_quantity(raw) -> int | None:
     return None
 
 
+def _valid_thousands(part: str, sep: str) -> str | None:
+    """Join exact thousands groups ("1.234"), or None when malformed."""
+    groups = part.split(sep)
+    if (
+        len(groups) < 2
+        or not groups[0].isdigit()
+        or not 1 <= len(groups[0]) <= 3
+        or any(len(piece) != 3 or not piece.isdigit() for piece in groups[1:])
+    ):
+        return None
+    return "".join(groups)
+
+
 def parse_price(raw) -> Decimal | None:
     """Read a positive decimal price, preserving supplier precision.
 
-    A lone comma acts as the European decimal separator ("10,5" -> 10.5);
-    with a dot present, commas are thousands separators ("1,000.50").
+    Explicit formats only. With both separators the last one wins as
+    the decimal mark ("1,234.56", "1.234,56"); the other side must be
+    exact thousands grouping. A lone comma keeps the documented US
+    rule: a three-digit tail means thousands ("1,000"), a one- or
+    two-digit tail means a European decimal ("10,5"). A lone dot with
+    a three-digit tail and a short head ("1.234") is genuinely
+    ambiguous — US decimal or EU thousands — so it is refused and the
+    reviewer decides instead of the parser guessing.
     """
     if raw is None or isinstance(raw, bool):
         return None
@@ -115,16 +159,25 @@ def parse_price(raw) -> Decimal | None:
     sign = ""
     if text[:1] in ("+", "-"):
         sign, text = text[0], text[1:]
-    if "," in text and "." not in text:
+    has_comma = "," in text
+    has_dot = "." in text
+    if has_comma and has_dot:
+        if text.rfind(",") > text.rfind("."):
+            integer, decimal = text.rsplit(",", 1)
+            joined = _valid_thousands(integer, ".")
+        else:
+            integer, decimal = text.rsplit(".", 1)
+            joined = _valid_thousands(integer, ",")
+        if joined is None or not decimal or not decimal.isdigit():
+            return None
+        text = f"{joined}.{decimal}"
+    elif has_comma:
         groups = text.split(",")
         if len(groups) > 2:
-            if (
-                not groups[0].isdigit()
-                or len(groups[0]) > 3
-                or any(len(part) != 3 or not part.isdigit() for part in groups[1:])
-            ):
+            joined = _valid_thousands(text, ",")
+            if joined is None:
                 return None
-            text = "".join(groups)
+            text = joined
         else:
             head, tail = groups
             if len(tail) == 3 and tail.isdigit() and head.isdigit():
@@ -133,8 +186,21 @@ def parse_price(raw) -> Decimal | None:
                 text = f"{head}.{tail}"
             else:
                 return None
-    else:
-        text = text.replace(",", "")
+    elif has_dot:
+        if text.count(".") > 1:
+            joined = _valid_thousands(text, ".")
+            if joined is None:
+                return None
+            text = joined
+        else:
+            head, tail = text.split(".")
+            if (
+                len(tail) == 3
+                and tail.isdigit()
+                and head.isdigit()
+                and 1 <= len(head) <= 3
+            ):
+                return None
     try:
         value = Decimal(sign + text)
     except (InvalidOperation, ValueError, AttributeError):
@@ -175,17 +241,131 @@ def parse_currency(raw) -> str | None:
 
 
 def classify_lock(raw) -> str:
-    """Classify lock state without guessing unknown wording."""
+    """Classify lock state without guessing unknown wording.
+
+    SIM/carrier-unlocked wording plus a lock signal (notably an
+    activation/iCloud lock) is a conflict, not an unlocked device:
+    it stays unknown so a human confirms the real state.
+    """
     if raw is None:
         return UNKNOWN
     text = str(raw).strip().lower()
     if not text:
         return UNKNOWN
-    if any(marker in text for marker in UNLOCKED_MARKERS):
+    # "unlocked" contains "lock", so unlocked wording is lifted out
+    # before looking for an independent lock signal.
+    remainder = text
+    saw_unlocked = False
+    for marker in UNLOCKED_MARKERS:
+        if marker in remainder:
+            saw_unlocked = True
+            remainder = remainder.replace(marker, " ")
+    saw_locked = any(marker in remainder for marker in LOCKED_MARKERS)
+    if saw_unlocked and saw_locked:
+        return UNKNOWN
+    if saw_unlocked:
         return UNLOCKED
-    if any(marker in text for marker in LOCKED_MARKERS):
+    if saw_locked:
         return LOCKED
     return UNKNOWN
+
+
+def _proposal_grounded(proposal, message: str) -> bool:
+    """Check that every number in a proposal occurs in the message line.
+
+    Numbers compare digit-for-digit after stripping separators, so a
+    transcribed "1.234,56" grounds "1234.56" without locale guessing.
+    Unambiguous plain numbers ("450.00" vs "450") also match by exact
+    decimal equality. A proposal with no digits at all passes here —
+    the normalizer either reads it or leaves the gap for a human.
+    """
+    tokens = _NUMBER_TOKEN_RE.findall("" if proposal is None else str(proposal))
+    if not tokens:
+        return True
+    line_tokens = _NUMBER_TOKEN_RE.findall(message)
+    line_digits = {
+        re.sub(r"\D", "", token)
+        for token in line_tokens
+        if re.sub(r"\D", "", token)
+    }
+    for token in tokens:
+        stripped = re.sub(r"\D", "", token)
+        if stripped and stripped in line_digits:
+            continue
+        if _PLAIN_NUMBER_RE.match(token) and any(
+            _plain_equal(token, other) for other in line_tokens
+        ):
+            continue
+        return False
+    return True
+
+
+def _plain_equal(left: str, right: str) -> bool:
+    if not (_PLAIN_NUMBER_RE.match(left) and _PLAIN_NUMBER_RE.match(right)):
+        return False
+    try:
+        return Decimal(left) == Decimal(right)
+    except InvalidOperation:
+        return False
+
+
+def merge_interpreted_cells(local_cells: dict, interpreted_cells: dict) -> dict:
+    """Fold a model proposal into source cells without overwriting reads.
+
+    Only cells for fields the local read could not fill come from the
+    proposal; every readable value stays byte-identical to the source.
+    Both the offer builder and the evidence gate use this merge, so a
+    model can never widen its own mandate by rewriting other fields.
+
+    On message rows (pasted chat-style lines), proposed numeric values
+    must additionally be grounded: every number in the proposal has to
+    occur in the source line. An ungrounded proposal is dropped, leaving
+    the gap open for a human instead of silently adopting invention.
+    """
+    fields = normalize_cells(local_cells)
+    _status, gaps, _reason = compute_offer_status(fields)
+    wanted = {
+        GAP_CELL_FIELDS[gap["field"]]
+        for gap in gaps
+        if gap["field"] in GAP_CELL_FIELDS
+    }
+    merged = dict(local_cells)
+    message = local_cells.get("message")
+    message = message if isinstance(message, str) and message.strip() else None
+    for key in wanted:
+        if key not in interpreted_cells:
+            continue
+        proposal = interpreted_cells[key]
+        if (
+            message is not None
+            and key in _GROUNDED_NUMERIC_CELLS
+            and not _proposal_grounded(proposal, message)
+        ):
+            continue
+        merged[key] = proposal
+    return merged
+
+
+def parse_review_value(field: str, value):
+    """Parse a human-supplied VALUE answer for one offer field.
+
+    Shared by answer recording and evidence validation so both agree
+    on what a decision authorizes. Returns None when unparseable.
+    """
+    if field == "quantity":
+        return parse_quantity(value)
+    if field == "unit_price":
+        return parse_price(value)
+    if field == "capacity_gb":
+        return parse_capacity(value)
+    if field == "currency":
+        return parse_currency(value)
+    if field in ("supplier", "model_name", "grade"):
+        if value is None:
+            return None
+        text = value.strip() if isinstance(value, str) else str(value).strip()
+        return text or None
+    return None
 
 
 def grade_options(raw) -> list[str] | None:

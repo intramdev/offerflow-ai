@@ -164,13 +164,10 @@ def create_export(*, run, user, format: str):
 
     if format not in ArtifactFormat.values:
         raise ValidationError(f"Unknown export format {format!r}.")
-    if run.status not in (RunStatus.APPROVED, RunStatus.COMPLETED):
-        raise ValidationError("Only approved runs can be exported.")
-    if normalized_digest(run) != (run.approved_normalized_digest or ""):
-        raise ValidationError("Approval is stale; re-approval is required.")
-    if run.source_file.sha256 != (run.approved_source_sha or ""):
-        raise ValidationError("Source changed since approval; re-approval is required.")
-    offers = list(run.offers.filter(status=OfferStatus.OK).order_by("id"))
+    from pipeline.release import check_run_release
+
+    release = check_run_release(run)
+    offers = release["offers"]
     if format == ArtifactFormat.XLSX:
         content = build_xlsx_bytes(run, offers)
     else:

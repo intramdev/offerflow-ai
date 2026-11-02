@@ -116,6 +116,72 @@ class CustomerQuoteTests(TestCase):
         self.assertNotIn(stale.id, {o.id for o in offers})
         self.assertEqual(run_ids, sorted([new.id, other_run.id]))
 
+    def test_collect_supersedes_per_supplier_not_per_run(self):
+        # R6: a newer single-supplier file replaces only that
+        # supplier's offers; the other supplier's older offers stay.
+        old = self._run(days_ago=5)
+        stale_a = self._offer(old, supplier="Acme")
+        staying_b = self._offer(old, supplier="Globex")
+        new = self._run(days_ago=0)
+        fresh_a = self._offer(new, supplier="Acme")
+        offers, run_ids = collect_quote_offers(self.org)
+        self.assertEqual(
+            {o.id for o in offers}, {fresh_a.id, staying_b.id}
+        )
+        self.assertNotIn(stale_a.id, {o.id for o in offers})
+        self.assertEqual(run_ids, sorted([old.id, new.id]))
+
+    def test_collect_upload_order_beats_approval_order(self):
+        # R6: precedence is (created_at, id); approving an older
+        # file later must not regress the quote to stale prices.
+        from pipeline.models import ImportRun as RunModel
+
+        first = self._run(days_ago=0)
+        first.approved_at = timezone.now()
+        first.save(update_fields=["approved_at"])
+        second = self._run(days_ago=5)
+        second.approved_at = timezone.now() - timedelta(days=5)
+        second.save(update_fields=["approved_at"])
+        # Upload order is first, then second, regardless of the
+        # backdated approval stamps above.
+        RunModel.objects.filter(pk=first.pk).update(
+            created_at=timezone.now() - timedelta(days=2)
+        )
+        RunModel.objects.filter(pk=second.pk).update(created_at=timezone.now())
+        stale = self._offer(first, supplier="Acme")
+        fresh = self._offer(second, supplier="Acme")
+        offers, _run_ids = collect_quote_offers(self.org)
+        self.assertEqual({o.id for o in offers}, {fresh.id})
+        self.assertNotIn(stale.id, {o.id for o in offers})
+
+    def test_collect_newer_file_replaces_omits_and_empties(self):
+        # R6: total replacement — omitted products vanish, an
+        # empty newer file silences its supplier, zero stock stays
+        # visible as out-of-stock state.
+        old = self._run(days_ago=5)
+        self._offer(old, supplier="Acme", model_name="iPhone 15")
+        lonely = self._offer(old, supplier="Solo", model_name="Pixel 8")
+        self._offer(old, supplier="Empty", model_name="Nokia 3310")
+        new = self._run(days_ago=0)
+        kept = self._offer(
+            new, supplier="Acme", model_name="iPhone 16", quantity=0
+        )
+        silencer = self._run(days_ago=0)
+        self._offer(
+            silencer,
+            supplier="Empty",
+            model_name="Nokia 3310",
+            status=OfferStatus.EXCLUDED,
+        )
+        offers, _run_ids = collect_quote_offers(self.org)
+        by_supplier = {o.supplier: o for o in offers}
+        # Omitted iPhone 15 and the silenced Empty supplier are out;
+        # Solo's only file still stands; Acme shows the newer file.
+        self.assertEqual(set(by_supplier), {"Acme", "Solo"})
+        self.assertEqual(by_supplier["Acme"].id, kept.id)
+        self.assertEqual(by_supplier["Acme"].quantity, 0)
+        self.assertEqual(by_supplier["Solo"].id, lonely.id)
+
     def test_collect_ignores_unapproved_runs(self):
         draft = self._run(status=RunStatus.READY_FOR_REVIEW)
         self._offer(draft, supplier="Acme")
@@ -318,7 +384,7 @@ class CustomerQuoteTests(TestCase):
         self.assertEqual(
             text,
             f"Quote — ACME ltd — {day}\n"
-            "Apple iPhone 15 128GB (A) — EUR 245\n"
+            "Apple iPhone 15 128GB (A) — EUR 245.00\n"
             "Samsung Galaxy S24 — EUR 199.99",
         )
 
@@ -329,7 +395,35 @@ class CustomerQuoteTests(TestCase):
             organization=self.org,
             decisions=[{"canonical_model": "iPhone 15", "offer_ids": [offer.id]}],
         )
-        self.assertIn("Apple iPhone 15 128GB (A) — USD 100", result["message"])
+        self.assertIn("Apple iPhone 15 128GB (A) — USD 100.00", result["message"])
+
+    def test_variant_stays_visible_on_line_message_and_file(self):
+        # R7: color and conditions survive pricing into the frozen
+        # line, the Telegram text, and the file columns.
+        from pipeline.quotes import render_quote_csv
+
+        run = self._run()
+        offer = self._offer(run, color="Black", conditions="Boxed, EU plug")
+        result = build_customer_quote(
+            organization=self.org,
+            decisions=[{"canonical_model": "iPhone 15", "offer_ids": [offer.id]}],
+        )
+        (line,) = result["lines"]
+        self.assertEqual(line["color"], "Black")
+        self.assertEqual(line["conditions"], "Boxed, EU plug")
+        self.assertIn(
+            "Apple iPhone 15 128GB (Black, A) — USD 100.00", result["message"]
+        )
+        body = render_quote_csv(
+            {"lines": result["lines"], "notes": []},
+            columns=["brand", "model", "color", "conditions", "price"],
+        ).decode("utf-8-sig")
+        rows = body.strip().splitlines()
+        self.assertEqual(
+            rows[0], "Brand,Model,Color,Conditions,Unit Price"
+        )
+        self.assertIn("Black", rows[1])
+        self.assertIn("Boxed, EU plug", rows[1])
 
     def test_lines_carry_categories_sorted_with_other_last(self):
         phones = Category.objects.create(organization=self.org, name="Phones")
@@ -425,10 +519,10 @@ class CustomerQuoteTests(TestCase):
             f"Quote — ACME ltd — {day.isoformat()}\n"
             "\n"
             "Phones:\n"
-            "Apple iPhone 15 128GB (A) — EUR 245\n"
+            "Apple iPhone 15 128GB (A) — EUR 245.00\n"
             "\n"
             "Tablets:\n"
-            "Apple iPad Air 256GB — EUR 500\n"
+            "Apple iPad Air 256GB — EUR 500.00\n"
             "\n"
             "Other:\n"
             "Samsung Galaxy S24 128GB — EUR 199.99",
@@ -485,5 +579,69 @@ class CustomerQuoteTests(TestCase):
         self.assertEqual(
             text,
             f"Quote — ACME ltd — {day.isoformat()}\n"
-            "Apple iPhone 15 128GB — USD 100",
+            "Apple iPhone 15 128GB — USD 100.00",
         )
+
+    def test_overrides_uncategorize_and_flag_manual_price(self):
+        from pipeline.customer_quotes import (
+            clean_line_edits,
+            present_lines,
+        )
+
+        lines = [
+            {
+                "id": "L1",
+                "brand": "Apple",
+                "model": "iPhone 15",
+                "capacity_gb": 128,
+                "grade": "A",
+                "color": "",
+                "conditions": "",
+                "category_id": 3,
+                "category_name": "Phones",
+                "supplier": "Acme",
+                "quantity": 5,
+                "unit_price": "100.0000",
+                "currency": "USD",
+                "rule": None,
+                "candidates": [
+                    {
+                        "supplier": "Acme",
+                        "unit_price": "100.0000",
+                        "currency": "USD",
+                    }
+                ],
+            }
+        ]
+        edits = clean_line_edits(
+            {"L1": {"category_id": None, "unit_price": "99.9"}},
+            lines=lines,
+            categories=[{"id": 3, "name": "Phones"}],
+        )
+        self.assertEqual(
+            edits,
+            {
+                "L1": {
+                    "label": None,
+                    "hidden": False,
+                    "category_id": None,
+                    "category_name": "",
+                    "unit_price": "99.90",
+                }
+            },
+        )
+        presented = present_lines(lines=lines, edits=edits)
+        self.assertIsNone(presented[0]["category_id"])
+        self.assertEqual(presented[0]["category_name"], "")
+        self.assertEqual(presented[0]["unit_price"], "99.90")
+        self.assertTrue(presented[0]["manual_price"])
+        # Frozen source values are never rewritten.
+        self.assertEqual(lines[0]["category_id"], 3)
+        self.assertEqual(lines[0]["unit_price"], "100.0000")
+        self.assertNotIn("manual_price", lines[0])
+        with self.assertRaises(ValidationError):
+            clean_line_edits(
+                {"L1": {"category_id": 9}},
+                lines=lines,
+                categories=[{"id": 3, "name": "Phones"}],
+            )

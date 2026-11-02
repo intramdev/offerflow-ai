@@ -112,7 +112,7 @@ class FixtureFxProvider:
         if dest_units is None:
             dest_units = 1.0 * (1 + (jitter.random() - 0.5) * 0.01)
         rates = {
-            code: f"{value / dest_units:.6f}" for code, value in units.items()
+            code: f"{dest_units / value:.6f}" for code, value in units.items()
         }
         rates[dest] = "1.000000"
         return {"rates": rates, "source": FIXTURE_SOURCE, "simulated": True}

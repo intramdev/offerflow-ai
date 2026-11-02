@@ -148,11 +148,14 @@ export default function CreditsPage() {
     setReleasedNote(null);
     try {
       const data = await releaseStuckSlots(active.organization);
-      const freed = data.released.in_flight;
+      const settled = data.swept.uncertain + data.swept.expired;
+      const live = data.live_reservations.length;
       setReleasedNote(
-        freed > 0
-          ? `Released ${freed} stuck slot${freed === 1 ? "" : "s"} for ${active.organization_name}. You can retry now.`
-          : `No stuck slots for ${active.organization_name} — nothing needed releasing.`,
+        settled > 0
+          ? `Settled ${settled} expired hold${settled === 1 ? "" : "s"} for ${active.organization_name} (${data.swept.tokens_booked} tokens booked as uncertain spend). ${live} live hold${live === 1 ? " was" : "s were"} left untouched — you can retry now.`
+          : live > 0
+            ? `No expired holds for ${active.organization_name} — ${live} live hold${live === 1 ? " is" : "s are"} still running and were left untouched.`
+            : `No stuck slots for ${active.organization_name} — nothing needed releasing.`,
       );
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not release the slot.");
@@ -258,9 +261,10 @@ export default function CreditsPage() {
             <CardTitle>Stuck AI requests?</CardTitle>
             <CardDescription>
               If requests keep failing with “No free in-flight slot” while
-              nobody is working, release {active.organization_name}’s stuck
-              slot here. It affects only your company and never changes
-              billed spend.
+              nobody is working, settle {active.organization_name}’s expired
+              holds here. This affects only your company, never touches
+              live requests, and books expired uncertain holds as spend
+              (the provider may have processed them).
             </CardDescription>
           </CardHeader>
           <CardContent>

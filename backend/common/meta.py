@@ -46,9 +46,20 @@ KEY_PREFIX = "LLM_"
 
 SYSTEM_PROMPT = (
     "You read supplier spreadsheet rows and copy their visible values into "
-    "fields. Copy values exactly as shown; never invent, guess, or compute "
-    "missing values. Use an empty string for any value that is absent or "
-    "unreadable. Return only the requested JSON."
+    "fields. A row may instead be one pasted chat message line under "
+    '"message", with a shared context quoting the full pasted text: header '
+    "lines there can name the supplier, so copy that name into each "
+    "product row supplier field. Group headers there (for example a grade "
+    'banner such as "P1+ - Like New" above several product lines) state '
+    "values that apply to every product line beneath them until the next "
+    "header: copy each stated value - grade, location, or any other field "
+    "- into every covered product row. Copy values exactly as shown; transcribe "
+    "numbers exactly as written without converting units or formats, and "
+    "never invent, guess, or compute missing values. If a pasted line "
+    "offers no product - a header, title, date, location, or note - set "
+    "is_product false and leave every field empty. Use an empty string "
+    "for any value that is absent or unreadable. Return only the "
+    "requested JSON."
 )
 
 FIELDS = (
@@ -79,6 +90,14 @@ RESPONSE_SCHEMA = {
                         "properties": {name: {"type": "string"} for name in FIELDS},
                         "required": list(FIELDS),
                         "additionalProperties": False,
+                    },
+                    "is_product": {
+                        "type": "boolean",
+                        "description": (
+                            "False only when a pasted message line offers "
+                            "no product (header, title, date, or note). "
+                            "Omitted means true."
+                        ),
                     },
                 },
                 "required": ["index", "fields"],
@@ -162,6 +181,51 @@ CHAT_RESPONSE_SCHEMA = {
         "out_of_scope": {"type": "boolean"},
     },
     "required": ["reply", "out_of_scope"],
+    "additionalProperties": False,
+}
+
+ASSIST_PREVIEW_SYSTEM_PROMPT = (
+    "You help adjust one pending OfferFlow import preview. The preview "
+    "quotes either numbered pasted chat message lines (one product per "
+    "line) or a small table with detected columns. The user discusses it "
+    "with you; you answer briefly and may propose exactly two kinds of "
+    "change: set_constants (a list of {name, value} pairs, one value "
+    "applied to every row, e.g. supplier, currency, or grade) and "
+    "drop_lines (numbered pasted lines that carry no product "
+    "information: titles, dates, locations, or notes). Never propose "
+    "dropping section headers that state values for the lines beneath "
+    "them (for example a grade banner such as "
+    '"P1+ - Like New"): the importer automatically applies those values '
+    "to every covered product line, so dropping them would lose the "
+    "values. Copy the "
+    "supplier name from header lines when it clearly names the supplier. "
+    "Transcribe values exactly as shown; never invent, guess, or compute "
+    "missing values, and propose nothing when unsure or when the request "
+    "leaves this preview. You cannot see any other company data and cannot "
+    "run commands, code, or SQL. Answer with the requested JSON only."
+)
+
+ASSIST_PREVIEW_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "message": {"type": "string"},
+        # Strict structured output rejects free-form maps, so
+        # constants travel as pairs and fold to a dict on receipt.
+        "set_constants": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["name", "value"],
+                "additionalProperties": False,
+            },
+        },
+        "drop_lines": {"type": "array", "items": {"type": "integer"}},
+    },
+    "required": ["message", "set_constants", "drop_lines"],
     "additionalProperties": False,
 }
 
@@ -249,6 +313,9 @@ class MetaProvider:
         rows = payload.get("rows", []) if isinstance(payload, dict) else []
         if not isinstance(rows, list):
             raise ProviderError("Unusable payload for paid dispatch.")
+        context = payload.get("context", "") if isinstance(payload, dict) else ""
+        if not isinstance(context, str):
+            raise ProviderError("Unusable payload for paid dispatch.")
         if not rows:
             return {
                 "simulated": False,
@@ -262,7 +329,10 @@ class MetaProvider:
                 "chunk_usages": [],
                 "rows": [],
             }
-        chunks = self._split_chunks(rows)
+        from pipeline.spending import estimate_text_tokens as _estimate
+
+        context_tokens = _estimate(context)
+        chunks = self._split_chunks(rows, base_tokens=context_tokens)
         client = self._client_factory(self._config)
         merged: list = []
         chunk_usages: list = []
@@ -270,7 +340,7 @@ class MetaProvider:
         completion_total = 0
         for position, chunk in enumerate(chunks, start=1):
             prompt_tokens, completion_tokens, items = self._dispatch_chunk(
-                client, chunk, position, len(chunks)
+                client, chunk, position, len(chunks), context
             )
             if on_chunk is not None:
                 on_chunk(
@@ -417,6 +487,75 @@ class MetaProvider:
             "out_of_scope": out_of_scope,
         }
 
+    def assist_preview(self, payload: dict, on_chunk=None) -> dict:
+        """Propose pending-preview adjustments in a single bounded call.
+
+        payload is {"preview": {...bounded quoted lines or table...},
+        "conversation": [{"role", "content"}, ...]}. Returns {"message",
+        "set_constants", "drop_lines"} plus usage; the caller validates
+        every proposed value and line number before showing or applying
+        anything, so the model can suggest but never act on its own.
+        """
+        preview = payload.get("preview") if isinstance(payload, dict) else None
+        turns = payload.get("conversation", []) if isinstance(payload, dict) else []
+        if (
+            not isinstance(preview, dict)
+            or not isinstance(turns, list)
+            or not turns
+            or any(
+                not isinstance(turn, dict)
+                or turn.get("role") not in ("user", "assistant")
+                or not isinstance(turn.get("content"), str)
+                or not turn.get("content").strip()
+                for turn in turns
+            )
+        ):
+            raise ProviderError("Unusable payload for paid assist.")
+        client = self._client_factory(self._config)
+        prompt_tokens, completion_tokens, parsed = self._single_shot(
+            client,
+            kind="assist",
+            system=ASSIST_PREVIEW_SYSTEM_PROMPT,
+            payload=payload,
+            schema_name="preview_assist",
+            schema=ASSIST_PREVIEW_RESPONSE_SCHEMA,
+        )
+        message = parsed.get("message")
+        pairs = parsed.get("set_constants")
+        drops = parsed.get("drop_lines")
+        if (
+            not isinstance(message, str)
+            or not isinstance(pairs, list)
+            or any(
+                not isinstance(pair, dict)
+                or not isinstance(pair.get("name"), str)
+                or not isinstance(pair.get("value"), str)
+                for pair in pairs
+            )
+            or not isinstance(drops, list)
+            or any(
+                not isinstance(line, int) or isinstance(line, bool)
+                for line in drops
+            )
+        ):
+            raise ProposalUnusable("Assist returned an unusable envelope.")
+        constants = {pair["name"]: pair["value"] for pair in pairs}
+        if on_chunk is not None:
+            on_chunk(1, 1, prompt_tokens, completion_tokens)
+        return {
+            "simulated": False,
+            "provider": "meta",
+            "model": self._config.model,
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+            "message": message,
+            "set_constants": constants,
+            "drop_lines": drops,
+        }
+
     def _dispatch_categorize(self, client, payload: dict) -> tuple:
         prompt_tokens, completion_tokens, parsed = self._single_shot(
             client,
@@ -436,21 +575,35 @@ class MetaProvider:
         kind ("match", "categorize") labels errors. Returns
         (prompt_tokens, completion_tokens, parsed_dict).
         """
-        from pipeline.spending import BudgetRefused, reconcile, release, reserve
+        from pipeline.spending import (
+            BudgetRefused,
+            estimate_request_tokens,
+            estimate_text_tokens,
+            mark_uncertain,
+            reconcile,
+            release,
+            reserve,
+        )
 
         label = kind.capitalize()
         user_content = json.dumps(payload, separators=(",", ":"))
-        estimated_input = len(user_content) // 4 + len(system) // 4
+        estimated_input = estimate_text_tokens(user_content) + estimate_text_tokens(system)
         if estimated_input > self._config.max_input_tokens:
             raise ProviderError(
                 f"{label} block exceeds the input cap; refusing dispatch."
             )
-        estimate = estimated_input + min(
-            self._config.max_output_tokens, estimated_input + 256
+        # Reserve the full permitted call (bounded input + entire output
+        # allowance + overhead); observed usage refunds the difference.
+        estimate = estimate_request_tokens(
+            texts=[system, user_content],
+            max_output_tokens=self._config.max_output_tokens,
         )
         try:
             reservation = reserve(
-                self._config.organization_id, estimate, self._config.max_in_flight
+                self._config.organization_id,
+                estimate,
+                self._config.max_in_flight,
+                purpose=kind,
             )
         except BudgetRefused as exc:
             raise ProviderError(f"Budget refused {kind} dispatch: {exc}") from exc
@@ -478,17 +631,29 @@ class MetaProvider:
             release(reservation)
             raise ProviderError(f"Provider rate limited {kind}; not retried.") from exc
         except APITimeoutError as exc:
-            release(reservation)
+            # The provider may have processed the call: uncertain, not free.
+            mark_uncertain(reservation, f"{kind} timed out: {exc}")
             raise ProviderError(f"Provider {kind} call timed out; not retried.") from exc
-        except (APIConnectionError, APIStatusError) as exc:
-            release(reservation)
-            status = getattr(exc, "status_code", None)
+        except APIConnectionError as exc:
+            mark_uncertain(reservation, f"{kind} connection failed: {exc}")
+            raise ProviderError(f"Provider error on {kind}; not retried.") from exc
+        except APIStatusError as exc:
+            try:
+                status = int(getattr(exc, "status_code", 0) or 0)
+            except (TypeError, ValueError):
+                status = 0
+            if status >= 500:
+                # A 5xx may follow a processed request: uncertain, not free.
+                mark_uncertain(reservation, f"{kind} HTTP {status}: {exc}")
+            else:
+                release(reservation)
             raise ProviderError(
                 f"Provider error{f' ({status})' if status else ''} "
                 f"on {kind}; not retried."
             ) from exc
         except Exception as exc:
-            release(reservation)
+            # Unknown local failure after dispatch started: uncertain.
+            mark_uncertain(reservation, f"unexpected {type(exc).__name__}: {exc}")
             raise ProviderError(f"Unexpected provider failure: {type(exc).__name__}.") from exc
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None)
@@ -515,14 +680,24 @@ class MetaProvider:
             raise ProposalUnusable(f"{label} returned an unusable envelope.")
         return prompt_tokens, completion_tokens, parsed
 
-    def _split_chunks(self, rows: list) -> list:
-        """Group rows so every call fits the input cap and a row bound."""
+    def _split_chunks(self, rows: list, base_tokens: int = 0) -> list:
+        """Group rows so every call fits the input cap and a row bound.
+
+        base_tokens reserves room for content attached to every call
+        (the shared message context), counted before any row is placed.
+        """
+        from pipeline.spending import estimate_text_tokens
+
+        system_tokens = estimate_text_tokens(SYSTEM_PROMPT)
+        fixed = system_tokens + base_tokens
         chunks: list = []
         current: list = []
-        current_tokens = len(SYSTEM_PROMPT) // 4
+        current_tokens = fixed
         for row in rows:
-            row_tokens = len(json.dumps(row, separators=(",", ":"))) // 4 + 1
-            if row_tokens + len(SYSTEM_PROMPT) // 4 > self._config.max_input_tokens:
+            row_tokens = (
+                estimate_text_tokens(json.dumps(row, separators=(",", ":"))) + 1
+            )
+            if row_tokens + fixed > self._config.max_input_tokens:
                 raise ProviderError(
                     "A single row exceeds the input cap; refusing dispatch."
                 )
@@ -535,29 +710,49 @@ class MetaProvider:
             ):
                 chunks.append(current)
                 current = []
-                current_tokens = len(SYSTEM_PROMPT) // 4
+                current_tokens = fixed
             current.append(row)
             current_tokens += row_tokens
         if current:
             chunks.append(current)
         return chunks
 
-    def _dispatch_chunk(self, client, chunk: list, position: int, total: int) -> tuple:
-        from pipeline.spending import BudgetRefused, reconcile, release, reserve
+    def _dispatch_chunk(
+        self, client, chunk: list, position: int, total: int, context: str = ""
+    ) -> tuple:
+        from pipeline.spending import (
+            BudgetRefused,
+            estimate_request_tokens,
+            estimate_text_tokens,
+            mark_uncertain,
+            reconcile,
+            release,
+            reserve,
+        )
 
-        user_content = json.dumps({"rows": chunk}, separators=(",", ":"))
-        estimated_input = len(user_content) // 4 + len(SYSTEM_PROMPT) // 4
+        body = {"rows": chunk}
+        if context:
+            body = {"context": context, "rows": chunk}
+        user_content = json.dumps(body, separators=(",", ":"))
+        estimated_input = estimate_text_tokens(user_content) + estimate_text_tokens(
+            SYSTEM_PROMPT
+        )
         if estimated_input > self._config.max_input_tokens:
             raise ProviderError(
                 f"Chunk {position}/{total} exceeds the input cap; refusing dispatch."
             )
-        # The model copies visible values, so output tracks input size.
-        estimate = estimated_input + min(
-            self._config.max_output_tokens, estimated_input + 256
+        # Reserve the full permitted call; observed usage refunds the rest.
+        estimate = estimate_request_tokens(
+            texts=[SYSTEM_PROMPT, user_content],
+            max_output_tokens=self._config.max_output_tokens,
         )
         try:
             reservation = reserve(
-                self._config.organization_id, estimate, self._config.max_in_flight
+                self._config.organization_id,
+                estimate,
+                self._config.max_in_flight,
+                purpose="interpret",
+                detail={"chunk": position, "chunks": total, "rows": len(chunk)},
             )
         except BudgetRefused as exc:
             raise ProviderError(
@@ -589,19 +784,39 @@ class MetaProvider:
                 f"Provider rate limited chunk {position}/{total}; not retried."
             ) from exc
         except APITimeoutError as exc:
-            release(reservation)
+            # The provider may have processed the call: uncertain, not free.
+            mark_uncertain(
+                reservation, f"chunk {position}/{total} timed out: {exc}"
+            )
             raise ProviderError(
                 f"Provider call timed out at chunk {position}/{total}; not retried."
             ) from exc
-        except (APIConnectionError, APIStatusError) as exc:
-            release(reservation)
-            status = getattr(exc, "status_code", None)
+        except APIConnectionError as exc:
+            mark_uncertain(
+                reservation, f"chunk {position}/{total} connection failed: {exc}"
+            )
+            raise ProviderError(
+                f"Provider error at chunk {position}/{total}; not retried."
+            ) from exc
+        except APIStatusError as exc:
+            try:
+                status = int(getattr(exc, "status_code", 0) or 0)
+            except (TypeError, ValueError):
+                status = 0
+            if status >= 500:
+                # A 5xx may follow a processed request: uncertain, not free.
+                mark_uncertain(
+                    reservation, f"chunk {position}/{total} HTTP {status}: {exc}"
+                )
+            else:
+                release(reservation)
             raise ProviderError(
                 f"Provider error{f' ({status})' if status else ''} "
                 f"at chunk {position}/{total}; not retried."
             ) from exc
         except Exception as exc:
-            release(reservation)
+            # Unknown local failure after dispatch started: uncertain.
+            mark_uncertain(reservation, f"unexpected {type(exc).__name__}: {exc}")
             raise ProviderError(f"Unexpected provider failure: {type(exc).__name__}.") from exc
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None)
@@ -636,8 +851,13 @@ class MetaProvider:
             if (
                 not isinstance(item, dict)
                 or not isinstance(item.get("index"), int)
+                or isinstance(item.get("index"), bool)
                 or not isinstance(item.get("fields"), dict)
             ):
+                raise ProviderError(
+                    f"Chunk {position}/{total} returned a malformed row."
+                )
+            if "is_product" in item and not isinstance(item["is_product"], bool):
                 raise ProviderError(
                     f"Chunk {position}/{total} returned a malformed row."
                 )

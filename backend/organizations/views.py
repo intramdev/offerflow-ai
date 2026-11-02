@@ -173,17 +173,22 @@ class OrganizationUsageView(APIView):
 
 
 class OrganizationReleaseStuckView(APIView):
-    """Release a stuck AI slot for the caller's own company only.
+    """Sweep expired reservations for the caller's own company only.
 
-    A crashed request can leave phantom in-flight/reserved counters that
-    block every later dispatch with "No free in-flight slot". This clears
-    them for this organization alone; other companies are untouched. It
-    never changes billed spend (period or grand totals).
+    A crashed request can leave reservations that block later dispatches
+    with "No free in-flight slot". This settles only expired
+    reservations for this organization alone; other companies are
+    untouched, and live reservations are never cleared — freeing one
+    could double-spend when the live call settles. Expired uncertain
+    reservations book their held estimate as spend (the provider may
+    have processed them); the response reports exactly what moved and
+    what is still live.
     """
 
     def post(self, request, organization_id):
         from pipeline.jobs import record_audit
-        from pipeline.spending import get_allowance
+        from pipeline.models import SpendReservation
+        from pipeline.spending import get_allowance, sweep_expired
 
         try:
             services.require_organization_role(request.user, organization_id)
@@ -193,24 +198,37 @@ class OrganizationReleaseStuckView(APIView):
             )
 
             raise DRFPermissionDenied(str(error)) from error
+        # Sweep only this organization's expired reservations. Live held
+        # reservations are never touched: clearing one would free budget
+        # for a call that may still settle, enabling double spend.
+        swept = sweep_expired(organization_id=organization_id)
         allowance = get_allowance(organization_id)
-        released = {
-            "in_flight": allowance.in_flight,
-            "tokens_reserved": allowance.tokens_reserved,
-        }
-        allowance.in_flight = 0
-        allowance.tokens_reserved = 0
-        allowance.save(update_fields=["in_flight", "tokens_reserved", "updated_at"])
+        live = list(
+            SpendReservation.objects.filter(
+                organization_id=organization_id,
+                state__in=[
+                    SpendReservation.State.HELD,
+                    SpendReservation.State.UNCERTAIN,
+                ],
+            )
+            .order_by("id")
+            .values("id", "state", "tokens", "purpose", "expires_at")
+        )
         record_audit(
             organization_id,
             request.user,
             "stuck_slots_released",
             "allowance",
             allowance.pk,
-            released,
+            {**swept, "live_reservations": [row["id"] for row in live]},
         )
         return Response(
-            {"released": released, "in_flight": 0, "tokens_reserved": 0}
+            {
+                "swept": swept,
+                "live_reservations": live,
+                "in_flight": allowance.in_flight,
+                "tokens_reserved": allowance.tokens_reserved,
+            }
         )
 
 

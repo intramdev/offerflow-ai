@@ -8,6 +8,7 @@ import * as React from "react";
 
 import { AssistantWidget } from "@/components/app/assistant-widget";
 import { OrgProvider, useOrg } from "@/components/app/org-context";
+import { PreviewAssistProvider } from "@/components/app/preview-assist-context";
 import { ThemeProvider } from "@/components/app/theme-provider";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/cn";
@@ -188,7 +189,8 @@ function Shell({ children }: { children: React.ReactNode }) {
         </div>
         <main
           className={
-            pathname.startsWith("/app/files")
+            pathname.startsWith("/app/files") ||
+            pathname.startsWith("/app/quotes")
               ? "mx-auto w-full flex-1 px-4 py-6 md:w-[90%] md:px-6 md:py-8"
               : "mx-auto w-full max-w-5xl flex-1 px-4 py-6 md:px-6 md:py-8"
           }
@@ -228,7 +230,9 @@ function Shell({ children }: { children: React.ReactNode }) {
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   return (
     <OrgProvider>
-      <Shell>{children}</Shell>
+      <PreviewAssistProvider>
+        <Shell>{children}</Shell>
+      </PreviewAssistProvider>
     </OrgProvider>
   );
 }

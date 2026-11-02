@@ -44,6 +44,7 @@ from pipeline.quotes import (
     _apply_ops,
     _file_fx,
     _winning_rule,
+    format_money,
 )
 
 QUOTEABLE_STATUSES = (RunStatus.APPROVED, RunStatus.COMPLETED)
@@ -55,6 +56,9 @@ REQUIRED_EXPORT_COLUMNS = ("model", "price")
 #: Longest customer-facing label or message header/footer line.
 MAX_LABEL_CHARS = 200
 
+#: Longest grade/color override on a quote line.
+MAX_VARIANT_CHARS = 60
+
 #: Per-company export template when nothing was customized yet: the
 #: sourcing (supplier) column is intelligence and stays out of
 #: customer files and messages until the company opts it back in.
@@ -62,6 +66,7 @@ DEFAULT_QUOTE_TEMPLATE = {
     "file_columns": list(DEFAULT_EXPORT_COLUMNS),
     "message_show_capacity": True,
     "message_show_grade": True,
+    "message_show_color": True,
     "message_show_quantity": False,
     "message_show_categories": True,
     "message_header": "",
@@ -92,6 +97,7 @@ def effective_template(organization) -> dict:
     for key in (
         "message_show_capacity",
         "message_show_grade",
+        "message_show_color",
         "message_show_quantity",
         "message_show_categories",
     ):
@@ -149,6 +155,7 @@ def clean_quote_export(value) -> dict:
     for key in (
         "message_show_capacity",
         "message_show_grade",
+        "message_show_color",
         "message_show_quantity",
         "message_show_categories",
     ):
@@ -165,70 +172,261 @@ def clean_quote_export(value) -> dict:
     return cleaned
 
 
-def clean_line_edits(value, *, line_count: int) -> dict:
+#: Sentinel for "no category override" (distinct from null, which
+#: moves the line to uncategorized).
+_KEEP_CATEGORY = object()
+
+
+def _clean_variant(value, *, raw_key, name: str):
+    """Validate a grade/color override (None keeps the frozen value)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValidationError(f"Line {raw_key}: {name} must be text.")
+    cleaned = " ".join(value.split())
+    if len(cleaned) > MAX_VARIANT_CHARS:
+        raise ValidationError(
+            f"Line {raw_key}: {name} must be "
+            f"{MAX_VARIANT_CHARS} characters or fewer."
+        )
+    return cleaned
+
+
+def _clean_override_price(value, *, raw_key) -> str:
+    """Validate a manual unit price, stored rounded to the cent."""
+    from decimal import InvalidOperation, ROUND_HALF_UP
+
+    from pipeline.quotes import CENTS
+
+    try:
+        price = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, AttributeError):
+        raise ValidationError(
+            f"Line {raw_key}: the price must be a number."
+        ) from None
+    if not price.is_finite() or price < 0:
+        raise ValidationError(
+            f"Line {raw_key}: the price must be zero or more."
+        )
+    return format(price.quantize(CENTS, ROUND_HALF_UP), "f")
+
+
+def clean_line_edits(value, *, lines: list, categories: list | None = None) -> dict:
     """Validate per-line presentation overrides for a ready quote.
 
-    Shape: {"0": {"label": "iPhone 15", "hidden": false}}. Indexes
-    must point at frozen lines; labels rename the customer-facing
-    product text (empty labels are refused — hide the line instead).
-    Returns the normalized edits map.
+    Callers address full-list positions ({"0": {...}}) or stable
+    line ids ({"L1": {...}}); both are normalized to stable ids so
+    an edit follows its line into category shelves. Lines frozen
+    before stable ids keep positional keys instead.
+
+    Overrides rename the customer-facing detail (label, grade,
+    color, category, quantity, supplier, unit price) or hide the
+    line; the frozen source values underneath are never touched,
+    so provenance survives and every save bumps the revision with
+    a fresh approval binding. Labels need words (hide the line
+    instead); a manual price is stored rounded to the cent and
+    presented flagged as manual; a supplier must be one of the
+    line's candidates; a category must be one of the company's
+    shelves (null moves the line to uncategorized). Overrides
+    that equal the frozen value are dropped as no-ops. Returns
+    the normalized edits map.
     """
     if not isinstance(value, dict):
         raise ValidationError("Line edits must be an object.")
+    shelves = {
+        shelf["id"]: shelf.get("name") or ""
+        for shelf in (categories or [])
+        if isinstance(shelf, dict) and isinstance(shelf.get("id"), int)
+    }
+    by_id = {}
+    for position, line in enumerate(lines or []):
+        if isinstance(line, dict) and line.get("id"):
+            by_id[str(line["id"])] = position
     cleaned = {}
-    for raw_index, edit in value.items():
-        try:
-            index = int(raw_index)
-        except (TypeError, ValueError):
-            raise ValidationError(
-                f"Line {raw_index!r} is not a line number."
-            ) from None
-        if index < 0 or index >= line_count:
-            raise ValidationError(f"Line {index} does not exist.")
+    allowed = {
+        "label",
+        "hidden",
+        "grade",
+        "color",
+        "category_id",
+        "quantity",
+        "supplier",
+        "unit_price",
+    }
+    for raw_key, edit in value.items():
+        position = by_id.get(str(raw_key))
+        if position is None:
+            try:
+                position = int(raw_key)
+            except (TypeError, ValueError):
+                raise ValidationError(
+                    f"Line {raw_key!r} is not a line number or id."
+                ) from None
+        if position < 0 or position >= len(lines or []):
+            raise ValidationError(f"Line {raw_key} does not exist.")
         if not isinstance(edit, dict):
-            raise ValidationError(f"Line {index} must be an object.")
-        unknown = sorted(set(edit) - {"label", "hidden"})
+            raise ValidationError(f"Line {raw_key} must be an object.")
+        unknown = sorted(set(edit) - allowed)
         if unknown:
             raise ValidationError(
-                f"Line {index}: unknown keys {', '.join(unknown)}."
+                f"Line {raw_key}: unknown keys {', '.join(unknown)}."
             )
+        line = lines[position]
         label = edit.get("label")
         if label is None:
             label = None
         elif not isinstance(label, str) or not label.strip():
             raise ValidationError(
-                f"Line {index}: the label needs words, or hide the line."
+                f"Line {raw_key}: the label needs words, or hide the line."
             )
         elif len(label.strip()) > MAX_LABEL_CHARS:
             raise ValidationError(
-                f"Line {index}: the label must be "
+                f"Line {raw_key}: the label must be "
                 f"{MAX_LABEL_CHARS} characters or fewer."
             )
         else:
             label = " ".join(label.split())
+            if label == line.get("model"):
+                label = None
         hidden = edit.get("hidden", False)
         if not isinstance(hidden, bool):
-            raise ValidationError(f"Line {index}: hidden must be true or false.")
-        if label is None and not hidden:
+            raise ValidationError(f"Line {raw_key}: hidden must be true or false.")
+        grade = _clean_variant(edit.get("grade"), raw_key=raw_key, name="grade")
+        if grade is not None and grade == (line.get("grade") or ""):
+            grade = None
+        color = _clean_variant(edit.get("color"), raw_key=raw_key, name="color")
+        if color is not None and color == (line.get("color") or ""):
+            color = None
+        category_id = edit.get("category_id", _KEEP_CATEGORY)
+        category_name: str | None = None
+        if category_id is _KEEP_CATEGORY:
+            pass
+        elif category_id is None:
+            category_name = ""
+            if line.get("category_id") is None:
+                category_id = _KEEP_CATEGORY
+        elif isinstance(category_id, bool) or not isinstance(category_id, int):
+            raise ValidationError(
+                f"Line {raw_key}: the category must be an id or null."
+            )
+        elif category_id not in shelves:
+            raise ValidationError(
+                f"Line {raw_key}: unknown category."
+            )
+        else:
+            category_name = shelves[category_id]
+            if category_id == line.get("category_id"):
+                category_id = _KEEP_CATEGORY
+        quantity = edit.get("quantity")
+        if quantity is not None:
+            if isinstance(quantity, bool) or not isinstance(quantity, int):
+                raise ValidationError(
+                    f"Line {raw_key}: the quantity must be a whole number."
+                )
+            if quantity < 0:
+                raise ValidationError(
+                    f"Line {raw_key}: the quantity cannot be negative."
+                )
+            if quantity == line.get("quantity"):
+                quantity = None
+        supplier = edit.get("supplier")
+        if supplier is not None:
+            if not isinstance(supplier, str) or not supplier.strip():
+                raise ValidationError(
+                    f"Line {raw_key}: the supplier needs a name."
+                )
+            supplier = supplier.strip()
+            offered = {
+                str(item.get("supplier") or "")
+                for item in (line.get("candidates") or [])
+                if isinstance(item, dict)
+            }
+            offered.add(str(line.get("supplier") or ""))
+            offered.discard("")
+            if supplier not in offered:
+                raise ValidationError(
+                    f"Line {raw_key}: pick one of the line's suppliers."
+                )
+            if supplier == line.get("supplier"):
+                supplier = None
+        unit_price = edit.get("unit_price")
+        if unit_price is not None:
+            unit_price = _clean_override_price(unit_price, raw_key=raw_key)
+            try:
+                same = Decimal(unit_price) == Decimal(str(line.get("unit_price")))
+            except Exception:
+                same = False
+            if same:
+                unit_price = None
+        entry: dict = {"label": label, "hidden": hidden}
+        if grade is not None:
+            entry["grade"] = grade
+        if color is not None:
+            entry["color"] = color
+        if category_id is not _KEEP_CATEGORY:
+            entry["category_id"] = category_id
+            entry["category_name"] = category_name or ""
+        if quantity is not None:
+            entry["quantity"] = quantity
+        if supplier is not None:
+            entry["supplier"] = supplier
+        if unit_price is not None:
+            entry["unit_price"] = unit_price
+        if (
+            label is None
+            and not hidden
+            and len(entry) == 2
+        ):
             continue
-        cleaned[str(index)] = {"label": label, "hidden": hidden}
+        stable = (
+            str(line.get("id"))
+            if isinstance(line, dict) and line.get("id")
+            else str(position)
+        )
+        cleaned[stable] = entry
     return cleaned
 
 
 def present_lines(*, lines: list, edits: dict | None) -> list:
-    """Frozen lines as the customer sees them: labels applied.
+    """Frozen lines as the customer sees them: overrides applied.
 
-    Hidden lines stay in place with hidden=True so callers can show
-    them greyed out (internal view) or drop them (files/messages).
+    Edits resolve by stable line id, falling back to the
+    full-list position for quotes frozen before stable ids.
+    Callers must present the full frozen list (filtering after),
+    so even legacy positional edits meet the line they were
+    written against. Hidden lines stay in place with hidden=True
+    so callers can show them greyed out (internal view) or drop
+    them (files/messages). A manual price replaces the frozen
+    unit price and is flagged manual_price so every surface can
+    say so; the frozen price itself is never rewritten.
     """
     edits = edits if isinstance(edits, dict) else {}
     presented = []
     for index, line in enumerate(lines):
-        edit = edits.get(str(index)) or {}
+        key = (
+            str(line.get("id"))
+            if isinstance(line, dict) and line.get("id")
+            else str(index)
+        )
+        edit = edits.get(key) or {}
         shown = dict(line)
         label = edit.get("label")
         if label:
             shown["model"] = label
+        if edit.get("grade") is not None:
+            shown["grade"] = edit["grade"]
+        if edit.get("color") is not None:
+            shown["color"] = edit["color"]
+        if "category_id" in edit:
+            shown["category_id"] = edit["category_id"]
+            shown["category_name"] = edit.get("category_name") or ""
+        if edit.get("quantity") is not None:
+            shown["quantity"] = edit["quantity"]
+        if edit.get("supplier") is not None:
+            shown["supplier"] = edit["supplier"]
+        if edit.get("unit_price") is not None:
+            shown["unit_price"] = edit["unit_price"]
+            shown["manual_price"] = True
         shown["hidden"] = bool(edit.get("hidden", False))
         presented.append(shown)
     return presented
@@ -242,9 +440,17 @@ def export_lines(*, lines: list, edits: dict | None) -> list:
 def collect_quote_offers(organization) -> tuple[list, list[int]]:
     """Ok offers from the latest quotable run per supplier.
 
-    Returns (offers, source_run_ids). A supplier's older approved
-    runs are superseded; drafts, failed, and cancelled runs never
-    feed a customer quote.
+    Returns (offers, source_run_ids). Precedence per supplier is
+    the newest quotable source first: (created_at, id), so upload
+    order decides and approval order never regresses a quote to
+    an older price list. Approval only gates quotability: drafts,
+    failed, and cancelled runs never feed a customer quote.
+
+    Replacement is total per supplier: the chosen run's ok offers
+    are the supplier's whole contribution. Products the newer
+    file omits disappear (no stale-price fallback); a newer file
+    with no ok offers silences that supplier; a zero quantity is
+    collected as out-of-stock state, not as missing data.
     """
     runs = list(
         ImportRun.objects.filter(
@@ -253,32 +459,43 @@ def collect_quote_offers(organization) -> tuple[list, list[int]]:
     )
     if not runs:
         return [], []
+    # Attribution uses every offer: an excluded row still names its
+    # supplier, so a newer file with no ok offers silences that
+    # supplier instead of resurrecting their older price list.
     offers = list(
         NormalizedOffer.objects.filter(
             organization=organization,
             run__in=runs,
-            status=OfferStatus.OK,
         )
         .select_related("run", "run__source_file")
         .order_by("id")
     )
     latest: dict[str, ImportRun] = {}
     for run in runs:
-        key = (run.approved_at or run.created_at, run.id)
+        key = (run.created_at, run.id)
         for offer in offers:
             if offer.run_id != run.id:
                 continue
             supplier = normalize_supplier(offer.supplier)
             current = latest.get(supplier)
             current_key = (
-                (current.approved_at or current.created_at, current.id)
+                (current.created_at, current.id)
                 if current is not None
                 else None
             )
             if current_key is None or key > current_key:
                 latest[supplier] = run
     wanted = {run.id for run in latest.values()}
-    chosen = [offer for offer in offers if offer.run_id in wanted]
+    # Per-supplier, not per-run: a run stays wanted for the
+    # suppliers it is latest for, but its superseded suppliers'
+    # offers must not leak back in through the shared run id.
+    chosen = []
+    for offer in offers:
+        if offer.status != OfferStatus.OK:
+            continue
+        chosen_run = latest.get(normalize_supplier(offer.supplier))
+        if chosen_run is not None and chosen_run.id == offer.run_id:
+            chosen.append(offer)
     return chosen, sorted(wanted)
 
 
@@ -337,6 +554,11 @@ def build_customer_quote(*, organization, decisions: list) -> dict:
             line["model"].lower(),
         )
     )
+    # Stable identity: presentation edits bind to these ids, so a
+    # label or hidden flag follows its line into category shelves
+    # instead of sticking to a filtered-list position.
+    for position, line in enumerate(lines, start=1):
+        line["id"] = f"L{position}"
     return {
         "lines": lines,
         "notes": notes,
@@ -429,6 +651,7 @@ def _price_group(
     first = members[0]
     brand = _common_raw([o.brand for o in members])
     grade = _common_raw([o.grade for o in members])
+    color = _common_raw([o.color for o in members])
     rule = _winning_rule(
         rules,
         {
@@ -470,6 +693,8 @@ def _price_group(
             "model": canonical,
             "capacity_gb": first.capacity_gb,
             "grade": picked.grade or "",
+            "color": color,
+            "conditions": picked.conditions or "",
             "category_id": category_id,
             "category_name": category_name,
             "supplier": picked.supplier,
@@ -530,11 +755,8 @@ def quote_lines_for_category(*, lines: list, category_id) -> tuple:
 
 
 def _display_price(value: str) -> str:
-    """Human price for messages: 245.0000 renders as 245."""
-    try:
-        return format(Decimal(value).normalize(), "f")
-    except Exception:
-        return value
+    """Human price for messages: 245.0000 renders as 245.00."""
+    return format_money(value)
 
 
 def render_message(
@@ -551,6 +773,7 @@ def render_message(
     template = template or {}
     show_capacity = template.get("message_show_capacity", True)
     show_grade = template.get("message_show_grade", True)
+    show_color = template.get("message_show_color", True)
     show_quantity = template.get("message_show_quantity", False)
     show_sections = template.get("message_show_categories", True)
     head = template.get("message_header") or f"Quote — {organization_name} — {day.isoformat()}"
@@ -571,8 +794,13 @@ def render_message(
             )
             if part
         )
+        variants = []
+        if show_color and line.get("color"):
+            variants.append(line["color"])
         if show_grade and line["grade"]:
-            title += f" ({line['grade']})"
+            variants.append(line["grade"])
+        if variants:
+            title += f" ({', '.join(variants)})"
         text = f"{title} — {line['currency']} {_display_price(line['unit_price'])}"
         if show_quantity and line.get("quantity") is not None:
             text += f" ×{line['quantity']}"
@@ -653,10 +881,14 @@ def confirm_customer_quote(*, quote: CustomerQuote, user, decisions: list) -> Cu
         }
         for d in decisions
     ]
+    from pipeline.release import bind_customer_quote
+
     quote.lines = result["lines"]
     quote.notes = result["notes"]
     quote.message = result["message"]
     quote.status = QuoteStatus.READY
+    quote.revision = 1
+    bind_customer_quote(quote)
     quote.save()
     record_audit(
         quote.organization_id,
@@ -664,7 +896,7 @@ def confirm_customer_quote(*, quote: CustomerQuote, user, decisions: list) -> Cu
         "quote_confirmed",
         "quote",
         quote.id,
-        {"groups": learned["groups"], "lines": len(result["lines"])},
+        {"groups": learned["groups"], "lines": len(result["lines"]), "revision": 1},
     )
     return quote
 
@@ -672,9 +904,11 @@ def confirm_customer_quote(*, quote: CustomerQuote, user, decisions: list) -> Cu
 def update_quote_lines(*, quote: CustomerQuote, user, edits: dict) -> CustomerQuote:
     """Replace a ready quote's line presentation overrides.
 
-    Operating roles only; audited. Labels and hidden flags change
-    what customers see in files and messages; frozen prices and
-    sources are untouched.
+    Operating roles only; audited. Overrides change what
+    customers see in files and messages; the frozen lines
+    underneath (source prices, offers, provenance) are never
+    rewritten, and every save bumps the revision with a fresh
+    approval binding.
     """
     from organizations.services import require_organization_role
 
@@ -685,17 +919,26 @@ def update_quote_lines(*, quote: CustomerQuote, user, edits: dict) -> CustomerQu
         raise ValidationError(
             "Confirm the product groups before editing lines."
         )
-    quote.line_edits = clean_line_edits(
-        edits, line_count=len(quote.lines or [])
+    from pipeline.release import bind_customer_quote
+
+    shelves = list(
+        Category.objects.filter(organization_id=quote.organization_id).values(
+            "id", "name"
+        )
     )
-    quote.save(update_fields=["line_edits"])
+    quote.line_edits = clean_line_edits(
+        edits, lines=quote.lines or [], categories=shelves
+    )
+    quote.revision = quote.revision + 1
+    bind_customer_quote(quote)
+    quote.save(update_fields=["line_edits", "revision", "approved_lines_digest"])
     record_audit(
         quote.organization_id,
         user,
         "quote_lines_edited",
         "quote",
         quote.id,
-        {"edited": len(quote.line_edits)},
+        {"edited": len(quote.line_edits), "revision": quote.revision},
     )
     return quote
 
@@ -817,6 +1060,27 @@ def delete_category(*, category: Category, user) -> None:
     )
 
 
+def delete_customer_quote(*, quote: CustomerQuote, user) -> None:
+    """Delete a draft or ready customer quote.
+
+    Operating roles only; audited. Groups, lines, and presentation
+    edits live on the quote and go with it; supplier runs, learned
+    aliases, and recorded usage are untouched, so a fresh quote can
+    be generated from the same sources at any time.
+    """
+    from organizations.services import require_organization_role
+
+    from pipeline.jobs import record_audit
+
+    require_organization_role(user, quote.organization_id)
+    organization_id = quote.organization_id
+    quote_id = quote.id
+    quote.delete()
+    record_audit(
+        organization_id, user, "quote_deleted", "quote", quote_id
+    )
+
+
 def set_file_category(
     *, source_file: SourceFile, user, category_id
 ) -> SourceFile:
@@ -863,6 +1127,7 @@ __all__ = [
     "confirm_customer_quote",
     "create_category",
     "delete_category",
+    "delete_customer_quote",
     "render_message",
     "set_file_category",
     "start_customer_quote",

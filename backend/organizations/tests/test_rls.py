@@ -8,11 +8,15 @@ context revokes visibility. Run under Compose against the real database.
 import unittest
 
 from django.contrib.auth import get_user_model
-from django.db import DatabaseError, connection
+from django.db import DatabaseError, connection, transaction
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from organizations.context import reset_tenant_context, set_tenant_context
+from organizations.context import (
+    reset_tenant_context,
+    set_tenant_context,
+    set_user_context,
+)
 from organizations.models import Invitation, Membership, Organization
 
 User = get_user_model()
@@ -33,6 +37,9 @@ class InvitationRowPolicyTests(TestCase):
         self.alice = User.objects.create_user(username="alice", password="x")
         self.org_a = Organization.objects.create(name="Org A")
         self.org_b = Organization.objects.create(name="Org B")
+        # Production publishes the verified user before membership writes;
+        # the membership policy admits a user's own rows on that key alone.
+        set_user_context(self.alice.id)
         Membership.objects.create(user=self.alice, organization=self.org_a, role="owner")
         set_tenant_context(self.org_a.id, self.alice.id)
         self.invite_a = Invitation.objects.create(
@@ -61,13 +68,16 @@ class InvitationRowPolicyTests(TestCase):
 
     def test_cross_context_write_refused(self):
         set_tenant_context(self.org_a.id, self.alice.id)
-        with self.assertRaises(DatabaseError):
-            Invitation.objects.create(
-                organization=self.org_b,
-                email="x@example.test",
-                role="viewer",
-                expires_at=timezone.now() + timezone.timedelta(days=1),
-            )
+        # The savepoint keeps the expected policy error from poisoning
+        # the TestCase transaction that cleanup queries still need.
+        with transaction.atomic():
+            with self.assertRaises(DatabaseError):
+                Invitation.objects.create(
+                    organization=self.org_b,
+                    email="x@example.test",
+                    role="viewer",
+                    expires_at=timezone.now() + timezone.timedelta(days=1),
+                )
 
     def test_reset_revokes_visibility(self):
         set_tenant_context(self.org_a.id, self.alice.id)

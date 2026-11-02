@@ -27,6 +27,8 @@ const FILE_COLUMNS: { key: string; label: string; locked?: boolean; hint?: strin
   { key: "model", label: "Model", locked: true },
   { key: "capacity", label: "Capacity GB" },
   { key: "grade", label: "Grade" },
+  { key: "color", label: "Color" },
+  { key: "conditions", label: "Conditions" },
   { key: "supplier", label: "Supplier", hint: "Sourcing intelligence — hidden by default" },
   { key: "quantity", label: "Quantity" },
   { key: "price", label: "Unit Price", locked: true },
@@ -38,12 +40,14 @@ const FILE_COLUMNS: { key: string; label: string; locked?: boolean; hint?: strin
 type MessageToggleKey =
   | "message_show_capacity"
   | "message_show_grade"
+  | "message_show_color"
   | "message_show_quantity"
   | "message_show_categories";
 
 const MESSAGE_TOGGLES: { key: MessageToggleKey; label: string; hint: string }[] = [
   { key: "message_show_capacity", label: "Capacity in rows", hint: "“128GB” after the product name" },
   { key: "message_show_grade", label: "Grade in rows", hint: "“(A)” after the product name" },
+  { key: "message_show_color", label: "Color in rows", hint: "“(Black)” after the product name" },
   { key: "message_show_quantity", label: "Quantity in rows", hint: "“×5” after the price" },
   { key: "message_show_categories", label: "Category sections", hint: "Group rows under one header per category" },
 ];

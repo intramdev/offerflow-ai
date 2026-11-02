@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import * as React from "react";
 
 import { ErrorNotice } from "@/components/app/error-notice";
@@ -10,6 +10,7 @@ import { StatusBadge } from "@/components/app/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import {
@@ -23,6 +24,7 @@ import {
 import {
   ApiError,
   confirmCustomerQuote,
+  deleteCustomerQuote,
   download,
   getCustomerQuote,
   getCustomerQuoteMessage,
@@ -33,8 +35,9 @@ import {
   type CustomerQuote,
   type QuoteGroup,
   type QuoteGroupMember,
+  type QuoteLineEdit,
 } from "@/lib/api";
-import { formatDateTime } from "@/lib/format";
+import { formatDateTime, formatMoney } from "@/lib/format";
 
 function sourceBadge(source: string, confidence: number) {
   switch (source) {
@@ -58,6 +61,7 @@ interface DraftGroup {
   brand: string;
   capacity: number | null;
   grade: string;
+  color: string;
   source: string;
   confidence: number;
   needsReview: boolean;
@@ -73,7 +77,8 @@ function sameBlock(a: DraftGroup, b: DraftGroup): boolean {
   return (
     a.brand.trim().toLowerCase() === b.brand.trim().toLowerCase() &&
     a.capacity === b.capacity &&
-    a.grade.trim().toLowerCase() === b.grade.trim().toLowerCase()
+    a.grade.trim().toLowerCase() === b.grade.trim().toLowerCase() &&
+    a.color.trim().toLowerCase() === b.color.trim().toLowerCase()
   );
 }
 
@@ -121,6 +126,7 @@ function ReconcileView({
       brand: group.brand,
       capacity: group.capacity_gb,
       grade: group.grade ?? "",
+      color: group.color ?? "",
       source: group.source,
       confidence: group.confidence,
       needsReview: group.needs_review,
@@ -178,6 +184,7 @@ function ReconcileView({
             brand: group.brand,
             capacity: group.capacity,
             grade: group.grade,
+            color: group.color,
             source: "manual",
             confidence: 1,
             needsReview: false,
@@ -229,6 +236,7 @@ function ReconcileView({
       brand: first.brand,
       capacity: first.capacity,
       grade: first.grade,
+      color: first.color,
       source: "manual",
       confidence: 1,
       needsReview: false,
@@ -289,7 +297,7 @@ function ReconcileView({
               onClick={merge}
               title={
                 chosen.length >= 2 && !mergeable
-                  ? "Only groups with the same brand, capacity, and grade can merge."
+                  ? "Only groups with the same brand, capacity, grade, and color can merge."
                   : "Merge the selected groups"
               }
             >
@@ -350,6 +358,7 @@ function ReconcileView({
                   {group.brand}
                   {group.capacity !== null ? ` · ${group.capacity}GB` : ""}
                   {group.grade ? ` · grade ${group.grade}` : ""}
+                  {group.color ? ` · ${group.color}` : ""}
                 </span>
                 {canOperate && categories.length > 0 ? (
                   <Select
@@ -396,11 +405,12 @@ function ReconcileView({
                         <span className="text-muted-foreground">
                           {" · "}
                           {member.model_name || "—"}
+                          {member.color ? ` · ${member.color}` : ""}
                           {member.grade ? ` (${member.grade})` : ""}
                         </span>
                       </span>
                       <span className="tabular-nums">
-                        {member.currency} {member.unit_price}
+                        {member.currency} {formatMoney(member.unit_price)}
                       </span>
                     </li>
                   );
@@ -425,14 +435,38 @@ function shelfSlug(name: string): string {
 interface LineDraft {
   label: string;
   hidden: boolean;
+  grade: string;
+  color: string;
+  categoryId: number | null;
+  categoryName: string;
+  supplier: string;
+  quantity: string;
+  unitPrice: string;
+  manualPrice: boolean;
 }
 
 function toDrafts(quote: CustomerQuote): LineDraft[] {
   return quote.lines.map((line, index) => {
-    const edit = quote.line_edits?.[String(index)];
+    const key = line.id ?? String(index);
+    const edit = quote.line_edits?.[key] ?? quote.line_edits?.[String(index)];
     return {
       label: edit?.label ?? line.model,
       hidden: edit?.hidden ?? false,
+      grade: edit?.grade ?? line.grade ?? "",
+      color: edit?.color ?? line.color ?? "",
+      categoryId:
+        edit && "category_id" in edit ? (edit.category_id ?? null) : line.category_id,
+      categoryName:
+        edit && "category_id" in edit
+          ? (edit.category_name ?? "")
+          : (line.category_name ?? ""),
+      supplier: edit?.supplier ?? line.supplier,
+      quantity:
+        edit?.quantity != null
+          ? String(edit.quantity)
+          : (line.quantity != null ? String(line.quantity) : ""),
+      unitPrice: edit?.unit_price ?? line.unit_price,
+      manualPrice: edit?.unit_price != null,
     };
   });
 }
@@ -453,31 +487,35 @@ function ReadyView({
   const [drafts, setDrafts] = React.useState<LineDraft[]>(() => toDrafts(quote));
   const [saving, setSaving] = React.useState(false);
   const [saved, setSaved] = React.useState(false);
-  const categorized = quote.lines.some((line) => line.category_name);
+  const [categories, setCategories] = React.useState<Category[]>([]);
+  // Saved-effective values (frozen lines + saved overrides): shelving,
+  // filtering, and display all read from here, never from frozen lines.
+  const effective = React.useMemo(() => toDrafts(quote), [quote]);
+  const categorized =
+    effective.some((row) => row.categoryName) ||
+    (canOperate && categories.length > 0);
   const shelves = React.useMemo(() => {
     const seen = new Map<number, string>();
-    for (const line of quote.lines) {
-      if (line.category_id !== null && !seen.has(line.category_id)) {
-        seen.set(line.category_id, line.category_name || "Category");
+    for (const row of effective) {
+      if (row.categoryId !== null && !seen.has(row.categoryId)) {
+        seen.set(row.categoryId, row.categoryName || "Category");
       }
     }
     return [...seen.entries()];
-  }, [quote.lines]);
-  const hasUncategorized = quote.lines.some(
-    (line) => line.category_id === null,
-  );
+  }, [effective]);
+  const hasUncategorized = effective.some((row) => row.categoryId === null);
   const showShelfPicker =
     shelves.length > 1 || (shelves.length === 1 && hasUncategorized);
   const visibleIndexes =
     shelf === ""
       ? quote.lines.map((_, index) => index)
       : shelf === "none"
-        ? quote.lines
-            .map((line, index) => (line.category_id === null ? index : -1))
+        ? effective
+            .map((row, index) => (row.categoryId === null ? index : -1))
             .filter((index) => index >= 0)
-        : quote.lines
-            .map((line, index) =>
-              line.category_id === Number(shelf) ? index : -1,
+        : effective
+            .map((row, index) =>
+              row.categoryId === Number(shelf) ? index : -1,
             )
             .filter((index) => index >= 0);
   const message = liveMessage ?? "";
@@ -485,6 +523,28 @@ function ReadyView({
   React.useEffect(() => {
     setDrafts(toDrafts(quote));
   }, [quote]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    void listCategories(quote.organization).then(
+      (rows) => {
+        if (!cancelled) setCategories(rows);
+      },
+      () => {
+        if (!cancelled) setCategories([]);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [quote.organization]);
+
+  function setCell(index: number, patch: Partial<LineDraft>) {
+    setSaved(false);
+    setDrafts((prev) =>
+      prev.map((row, i) => (i === index ? { ...row, ...patch } : row)),
+    );
+  }
 
   React.useEffect(() => {
     let cancelled = false;
@@ -518,20 +578,37 @@ function ReadyView({
     setSaved(false);
     setSaving(true);
     try {
-      const edits: Record<string, { label: string | null; hidden: boolean }> = {};
+      const edits: Record<string, QuoteLineEdit> = {};
       quote.lines.forEach((line, index) => {
-        const draft = drafts[index];
+        const draft = drafts[index] ?? effective[index];
         const label = draft.label.trim();
         if (label === "" && !draft.hidden) {
           throw new Error(
             `Line ${index + 1} needs words, or hide it from the exports.`,
           );
         }
-        const cleaned =
-          label === "" || label === line.model ? null : label;
-        if (cleaned !== null || draft.hidden) {
-          edits[String(index)] = { label: cleaned, hidden: draft.hidden };
+        const qty = draft.quantity.trim();
+        if (qty !== "" && !/^\d+$/.test(qty)) {
+          throw new Error(
+            `Line ${index + 1}: quantity must be a whole number.`,
+          );
         }
+        const price = draft.unitPrice.trim();
+        if (price === "" || !Number.isFinite(Number(price))) {
+          throw new Error(`Line ${index + 1} needs a numeric price.`);
+        }
+        // Every detail ships; the backend drops values that equal
+        // the frozen line, so untouched rows store nothing.
+        edits[String(index)] = {
+          label: label === "" || label === line.model ? null : label,
+          hidden: draft.hidden,
+          grade: draft.grade.trim(),
+          color: draft.color.trim(),
+          category_id: draft.categoryId,
+          quantity: qty === "" ? null : Number(qty),
+          supplier: draft.supplier,
+          unit_price: price,
+        };
       });
       const updated = await updateQuoteLines(quote.id, edits);
       onChanged(updated);
@@ -625,15 +702,16 @@ function ReadyView({
                   disabled={saving}
                   onClick={() => void saveLines()}
                 >
-                  {saving ? "Saving…" : "Save labels"}
+                  {saving ? "Saving…" : "Save changes"}
                 </Button>
               </div>
             ) : null}
           </div>
           <p className="text-sm text-muted-foreground">
-            Rewrite the customer-facing product text or hide a line — labels
-            and hidden lines apply to the files and the Telegram message.
-            Prices and sources stay frozen.
+            Rewrite any customer-facing detail — product text, category,
+            grade, color, supplier, quantity, or price. Manual prices are
+            marked and audited; the supplier source data stays untouched.
+            Hidden lines drop out of the files and the Telegram message.
           </p>
         </CardHeader>
         <CardContent>
@@ -642,12 +720,13 @@ function ReadyView({
               Every group was skipped — see the notes below.
             </p>
           ) : (
-            <Table>
+            <Table className="[&_td]:px-2 [&_th]:px-2">
               <TableHeader>
                 <TableRow>
                   <TableHead>Product</TableHead>
                   {categorized ? <TableHead>Category</TableHead> : null}
                   <TableHead>Grade</TableHead>
+                  <TableHead>Color</TableHead>
                   <TableHead>Supplier</TableHead>
                   <TableHead>Qty</TableHead>
                   <TableHead>Price</TableHead>
@@ -658,11 +737,14 @@ function ReadyView({
               <TableBody>
                 {visibleIndexes.map((index) => {
                   const line = quote.lines[index];
-                  const draft = drafts[index] ?? {
-                    label: line.model,
-                    hidden: false,
-                  };
+                  const draft = drafts[index] ?? effective[index];
                   const edited = draft.label.trim() !== line.model;
+                  const suppliers = [
+                    line.supplier,
+                    ...(line.candidates ?? []).map((c) => c.supplier),
+                  ].filter(
+                    (name, at, all) => name !== "" && all.indexOf(name) === at,
+                  );
                   return (
                     <TableRow
                       key={index}
@@ -672,17 +754,11 @@ function ReadyView({
                         {canOperate ? (
                           <Input
                             value={draft.label}
-                            onChange={(event) => {
-                              setSaved(false);
-                              const value = event.target.value;
-                              setDrafts((prev) =>
-                                prev.map((row, i) =>
-                                  i === index ? { ...row, label: value } : row,
-                                ),
-                              );
-                            }}
+                            onChange={(event) =>
+                              setCell(index, { label: event.target.value })
+                            }
                             aria-label={`Customer label for line ${index + 1}`}
-                            className="min-w-44"
+                            className="min-w-36"
                           />
                         ) : (
                           <span>
@@ -703,11 +779,84 @@ function ReadyView({
                         ) : null}
                       </TableCell>
                       {categorized ? (
-                        <TableCell>{line.category_name || "—"}</TableCell>
+                        <TableCell>
+                          {canOperate && categories.length > 0 ? (
+                            <Select
+                              value={
+                                draft.categoryId === null
+                                  ? ""
+                                  : String(draft.categoryId)
+                              }
+                              onChange={(event) =>
+                                setCell(index, {
+                                  categoryId:
+                                    event.target.value === ""
+                                      ? null
+                                      : Number(event.target.value),
+                                })
+                              }
+                              aria-label={`Category for line ${index + 1}`}
+                              className="h-8 w-32 py-0 text-xs"
+                            >
+                              <option value="">No category</option>
+                              {categories.map((shelf) => (
+                                <option key={shelf.id} value={shelf.id}>
+                                  {shelf.name}
+                                </option>
+                              ))}
+                            </Select>
+                          ) : (
+                            draft.categoryName || "—"
+                          )}
+                        </TableCell>
                       ) : null}
-                      <TableCell>{line.grade || "—"}</TableCell>
                       <TableCell>
-                        {line.supplier}
+                        {canOperate ? (
+                          <Input
+                            value={draft.grade}
+                            onChange={(event) =>
+                              setCell(index, { grade: event.target.value })
+                            }
+                            aria-label={`Grade for line ${index + 1}`}
+                            className="h-8 w-16 py-0"
+                          />
+                        ) : (
+                          draft.grade || "—"
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {canOperate ? (
+                          <Input
+                            value={draft.color}
+                            onChange={(event) =>
+                              setCell(index, { color: event.target.value })
+                            }
+                            aria-label={`Color for line ${index + 1}`}
+                            className="h-8 w-20 py-0"
+                          />
+                        ) : (
+                          draft.color || "—"
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {canOperate ? (
+                          <Select
+                            value={draft.supplier}
+                            onChange={(event) =>
+                              setCell(index, { supplier: event.target.value })
+                            }
+                            aria-label={`Supplier for line ${index + 1}`}
+                            className="h-8 w-32 py-0 text-xs"
+                          >
+                            {suppliers.map((name) => (
+                              <option key={name} value={name}>
+                                {name}
+                              </option>
+                            ))}
+                          </Select>
+                        ) : (
+                          draft.supplier
+                        )}
                         {(line.candidates ?? []).length > 1 ? (
                           <span className="block text-xs text-muted-foreground">
                             also:{" "}
@@ -715,15 +864,55 @@ function ReadyView({
                               .filter((c) => c.supplier !== line.supplier)
                               .map(
                                 (c) =>
-                                  `${c.supplier} ${c.currency} ${c.unit_price}`,
+                                  `${c.supplier} ${c.currency} ${formatMoney(c.unit_price)}`,
                               )
                               .join(" · ")}
                           </span>
                         ) : null}
                       </TableCell>
-                      <TableCell>{line.quantity ?? "—"}</TableCell>
+                      <TableCell>
+                        {canOperate ? (
+                          <Input
+                            value={draft.quantity}
+                            onChange={(event) =>
+                              setCell(index, { quantity: event.target.value })
+                            }
+                            inputMode="numeric"
+                            aria-label={`Quantity for line ${index + 1}`}
+                            className="h-8 w-16 py-0 tabular-nums"
+                          />
+                        ) : (
+                          draft.quantity || "—"
+                        )}
+                      </TableCell>
                       <TableCell className="tabular-nums">
-                        {line.currency} {line.unit_price}
+                        {canOperate ? (
+                          <span className="flex items-center gap-1">
+                            <span className="text-xs text-muted-foreground">
+                              {line.currency}
+                            </span>
+                            <Input
+                              value={draft.unitPrice}
+                              onChange={(event) =>
+                                setCell(index, {
+                                  unitPrice: event.target.value,
+                                })
+                              }
+                              inputMode="decimal"
+                              aria-label={`Price for line ${index + 1}`}
+                              className="h-8 w-20 py-0 tabular-nums"
+                            />
+                          </span>
+                        ) : (
+                          <span>
+                            {line.currency} {formatMoney(draft.unitPrice)}
+                          </span>
+                        )}
+                        {draft.manualPrice ? (
+                          <Badge variant="secondary" className="ml-1">
+                            Manual
+                          </Badge>
+                        ) : null}
                       </TableCell>
                       <TableCell>{line.rule ?? "—"}</TableCell>
                       <TableCell>
@@ -732,16 +921,9 @@ function ReadyView({
                             <input
                               type="checkbox"
                               checked={!draft.hidden}
-                              onChange={() => {
-                                setSaved(false);
-                                setDrafts((prev) =>
-                                  prev.map((row, i) =>
-                                    i === index
-                                      ? { ...row, hidden: !row.hidden }
-                                      : row,
-                                  ),
-                                );
-                              }}
+                              onChange={() =>
+                                setCell(index, { hidden: !draft.hidden })
+                              }
                               aria-label={`Include line ${index + 1} in exports`}
                               className="h-4 w-4 accent-primary"
                             />
@@ -809,9 +991,12 @@ function ReadyView({
 export default function QuoteDetailPage() {
   const params = useParams();
   const id = Number(params.id);
-  const { prefs } = useOrg();
+  const router = useRouter();
+  const { prefs, canOperate } = useOrg();
   const [quote, setQuote] = React.useState<CustomerQuote | null>(null);
   const [error, setError] = React.useState("");
+  const [confirming, setConfirming] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -829,6 +1014,22 @@ export default function QuoteDetailPage() {
       cancelled = true;
     };
   }, [id]);
+
+  async function confirmDelete() {
+    if (!quote) return;
+    setDeleting(true);
+    setError("");
+    try {
+      await deleteCustomerQuote(quote.id);
+      router.push("/app/quotes");
+    } catch (err) {
+      setError(
+        err instanceof ApiError ? err.message : "Could not delete the quote.",
+      );
+      setDeleting(false);
+      setConfirming(false);
+    }
+  }
 
   if (!quote && !error) {
     return <p className="text-sm text-muted-foreground">Loading quote…</p>;
@@ -859,14 +1060,43 @@ export default function QuoteDetailPage() {
             {quote.simulated ? " · matching ran locally" : ""}
           </p>
         </div>
-        <StatusBadge status={quote.status} />
+        <div className="flex items-center gap-3">
+          <StatusBadge status={quote.status} />
+          {canOperate ? (
+            <Button variant="outline" onClick={() => setConfirming(true)}>
+              Delete
+            </Button>
+          ) : null}
+        </div>
       </div>
+
+      {error ? <ErrorNotice message={error} /> : null}
 
       {quote.status === "ready" ? (
         <ReadyView quote={quote} onChanged={setQuote} />
       ) : (
         <ReconcileView quote={quote} onConfirmed={setQuote} />
       )}
+
+      <Dialog
+        open={confirming}
+        onClose={() => setConfirming(false)}
+        title="Delete this quote?"
+        description={`Quote #${quote.id} and its groups, lines, and labels will be removed. Supplier runs and learned matches stay, so you can generate a fresh quote any time. This cannot be undone.`}
+      >
+        <div className="mt-4 flex justify-end gap-2">
+          <Button variant="outline" onClick={() => setConfirming(false)}>
+            Cancel
+          </Button>
+          <Button
+            variant="destructive"
+            onClick={() => void confirmDelete()}
+            disabled={deleting}
+          >
+            {deleting ? "Deleting…" : "Delete"}
+          </Button>
+        </div>
+      </Dialog>
     </div>
   );
 }

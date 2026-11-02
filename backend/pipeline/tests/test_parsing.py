@@ -244,6 +244,29 @@ class ParsingTests(SimpleTestCase):
         sheet = parse_named(content, "prices.txt")
         self.assertEqual(sheet.rows[0].data["model"], "P1")
 
+    def test_message_fallback_reads_one_line_per_row(self):
+        content = b"iPhone 15 128GB Black 450\n\nSamsung S24 128GB 390\n"
+        sheet = parse_named(content, "paste.txt", message_fallback=True)
+        self.assertEqual(sheet.headers, ["message"])
+        self.assertEqual(sheet.column_map, {"message": 0})
+        self.assertEqual(len(sheet.rows), 2)
+        self.assertEqual(
+            sheet.rows[0].data["message"], "iPhone 15 128GB Black 450"
+        )
+        # Absolute paste line numbers survive as provenance.
+        self.assertEqual(sheet.rows[0].provenance["row"], 1)
+        self.assertEqual(sheet.rows[1].provenance["row"], 3)
+
+    def test_message_fallback_rejects_multicolumn_text(self):
+        content = b"a,b\n1,2\n"
+        with self.assertRaises(UnsupportedFile):
+            parse_named(content, "paste.txt", message_fallback=True)
+
+    def test_message_fallback_off_keeps_hard_error(self):
+        content = b"iPhone 15 128GB Black 450\n"
+        with self.assertRaises(UnsupportedFile):
+            parse_named(content, "paste.txt")
+
     def test_docx_first_table_parses(self):
         tables = [[["Supplier", "Model", "Price", "Qty"], ["Acme", "P1", "10", "2"]]]
         sheet = parse_named(make_docx(tables), "prices.docx")

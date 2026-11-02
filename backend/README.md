@@ -69,6 +69,12 @@ network with no published ports.
   `.doc` refused with guidance)
 - `POST api/pipeline/previews/` + `GET api/pipeline/previews/<key>/render/`
   — preview-first import with live mapping
+- `POST api/pipeline/previews/from-text/` — paste-text import with
+  deterministic message-lane parsing (supplier header, grade-section
+  inheritance, currency defaults) into the same mapping preview
+- `POST api/pipeline/previews/<key>/assist/` + `.../assist/apply/` —
+  preview assistant: propose an edit draft, then apply it only after
+  the user clicks **Apply to preview** (user edits always win)
 - `POST api/pipeline/previews/<key>/confirm/` — import the preview
 - `GET api/pipeline/files/` + `PUT api/pipeline/files/<id>/` — file grid
   (search, rename, per-file currency date)
@@ -96,6 +102,9 @@ network with no published ports.
   quote or one shelf (`none` = uncategorized)
 - `GET api/pipeline/quotes/<id>/message/?category_id=` — Telegram
   message, frozen whole or re-rendered per shelf
+- `DELETE api/pipeline/quotes/<id>/` — operator-only quote deletion
+  (list and detail); every quote field is editable with 2-decimal
+  currency rounding
 - `GET api/pipeline/assistant/status/?organization_id=` — paid
   assistant reachability (free to ask)
 - `POST api/pipeline/assistant/chat/` — one help turn, spent as
@@ -147,6 +156,14 @@ Cancel stops a running worker at the next chunk boundary (no further paid
 calls) and shelves runs awaiting input or review. Approved runs cannot be
 cancelled — remap one to start over.
 
+Pasted text enters the same pipeline through a deterministic message
+lane: supplier header, location/date lines, grade sections, and
+`Name - price` rows become a preview with per-row grade inheritance
+and currency defaults before any model is involved. The preview
+assistant may then propose set/drop edits against that preview alone;
+nothing it drafts reaches the pipeline until the user clicks
+**Apply to preview**.
+
 ## Simulated mode
 
 `OFFERFLOW_PROVIDER` defaults to `fixture`. The fixture provider is a pure
@@ -193,17 +210,28 @@ zero tokens) whenever dispatch complains about the model.
    key/model (Fernet-encrypted at rest, never displayed). This row serves
    all companies; disabling it refuses every paid call even if env vars
    exist. Without a complete admin row, the env vars are the fallback.
-4. Under **Spend allowances**, set each company's **monthly credits**.
+4. Under **Operator spend**, approve the operator-wide monthly ceiling.
+   On a fresh install click **Add operator spend** first — with no row
+   the admin shows no change form. Zero (the default) refuses every
+   paid call for every company, even when a company has its own
+   credits. The ceiling resets on the
+   calendar month; the operator lifetime total never resets.
+5. Under **Spend allowances**, set each company's **monthly credits**.
    Zero (the default) refuses every paid call. Credits reset on each
    company's own billing anniversary (activation day); the grand total
-   never resets. The legacy lifetime budget stays as an extra ceiling.
-5. Process one small upload and check the run's `provider_call` usage
+   never resets. The lifetime budget stays as an extra ceiling.
+6. Process one small upload and check the run's `provider_call` usage
    events: observed tokens must reconcile against the reservation, and
    the allowance must show matching spend with nothing left reserved.
 
-Budgeting example (Contributor: $0.10/M input, $0.20/M output):
-25,000,000 monthly tokens cap worst-case spend at $5, since output is the
-pricier direction.
+Budgeting illustration (Contributor list prices at time of writing:
+$0.10/M input, $0.20/M output): 25,000,000 monthly tokens would cost
+about $5 only if every token billed at the output rate. The software
+enforces token ceilings, not money: your bill depends on the provider's
+current prices, the input/output mix, and cached-input treatment, so
+size ceilings from your own invoice math, not from this example.
+Prefer Standard-billed models for sensitive supplier lists:
+Contributor-tier inputs are used to train Meta's models.
 
 ### Admin credit controls
 
@@ -213,7 +241,8 @@ pricier direction.
 - "Reset current-period usage to zero" zeroes used-this-period at once;
   the billing cycle and grand total are untouched.
 - The billing-cycle anchor day is editable per company; `paused` is the
-  per-company kill switch.
+  per-company kill switch. `paused` on **Operator spend** is the global
+  kill switch and stops new dispatch for every company.
 
 Kill switch, in order: pause the company in the admin, disable the AI
 provider config, revoke the key at the provider, unset the paid
@@ -231,6 +260,11 @@ super-admin. The admin can ban a repeat offender from the assistant
 (flag action or the User preference switch) or deactivate the account
 via the standard User admin. Out-of-scope answers always return the
 same fixed refusal text.
+
+On the Upload page a preview-assistant mode receives only the pending
+paste preview — no stored company data — and proposes set/drop edits
+as an explicit draft. Nothing is applied until the user clicks
+**Apply to preview**; user edits always win over assisted values.
 
 ### GDPR self-service
 

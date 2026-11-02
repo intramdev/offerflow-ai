@@ -226,6 +226,39 @@ class CustomerQuoteApiTests(TestCase):
         )
         self.assertEqual(refused.status_code, 403)
 
+    def test_operator_deletes_quote_but_sources_survive(self):
+        run_a, _run_b, _first, _second = self._seed_two_suppliers()
+        started = self.client.post(
+            "/api/pipeline/quotes/", {"organization_id": self.org.id}, format="json"
+        )
+        quote_id = started.data["id"]
+        deleted = self.client.delete(f"/api/pipeline/quotes/{quote_id}/")
+        self.assertEqual(deleted.status_code, 204)
+        self.assertEqual(
+            self.client.get(f"/api/pipeline/quotes/{quote_id}/").status_code, 404
+        )
+        listed = self.client.get(
+            f"/api/pipeline/quotes/?organization_id={self.org.id}"
+        )
+        self.assertNotIn(quote_id, [row["id"] for row in listed.data])
+        self.assertEqual(
+            self.client.get(f"/api/pipeline/runs/{run_a.id}/").status_code, 200
+        )
+
+    def test_viewer_cannot_delete_quote(self):
+        self._seed_two_suppliers()
+        started = self.client.post(
+            "/api/pipeline/quotes/", {"organization_id": self.org.id}, format="json"
+        )
+        quote_id = started.data["id"]
+        self.client.force_authenticate(self.viewer)
+        denied = self.client.delete(f"/api/pipeline/quotes/{quote_id}/")
+        self.assertEqual(denied.status_code, 403)
+        self.client.force_authenticate(self.owner)
+        self.assertEqual(
+            self.client.get(f"/api/pipeline/quotes/{quote_id}/").status_code, 200
+        )
+
     def test_download_needs_ready_quote(self):
         _run_a, _run_b, first, second = self._seed_two_suppliers()
         started = self.client.post(
@@ -371,11 +404,12 @@ class QuotePresentationApiTests(CustomerQuoteApiTests):
             format="json",
         )
         self.assertEqual(response.status_code, 200, response.content)
+        # Positions normalize to stable line ids on save.
         self.assertEqual(
             response.data["line_edits"],
             {
-                "0": {"label": "iPhone 15 Pro Max", "hidden": False},
-                "1": {"label": None, "hidden": True},
+                "L1": {"label": "iPhone 15 Pro Max", "hidden": False},
+                "L2": {"label": None, "hidden": True},
             },
         )
         # Frozen prices and sources stay untouched.
@@ -388,6 +422,224 @@ class QuotePresentationApiTests(CustomerQuoteApiTests):
         ).data["message"]
         self.assertIn("iPhone 15 Pro Max", message)
         self.assertNotIn("Galaxy S24", message)
+
+    def test_line_edits_override_every_detail(self):
+        from pipeline.models import Category
+
+        phones = Category.objects.create(
+            organization=self.org, name="Phones"
+        )
+        quote_id = self._ready_quote_id()
+        response = self.client.put(
+            f"/api/pipeline/quotes/{quote_id}/lines/",
+            {
+                "edits": {
+                    "0": {
+                        "label": None,
+                        "hidden": False,
+                        "grade": "A+",
+                        "color": "Black",
+                        "category_id": phones.id,
+                        "quantity": 7,
+                        "supplier": "Globex",
+                        "unit_price": "89.995",
+                    }
+                }
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        saved = response.data["line_edits"]["L1"]
+        # Manual prices round half up to the cent on save.
+        self.assertEqual(saved["unit_price"], "90.00")
+        self.assertEqual(saved["supplier"], "Globex")
+        self.assertEqual(saved["category_id"], phones.id)
+        self.assertEqual(saved["category_name"], "Phones")
+        # Frozen source values stay untouched underneath.
+        frozen = response.data["lines"][0]
+        self.assertEqual(frozen["supplier"], "Acme")
+        self.assertEqual(frozen["grade"], "A")
+        self.assertEqual(frozen["quantity"], 5)
+        self.assertEqual(frozen["unit_price"], "100.0000")
+        self.assertIsNone(frozen["category_id"])
+        message = self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/message/"
+        ).data["message"]
+        self.assertIn("(Black, A+)", message)
+        self.assertIn("USD 90.00", message)
+        body = self._csv_body(quote_id)
+        self.assertIn("90.00", body)
+        self.assertIn("A+", body)
+        shelf = self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/download/csv/"
+            f"?category_id={phones.id}"
+        )
+        self.assertEqual(shelf.status_code, 200)
+        shelf_body = b"".join(shelf.streaming_content).decode("utf-8-sig")
+        self.assertIn("iPhone 15", shelf_body)
+        self.assertNotIn("Galaxy S24", shelf_body)
+
+    def test_line_edits_reject_bad_overrides(self):
+        quote_id = self._ready_quote_id()
+        bad_edits = [
+            {"supplier": "Unknown Co"},
+            {"supplier": ""},
+            {"unit_price": "nine"},
+            {"unit_price": "-5"},
+            {"quantity": -1},
+            {"quantity": 2.5},
+            {"quantity": True},
+            {"category_id": 999999},
+            {"category_id": "phones"},
+            {"grade": "x" * 61},
+            {"color": 5},
+            {"motto": "cheapest in town"},
+        ]
+        for edits in bad_edits:
+            response = self.client.put(
+                f"/api/pipeline/quotes/{quote_id}/lines/",
+                {"edits": {"0": edits}},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 400, edits)
+
+    def test_line_edits_drop_noop_overrides(self):
+        quote_id = self._ready_quote_id()
+        response = self.client.put(
+            f"/api/pipeline/quotes/{quote_id}/lines/",
+            {
+                "edits": {
+                    "0": {
+                        "label": None,
+                        "hidden": False,
+                        "grade": "A",
+                        "color": "",
+                        "category_id": None,
+                        "quantity": 5,
+                        "supplier": "Acme",
+                        "unit_price": "100.0000",
+                    }
+                }
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.data["line_edits"], {})
+
+    def test_money_renders_two_decimals(self):
+        import io
+
+        from pipeline.quotes import format_money
+
+        self.assertEqual(format_money("245.0000"), "245.00")
+        self.assertEqual(format_money("10.005"), "10.01")
+        self.assertEqual(format_money("199.99"), "199.99")
+        self.assertEqual(format_money("n/a"), "n/a")
+        quote_id = self._ready_quote_id()
+        self.assertIn("100.00", self._csv_body(quote_id))
+        xlsx = self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/download/xlsx/"
+        )
+        self.assertEqual(xlsx.status_code, 200)
+        from openpyxl import load_workbook
+
+        sheet = load_workbook(
+            io.BytesIO(b"".join(xlsx.streaming_content))
+        ).active
+        headers = [cell.value for cell in sheet[1]]
+        price_column = headers.index("Unit Price") + 1
+        cell = sheet.cell(row=2, column=price_column)
+        self.assertEqual(cell.value, 100.0)
+        self.assertEqual(cell.number_format, "0.00")
+
+    def test_line_edits_follow_lines_into_category_files(self):
+        # R8: edits bind to stable line identity, not to the
+        # position inside a filtered shelf.
+        from pipeline.models import Category
+
+        phones = Category.objects.create(
+            organization=self.org, name="Phones"
+        )
+        tablets = Category.objects.create(
+            organization=self.org, name="Tablets"
+        )
+        run = self._run()
+        iphone = self._offer(run, supplier="Acme", model_name="iPhone 15")
+        pixel = self._offer(
+            run,
+            supplier="Acme",
+            brand="Google",
+            model_name="Pixel 8",
+            unit_price=Decimal("150.0000"),
+        )
+        galaxy = self._offer(
+            run,
+            supplier="Acme",
+            brand="Samsung",
+            model_name="Galaxy S24",
+            grade="B",
+            unit_price=Decimal("200.0000"),
+        )
+        started = self.client.post(
+            "/api/pipeline/quotes/", {"organization_id": self.org.id}, format="json"
+        )
+        quote_id = started.data["id"]
+        confirmed = self.client.post(
+            f"/api/pipeline/quotes/{quote_id}/confirm/",
+            {
+                "groups": [
+                    {
+                        "canonical_model": "iPhone 15",
+                        "offer_ids": [iphone.id],
+                        "category_id": phones.id,
+                    },
+                    {
+                        "canonical_model": "Pixel 8",
+                        "offer_ids": [pixel.id],
+                        "category_id": phones.id,
+                    },
+                    {
+                        "canonical_model": "Galaxy S24",
+                        "offer_ids": [galaxy.id],
+                        "category_id": tablets.id,
+                    },
+                ]
+            },
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.content)
+        models = [line["model"] for line in confirmed.data["lines"]]
+        # Frozen order: Apple, Google, Samsung.
+        self.assertEqual(models, ["iPhone 15", "Pixel 8", "Galaxy S24"])
+        edited = self.client.put(
+            f"/api/pipeline/quotes/{quote_id}/lines/",
+            {
+                "edits": {
+                    "0": {"hidden": True},
+                    "2": {"label": "Galaxy S24 Ultra", "hidden": False},
+                }
+            },
+            format="json",
+        )
+        self.assertEqual(edited.status_code, 200, edited.content)
+        # The tablets shelf holds only the renamed Galaxy: the
+        # hidden flag on full-list line 0 must not leak onto it.
+        shelf = self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/download/csv/?category_id={tablets.id}"
+        )
+        self.assertEqual(shelf.status_code, 200)
+        shelf_body = b"".join(shelf.streaming_content).decode("utf-8-sig")
+        self.assertIn("Galaxy S24 Ultra", shelf_body)
+        self.assertNotIn("iPhone 15", shelf_body)
+        # The full file hides the iPhone and shows the rename.
+        full = self._csv_body(quote_id)
+        self.assertNotIn("iPhone 15", full)
+        self.assertIn("Galaxy S24 Ultra", full)
+        self.assertIn("Pixel 8", full)
+        message = self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/message/?category_id={tablets.id}"
+        ).data["message"]
+        self.assertIn("Galaxy S24 Ultra", message)
 
     def test_line_edits_refused_loudly(self):
         quote_id = self._ready_quote_id()
@@ -467,7 +719,7 @@ class QuotePresentationApiTests(CustomerQuoteApiTests):
         ).data["message"]
         self.assertTrue(message.startswith("Fresh stock today\n"))
         self.assertTrue(message.endswith("\nReply to order"))
-        self.assertIn("Apple iPhone 15 — USD 100 ×5", message)
+        self.assertIn("Apple iPhone 15 — USD 100.00 ×5", message)
         self.assertNotIn("(A)", message)
         self.assertNotIn("128GB", message)
 
@@ -523,3 +775,119 @@ class QuotePresentationApiTests(CustomerQuoteApiTests):
         self.assertNotIn("supplier", template["file_columns"])
         self.assertIn("price", template["file_columns"])
         self.assertTrue(template["message_show_grade"])
+
+
+class QuoteReleaseTests(QuotePresentationApiTests):
+    def _draft_id(self):
+        self._seed_two_products()
+        started = self.client.post(
+            "/api/pipeline/quotes/", {"organization_id": self.org.id}, format="json"
+        )
+        return started.data["id"]
+
+    def test_draft_release_paths_refused(self):
+        draft_id = self._draft_id()
+        download = self.client.get(
+            f"/api/pipeline/quotes/{draft_id}/download/csv/"
+        )
+        self.assertEqual(download.status_code, 400)
+        self.assertIn("Confirm the product groups", str(download.data))
+        message = self.client.get(f"/api/pipeline/quotes/{draft_id}/message/")
+        self.assertEqual(message.status_code, 400)
+        self.assertIn("Confirm the product groups", str(message.data))
+
+    def test_release_manifest_names_exact_revision(self):
+        quote_id = self._ready_quote_id()
+        message = self.client.get(f"/api/pipeline/quotes/{quote_id}/message/")
+        self.assertEqual(message.status_code, 200)
+        manifest = message.data["release"]
+        self.assertEqual(manifest["quote_id"], quote_id)
+        self.assertEqual(manifest["revision"], 1)
+        self.assertTrue(manifest["lines_digest"])
+        self.assertTrue(manifest["template_digest"])
+        edited = self.client.put(
+            f"/api/pipeline/quotes/{quote_id}/lines/",
+            {"edits": {"1": {"hidden": True}}},
+            format="json",
+        )
+        self.assertEqual(edited.status_code, 200)
+        reread = self.client.get(f"/api/pipeline/quotes/{quote_id}/message/")
+        self.assertEqual(reread.status_code, 200)
+        self.assertEqual(reread.data["release"]["revision"], 2)
+        self.assertNotEqual(
+            reread.data["release"]["lines_digest"], manifest["lines_digest"]
+        )
+        detail = self.client.get(f"/api/pipeline/quotes/{quote_id}/")
+        self.assertEqual(detail.data["revision"], 2)
+
+    def test_tampered_lines_refused(self):
+        quote_id = self._ready_quote_id()
+        quote = CustomerQuote.objects.get(pk=quote_id)
+        lines = list(quote.lines)
+        lines[0] = dict(lines[0], unit_price="0.01")
+        CustomerQuote.objects.filter(pk=quote_id).update(lines=lines)
+        response = self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/download/csv/"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("audited edit flow", str(response.data))
+
+    def test_legacy_unbound_quote_refused(self):
+        quote = CustomerQuote.objects.create(
+            organization=self.org,
+            created_by=self.owner,
+            status="ready",
+            lines=[{"model": "X", "quantity": 1, "unit_price": "5", "currency": "EUR"}],
+        )
+        response = self.client.get(
+            f"/api/pipeline/quotes/{quote.id}/download/csv/"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("audited edit flow", str(response.data))
+
+    def test_changed_source_invalidates_quote(self):
+        quote_id = self._ready_quote_id()
+        quote = CustomerQuote.objects.get(pk=quote_id)
+        run = ImportRun.objects.get(pk=quote.source_run_ids[0])
+        self._offer(run, supplier="Latecomer", model_name="iPhone 15")
+        response = self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/download/csv/"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("changed since confirmation", str(response.data))
+
+    def test_unapproved_source_invalidates_quote(self):
+        quote_id = self._ready_quote_id()
+        quote = CustomerQuote.objects.get(pk=quote_id)
+        ImportRun.objects.filter(pk=quote.source_run_ids[0]).update(
+            status=RunStatus.UPLOADED
+        )
+        response = self.client.get(f"/api/pipeline/quotes/{quote_id}/message/")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("no longer approved", str(response.data))
+
+    def test_deleted_source_invalidates_quote(self):
+        quote_id = self._ready_quote_id()
+        quote = CustomerQuote.objects.get(pk=quote_id)
+        ImportRun.objects.filter(pk=quote.source_run_ids[0]).delete()
+        response = self.client.get(
+            f"/api/pipeline/quotes/{quote_id}/download/csv/"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("deleted", str(response.data))
+
+    def test_message_file_and_detail_agree(self):
+        quote_id = self._ready_quote_id()
+        self.client.put(
+            f"/api/pipeline/quotes/{quote_id}/lines/",
+            {"edits": {"0": {"label": "IPHONE 15 128GB GRADE A"}}},
+            format="json",
+        )
+        message = self.client.get(f"/api/pipeline/quotes/{quote_id}/message/")
+        body = self._csv_body(quote_id)
+        detail = self.client.get(f"/api/pipeline/quotes/{quote_id}/")
+        self.assertIn("IPHONE 15 128GB GRADE A", message.data["message"])
+        self.assertIn("IPHONE 15 128GB GRADE A", body)
+        self.assertEqual(
+            detail.data["line_edits"]["L1"]["label"], "IPHONE 15 128GB GRADE A"
+        )

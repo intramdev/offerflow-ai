@@ -7,6 +7,9 @@ class OrganizationsConfig(AppConfig):
 
     def ready(self):
         # Imported for signal side effects.
-        from organizations import signals
+        from django.core.checks import register
+
+        from organizations import checks, signals
 
         assert signals is not None
+        register(checks.check_runtime_role_is_restricted)

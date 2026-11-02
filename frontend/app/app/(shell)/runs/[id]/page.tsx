@@ -13,7 +13,8 @@ import {
   type HeaderOption,
 } from "@/components/app/field-mapper";
 import { useOrg } from "@/components/app/org-context";
-import { formatDate } from "@/lib/format";
+import { formatDate, type DateTimeFormat } from "@/lib/format";
+import { selectFxPair, type FxPairStatus } from "@/lib/fx";
 import { StatusBadge } from "@/components/app/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -55,6 +56,80 @@ function formatRate(raw: string): string {
   const value = Number(raw);
   if (!Number.isFinite(value)) return raw;
   return value.toFixed(6).replace(/\.?0+$/, "");
+}
+
+function FxPairLine({
+  fx,
+  organizationId,
+  datetimeFormat,
+}: {
+  fx: Quote["fx"];
+  organizationId: number | null;
+  datetimeFormat: DateTimeFormat;
+}) {
+  const [pair, setPair] = useState<{ from: string; to: string } | null>(null);
+
+  useEffect(() => {
+    if (organizationId === null) return;
+    let cancelled = false;
+    void getOrgSettings(organizationId).then(
+      (settings) => {
+        if (cancelled) return;
+        setPair({
+          from: settings.default_currency,
+          to: settings.destination_currency,
+        });
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [organizationId]);
+
+  if (!pair) {
+    return (
+      <p className="text-sm text-muted-foreground">Loading exchange rate…</p>
+    );
+  }
+  const status: FxPairStatus = selectFxPair(fx, pair.from, pair.to);
+  const day = formatDate(fx.currency_date + "T00:00:00", datetimeFormat);
+  const provenance = fx.simulated ? "simulated" : (fx.source ?? "recorded rates");
+  if (status.kind === "same") {
+    return (
+      <p className="text-sm text-muted-foreground">
+        No conversion needed ({status.currency}).
+      </p>
+    );
+  }
+  if (status.kind === "rate") {
+    return (
+      <div className="space-y-1 text-sm text-muted-foreground">
+        <p>
+          Exchange rate: {status.from} -&gt; {status.to}; 1 {status.from} ={" "}
+          <span className="tabular-nums">
+            {formatRate(status.rate)} {status.to}
+          </span>
+          ; {day} ({provenance}).
+        </p>
+        <p>Change the date on the Files page to reprice.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-1 text-sm text-muted-foreground">
+      <p>
+        Exchange rate {status.from || "—"} -&gt; {status.to || "—"}: unavailable
+        — no recorded rate for this pair.
+      </p>
+      <p>
+        {status.recordedDestination
+          ? `Recorded rates convert to ${status.recordedDestination}; `
+          : ""}
+        Change the date on the Files page to reprice.
+      </p>
+    </div>
+  );
 }
 
 function AnswerForm({ review, onAnswered }: { review: Review; onAnswered: () => void }) {
@@ -276,6 +351,92 @@ function RemapDialog({
   );
 }
 
+const STAGES = [
+  { key: "uploaded", label: "Queued" },
+  { key: "parsing", label: "Parsing" },
+  { key: "interpretation", label: "Interpreting" },
+  { key: "validation", label: "Validating" },
+] as const;
+
+function RunProgress({
+  run,
+  aiProgress,
+}: {
+  run: Run;
+  aiProgress: { done: number; total: number } | null;
+}) {
+  const stageIndex = STAGES.findIndex((stage) => stage.key === run.status);
+  const percent =
+    run.status === "interpretation" && aiProgress && aiProgress.total > 0
+      ? Math.min(100, Math.round((aiProgress.done / aiProgress.total) * 100))
+      : null;
+  const provider = run.provider_name || "AI";
+  const detail =
+    run.status === "uploaded"
+      ? "Waiting for a worker to pick up the file…"
+      : run.status === "parsing"
+        ? "Reading the spreadsheet…"
+        : run.status === "interpretation"
+          ? !run.simulated && aiProgress
+            ? `Enriching ${run.counts.rows} rows with ${provider}… call ${aiProgress.done} of ${aiProgress.total} done.`
+            : !run.simulated
+              ? `Contacting ${provider}…`
+              : "Interpreting rows locally…"
+          : "Running validation checks…";
+  return (
+    <div className="mt-4 rounded-md border border-border bg-muted/40 p-4">
+      <ol
+        className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs"
+        aria-label="Import progress"
+      >
+        {STAGES.map((stage, index) => {
+          const done = index < stageIndex;
+          const current = index === stageIndex;
+          return (
+            <li
+              key={stage.key}
+              aria-current={current ? "step" : undefined}
+              className={
+                current
+                  ? "font-semibold text-foreground"
+                  : done
+                    ? "text-muted-foreground"
+                    : "text-muted-foreground/60"
+              }
+            >
+              <span aria-hidden>
+                {done ? "✓ " : current ? "● " : "○ "}
+              </span>
+              {stage.label}
+            </li>
+          );
+        })}
+      </ol>
+      <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
+        {percent !== null ? (
+          <div
+            role="progressbar"
+            aria-label="AI interpretation progress"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={percent}
+            aria-valuetext={`${aiProgress?.done} of ${aiProgress?.total} calls done`}
+            className="h-full rounded-full bg-primary motion-safe:transition-[width] motion-safe:duration-500"
+            style={{ width: `${percent}%` }}
+          />
+        ) : (
+          <div
+            role="progressbar"
+            aria-label={detail}
+            className="h-full w-1/3 rounded-full bg-primary motion-safe:animate-pulse"
+          />
+        )}
+      </div>
+      <p className="mt-2 text-sm text-muted-foreground">{detail}</p>
+    </div>
+  );
+}
+
 export default function RunPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const { canOperate, prefs } = useOrg();
@@ -394,11 +555,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
         {run.error ? <div className="mt-3"><ErrorNotice message={run.error} /></div> : null}
         {error ? <div className="mt-3"><ErrorNotice message={error} /></div> : null}
         {ACTIVE.has(run.status) ? (
-          <p className="mt-3 text-sm text-muted-foreground">
-            {run.status === "interpretation" && !run.simulated && aiProgress
-              ? `Enriching ${run.counts.rows} rows with AI… call ${aiProgress.done} of ${aiProgress.total} done.`
-              : "Processing… this page refreshes itself."}
-          </p>
+          <RunProgress run={run} aiProgress={aiProgress} />
         ) : null}
       </div>
 
@@ -495,28 +652,12 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
 
       <section className="space-y-3">
         <h2 className="text-lg font-semibold">Customer quote</h2>
-        {quote?.fx.destination ? (
-          <div className="space-y-1 text-sm text-muted-foreground">
-            <p>
-              {quote.fx.destination} rates of{" "}
-              {formatDate(
-                quote.fx.currency_date + "T00:00:00",
-                prefs.datetime_format,
-              )}
-              {quote.fx.simulated ? " (simulated)" : ` (${quote.fx.source})`}.
-              Change the date on the Files page to reprice.
-            </p>
-            {Object.keys(quote.fx.rates).length > 0 ? (
-              <p className="tabular-nums">
-                {Object.entries(quote.fx.rates)
-                  .map(
-                    ([from, rate]) =>
-                      `1 ${from} = ${formatRate(rate)} ${quote.fx.destination}`,
-                  )
-                  .join(" · ")}
-              </p>
-            ) : null}
-          </div>
+        {quote ? (
+          <FxPairLine
+            fx={quote.fx}
+            organizationId={run?.organization ?? null}
+            datetimeFormat={prefs.datetime_format}
+          />
         ) : null}
         {!quote || quote.lines.length === 0 ? (
           <p className="text-sm text-muted-foreground">

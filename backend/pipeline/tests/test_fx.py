@@ -49,6 +49,20 @@ class FixtureProviderTests(TestCase):
         self.assertEqual(rates["EUR"], "1.000000")
         self.assertIn("USD", rates)
 
+    def test_fixture_direction_matches_anchors(self):
+        # Units-per-USD anchors say 1 USD ~ 0.92 EUR and
+        # 1 CZK ~ 0.92/23.1 EUR; day jitter stays within half a percent,
+        # so generous bands still prove the direction (an inversion
+        # would read ~1.09 and ~25.1 instead).
+        rates = FixtureFxProvider().rates_for(date(2026, 10, 30), "EUR")["rates"]
+        usd = Decimal(rates["USD"])
+        czk = Decimal(rates["CZK"])
+        self.assertLess(usd, Decimal("1"))
+        self.assertGreater(usd, Decimal("0.9"))
+        self.assertLess(usd, Decimal("0.95"))
+        self.assertGreater(czk, Decimal("0.039"))
+        self.assertLess(czk, Decimal("0.041"))
+
     def test_supported_list_is_alphabetical(self):
         codes = list(SUPPORTED_CURRENCIES)
         self.assertEqual(len(codes), 34)
@@ -139,6 +153,26 @@ class FileFxTests(TestCase):
         offers = self.client.get(f"/api/pipeline/runs/{run.id}/offers/").data
         self.assertEqual(offers[0]["currency"], "USD")
         self.assertEqual(offers[0]["unit_price"], "299.9900")
+
+    def test_quote_fx_exposes_single_pair_inputs(self):
+        # The run panel shows exactly one configured pair from this
+        # payload: destination, the recorded table, date, and the
+        # simulated/source provenance. The recorded USD rate is
+        # destination units per dollar (direction, not an example).
+        from decimal import Decimal
+
+        self.org.destination_currency = "EUR"
+        self.org.save(update_fields=["destination_currency"])
+        run = self._upload()
+        quote = self.client.get(f"/api/pipeline/runs/{run.id}/quote/").data
+        fx = quote["fx"]
+        self.assertEqual(fx["destination"], "EUR")
+        self.assertEqual(fx["currency_date"], timezone.localdate().isoformat())
+        self.assertTrue(fx["simulated"])
+        self.assertIn("synthetic", fx["source"])
+        rate = Decimal(fx["rates"]["USD"])
+        self.assertGreater(rate, Decimal("0.9"))
+        self.assertLess(rate, Decimal("0.95"))
 
     def test_no_destination_leaves_table_empty(self):
         self.org.destination_currency = ""
@@ -316,6 +350,35 @@ class FileFxTests(TestCase):
             quote["fx"]["currency_date"], timezone.localdate().isoformat()
         )
         self.assertIn("synthetic", quote["fx"]["source"])
+
+    def test_quote_converts_along_hand_recorded_rate(self):
+        # Independently directed example: with 1 USD = 0.92 EUR
+        # recorded on the file, $299.99 must shrink to ~EUR 276,
+        # never grow past the dollar amount.
+        self.org.destination_currency = "EUR"
+        self.org.save(update_fields=["destination_currency"])
+        run = self._upload()
+        source = SourceFile.objects.get(pk=run.source_file_id)
+        source.fx_rates = {"USD": "0.920000"}
+        source.save(update_fields=["fx_rates"])
+        create_rule(
+            organization=self.org,
+            user=self.alice,
+            data={
+                "name": "To EUR",
+                "matcher": {},
+                "supplier_strategy": "lowest",
+                "preferred_supplier": "",
+                "ops": [{"op": "convert_to_destination"}],
+                "priority": 100,
+                "active": True,
+            },
+        )
+        quote = build_quote(ImportRun.objects.get(pk=run.id))
+        self.assertEqual(len(quote["lines"]), 1)
+        converted = Decimal(quote["lines"][0]["unit_price"])
+        self.assertEqual(converted, Decimal("299.9900") * Decimal("0.920000"))
+        self.assertLess(converted, Decimal("299.9900"))
 
     def test_quote_skips_currency_without_recorded_rate(self):
         self.org.destination_currency = "EUR"

@@ -36,7 +36,7 @@ from pipeline.models import (
     SourceRow,
     UsageEvent,
 )
-from pipeline.spending import get_allowance
+from pipeline.spending import get_allowance, get_operator_spend
 
 User = get_user_model()
 
@@ -262,6 +262,17 @@ class SimulatedProposeTests(MatchingCase):
         result = propose_groups(organization=self.org, offers=[apple, pear])
         self.assertEqual(len(result["groups"]), 2)
 
+    def test_color_blocks_apart(self):
+        # R7: different colors are different stock and must not
+        # silently merge into one group.
+        run = self._run()
+        black = self._offer(run, model_name="iPhone 15", color="Black")
+        white = self._offer(run, model_name="iPhone 15", color="White")
+        result = propose_groups(organization=self.org, offers=[black, white])
+        self.assertEqual(len(result["groups"]), 2)
+        colors = sorted(g["color"] for g in result["groups"])
+        self.assertEqual(colors, ["Black", "White"])
+
     def test_unknown_spellings_stay_provisional(self):
         run = self._run()
         first = self._offer(run, supplier="A", model_name="iPhone 15")
@@ -478,6 +489,21 @@ class RememberTests(MatchingCase):
             )
         self.assertIn("capacities", str(ctx.exception))
 
+    def test_cross_color_merge_refused(self):
+        # R7: a manual reconcile across colors is refused loudly.
+        run = self._run()
+        black = self._offer(run, model_name="iPhone 15", color="Black")
+        white = self._offer(run, model_name="iPhone 15", color="White")
+        with self.assertRaises(ValidationError) as ctx:
+            remember_decisions(
+                organization=self.org,
+                decisions=[
+                    {"canonical_model": "iPhone 15", "offer_ids": [black.id, white.id]}
+                ],
+                expected_offer_ids=[black.id, white.id],
+            )
+        self.assertIn("colors", str(ctx.exception))
+
     def test_coverage_exactly_once(self):
         run = self._run()
         first = self._offer(run, model_name="iPhone 15")
@@ -583,6 +609,9 @@ class MetaMatchWireTests(TestCase):
         allowance.token_budget = credits
         allowance.monthly_credits = credits
         allowance.save()
+        operator = get_operator_spend()
+        operator.monthly_ceiling = credits
+        operator.save(update_fields=["monthly_ceiling"])
         return allowance
 
     def _payload(self):
@@ -999,6 +1028,9 @@ class MetaCategorizeWireTests(TestCase):
         allowance.token_budget = credits
         allowance.monthly_credits = credits
         allowance.save()
+        operator = get_operator_spend()
+        operator.monthly_ceiling = credits
+        operator.save(update_fields=["monthly_ceiling"])
         return allowance
 
     def _payload(self):

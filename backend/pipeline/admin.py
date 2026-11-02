@@ -9,8 +9,10 @@ from pipeline.models import (
     Category,
     CustomerQuote,
     ImportRun,
+    OperatorSpend,
     ProductAlias,
     SpendAllowance,
+    SpendReservation,
     Supplier,
     SupplierNote,
 )
@@ -22,6 +24,65 @@ class CreditAdjustForm(forms.Form):
         help_text="Positive adds credits, negative removes them. "
         "Allowances never go below zero.",
     )
+
+
+@admin.register(OperatorSpend)
+class OperatorSpendAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "monthly_ceiling",
+        "period_spent",
+        "tokens_reserved",
+        "lifetime_spent",
+        "paused",
+    )
+    readonly_fields = (
+        "period_start",
+        "period_spent",
+        "tokens_reserved",
+        "lifetime_spent",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request):
+        # Singleton: creatable exactly once. A blanket refusal on an
+        # empty table would leave paid dispatch permanently
+        # unapproved, since refused reserves roll their auto-created
+        # row back and the admin would offer no row to approve.
+        return not OperatorSpend.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(SpendReservation)
+class SpendReservationAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "organization",
+        "state",
+        "tokens",
+        "actual_tokens",
+        "purpose",
+        "expires_at",
+    )
+    list_filter = ("state", "organization")
+    search_fields = ("purpose",)
+    readonly_fields = (
+        "allowance",
+        "organization",
+        "tokens",
+        "state",
+        "purpose",
+        "detail",
+        "actual_tokens",
+        "created_at",
+        "expires_at",
+        "settled_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
 
 
 @admin.register(AssistantFlag)

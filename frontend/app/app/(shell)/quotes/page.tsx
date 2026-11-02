@@ -10,8 +10,10 @@ import { Pager } from "@/components/app/pager";
 import { StatusBadge } from "@/components/app/status-badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog } from "@/components/ui/dialog";
 import {
   ApiError,
+  deleteCustomerQuote,
   listCustomerQuotesPage,
   startCustomerQuote,
   type CustomerQuote,
@@ -27,6 +29,8 @@ export default function QuotesPage() {
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const [pending, setPending] = React.useState<CustomerQuote | null>(null);
+  const [deleting, setDeleting] = React.useState(false);
 
   const reload = React.useCallback(
     async (wanted: number) => {
@@ -64,6 +68,28 @@ export default function QuotesPage() {
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not start a quote.");
       setBusy(false);
+    }
+  }
+
+  async function confirmDelete() {
+    if (!pending) return;
+    setDeleting(true);
+    setError("");
+    try {
+      await deleteCustomerQuote(pending.id);
+      setPending(null);
+      const remaining = (quotes ?? []).filter((row) => row.id !== pending.id);
+      if (remaining.length === 0 && page > 1) {
+        void reload(page - 1);
+      } else {
+        setQuotes(remaining);
+      }
+    } catch (err) {
+      setError(
+        err instanceof ApiError ? err.message : "Could not delete the quote.",
+      );
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -123,6 +149,15 @@ export default function QuotesPage() {
                         : `${quote.groups.length} groups`}
                     </span>
                     <StatusBadge status={quote.status} />
+                    {canOperate ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setPending(quote)}
+                      >
+                        Delete
+                      </Button>
+                    ) : null}
                   </div>
                 </li>
               ))}
@@ -139,6 +174,26 @@ export default function QuotesPage() {
           ) : null}
         </CardContent>
       </Card>
+
+      <Dialog
+        open={pending !== null}
+        onClose={() => setPending(null)}
+        title="Delete this quote?"
+        description={`Quote #${pending?.id} and its groups, lines, and labels will be removed. Supplier runs and learned matches stay, so you can generate a fresh quote any time. This cannot be undone.`}
+      >
+        <div className="mt-4 flex justify-end gap-2">
+          <Button variant="outline" onClick={() => setPending(null)}>
+            Cancel
+          </Button>
+          <Button
+            variant="destructive"
+            onClick={() => void confirmDelete()}
+            disabled={deleting}
+          >
+            {deleting ? "Deleting…" : "Delete"}
+          </Button>
+        </div>
+      </Dialog>
     </div>
   );
 }

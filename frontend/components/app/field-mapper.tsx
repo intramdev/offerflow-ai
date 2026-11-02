@@ -103,6 +103,7 @@ export function FieldMapper({
   onChange,
   autoFields,
   currencies,
+  valuesOnly,
 }: {
   headers: HeaderOption[];
   selection: FieldSelection;
@@ -110,6 +111,12 @@ export function FieldMapper({
   autoFields?: string[];
   /** Supported currency codes; null while loading (falls back to text). */
   currencies?: string[] | null;
+  /**
+   * Message imports have no columns: offer only "not set" or a fixed
+   * value per field, and never nag about required fields — the
+   * interpretation lane and human reviews cover the gaps.
+   */
+  valuesOnly?: boolean;
 }) {
   function choose(field: string, selectValue: string) {
     const current = selection[field];
@@ -144,6 +151,7 @@ export function FieldMapper({
               ? ""
               : choice.kind;
         const unresolved =
+          !valuesOnly &&
           field.required &&
           (choice.kind === "" ||
             choice.kind === "ignore" ||
@@ -154,7 +162,9 @@ export function FieldMapper({
             <label className="block text-sm font-medium">
               <span className="mb-1.5 flex items-center gap-2">
                 {field.label}
-                {field.required ? <Badge variant="outline">required</Badge> : null}
+                {field.required && !valuesOnly ? (
+                  <Badge variant="outline">required</Badge>
+                ) : null}
                 {autoFields?.includes(field.name) ? (
                   <span className="text-xs font-normal text-muted-foreground">auto</span>
                 ) : null}
@@ -168,13 +178,15 @@ export function FieldMapper({
                 className={cn(unresolved && "border-destructive")}
                 aria-label={`${field.label} column`}
               >
-                <option value="">Not mapped</option>
+                <option value="">{valuesOnly ? "Not set" : "Not mapped"}</option>
                 {headers.map((h) => (
                   <option key={h.position} value={h.position}>
                     {h.letter} — {h.header || "(blank header)"}
                   </option>
                 ))}
-                <option value="ignore">Ignore this field</option>
+                {valuesOnly ? null : (
+                  <option value="ignore">Ignore this field</option>
+                )}
                 <option value="custom">Set a value…</option>
               </Select>
             </label>

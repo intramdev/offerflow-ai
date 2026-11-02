@@ -113,6 +113,22 @@ if _DB_ENGINE == "postgresql":
             "PORT": _env("OFFERFLOW_DB_PORT", "5432"),
         }
     }
+    # Privileged migration/administration connection. The web and worker
+    # processes never use it at runtime; it exists so `migrate
+    # --database=admin` and `provision_runtime` can run with a role that
+    # owns the schema while `default` stays restricted. It mirrors the
+    # default test database so the suite never builds a second one.
+    _DB_ADMIN_USER = _env("OFFERFLOW_DB_ADMIN_USER", "")
+    if _DB_ADMIN_USER:
+        DATABASES["admin"] = {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": _env("OFFERFLOW_DB_NAME", "offerflow"),
+            "USER": _DB_ADMIN_USER,
+            "PASSWORD": _env_required("OFFERFLOW_DB_ADMIN_PASSWORD"),
+            "HOST": _env("OFFERFLOW_DB_HOST", "db"),
+            "PORT": _env("OFFERFLOW_DB_PORT", "5432"),
+            "TEST": {"MIRROR": "default"},
+        }
 elif _DB_ENGINE == "sqlite":
     # Dependency-free local unit-test runs only. Never for application runs.
     DATABASES = {

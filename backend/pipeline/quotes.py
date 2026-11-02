@@ -41,6 +41,8 @@ QUOTE_COLUMN_KEYS = (
     "model",
     "capacity",
     "grade",
+    "color",
+    "conditions",
     "supplier",
     "quantity",
     "price",
@@ -53,6 +55,8 @@ QUOTE_COLUMN_HEADERS = {
     "model": "Model",
     "capacity": "Capacity GB",
     "grade": "Grade",
+    "color": "Color",
+    "conditions": "Conditions",
     "supplier": "Supplier",
     "quantity": "Quantity",
     "price": "Unit Price",
@@ -213,6 +217,7 @@ def _group_key(offer) -> tuple:
         (offer.model_name or "").strip().lower(),
         offer.capacity_gb,
         (offer.grade or "").strip().lower(),
+        (offer.color or "").strip().lower(),
         (offer.currency or "").strip().upper(),
     )
 
@@ -350,6 +355,8 @@ def build_quote(run) -> dict:
                 "model": attrs["model"],
                 "capacity_gb": first.capacity_gb,
                 "grade": attrs["grade"],
+                "color": first.color or "",
+                "conditions": picked.conditions or "",
                 "supplier": picked.supplier,
                 "quantity": picked.quantity,
                 "unit_price": str(price),
@@ -374,21 +381,45 @@ def _cell(value):
     return value
 
 
+#: Customer-facing money always renders to the cent, half up:
+#: 245 renders as 245.00, 10.005 as 10.01. Stored values keep
+#: full precision; only the display is rounded.
+CENTS = Decimal("0.01")
+
+
+def format_money(value) -> str:
+    """Render a price string/number with exactly two decimals."""
+    try:
+        return format(Decimal(str(value).strip()).quantize(CENTS, ROUND_HALF_UP), "f")
+    except Exception:
+        return str(value)
+
+
 def _quote_cells(line: dict, *, numbers: bool) -> dict:
     """One quote line as template column key -> rendered cell."""
     price = line["unit_price"]
     capacity = line["capacity_gb"]
     quantity = line["quantity"]
     if numbers:
-        price = float(price)
+        try:
+            price = float(
+                Decimal(str(price).strip()).quantize(CENTS, ROUND_HALF_UP)
+            )
+        except Exception:
+            price = float(price)
     else:
         capacity = _cell(capacity)
         quantity = _cell(quantity)
+        price = format_money(price)
     return {
         "brand": sanitize_cell(line["brand"]),
         "model": sanitize_cell(line["model"]),
         "capacity": capacity,
         "grade": sanitize_cell(line["grade"]),
+        # Quotes frozen before variants were tracked carry no keys;
+        # they render blank rather than breaking the download.
+        "color": sanitize_cell(line.get("color") or ""),
+        "conditions": sanitize_cell(line.get("conditions") or ""),
         "supplier": sanitize_cell(line["supplier"]),
         "quantity": quantity,
         "price": price,
@@ -463,6 +494,14 @@ def render_quote_xlsx(
     for line in quote["lines"]:
         cells = _quote_cells(line, numbers=True)
         sheet.append([cells[key] for key in keys])
+    if "price" in keys:
+        price_column = keys.index("price") + 1
+        for row in sheet.iter_rows(
+            min_row=2, min_col=price_column, max_col=price_column
+        ):
+            for cell in row:
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = "0.00"
     buffer = io.BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()

@@ -13,7 +13,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from django.conf import settings
-from django.core.exceptions import ValidationError
+from django.core.exceptions import PermissionDenied, ValidationError
 
 from common.storage import LocalFileAdapter
 from organizations.services import authorize_organization_access
@@ -28,6 +28,7 @@ from pipeline.normalize import (
 )
 from pipeline.parsing import (
     HEADER_TOKENS,
+    MESSAGE_COLUMN,
     REQUIRED_COLUMNS,
     MappingRequired,
     UnsupportedFile,
@@ -96,6 +97,38 @@ def _gc_previews() -> None:
             if re.fullmatch(r"[A-Za-z0-9_-]{8,64}", key or ""):
                 adapter.delete(f"previews/{key}.bin")
                 adapter.delete(f"previews/{key}.json")
+
+
+def _derive_sheet(content, original_name, limits, message_fallback):
+    """Parse preview bytes into headers, map, sources, missing, row count.
+
+    Shared by creation and assist-apply so re-derived previews always
+    match what a fresh upload of the same bytes would show.
+    """
+    try:
+        sheet = parse_upload(
+            content,
+            original_name,
+            max_rows=limits["max_rows"],
+            max_cols=limits["max_cols"],
+            header_scan_rows=limits["header_scan_rows"],
+            message_fallback=message_fallback,
+        )
+        return (
+            sheet.headers,
+            sheet.column_map,
+            sheet.sources,
+            [],
+            len(sheet.rows),
+        )
+    except MappingRequired as exc:
+        return (
+            exc.headers,
+            exc.column_map,
+            exc.sources,
+            exc.missing,
+            len(exc.rows),
+        )
 
 
 def _load_preview(key: str) -> dict:
@@ -236,7 +269,10 @@ def _clean_positions(
         cleaned[canonical] = position
     if len(set(cleaned.values())) != len(cleaned):
         raise ValidationError("Two fields point at the same column.")
-    effective = dict(detected or {})
+    # The synthetic message column is not mappable: drop anything the
+    # header vocabulary does not know so it can never reach the parser
+    # as a column override (message previews map nothing).
+    effective = {k: v for k, v in (detected or {}).items() if k in HEADER_TOKENS}
     effective.update(cleaned)
     if len(set(effective.values())) != len(effective):
         raise ValidationError("The mapping assigns one column twice.")
@@ -302,7 +338,8 @@ def _with_currency_default(mapping: dict, constants: dict, default_currency: str
 
 
 def _render_samples(content: bytes, filename: str, mapping: dict,
-                    constants=None, ignored=None, default_currency="") -> dict:
+                    constants=None, ignored=None, default_currency="",
+                    message_fallback: bool = False) -> dict:
     limits = _limits()
     merged, labels, applied = _with_currency_default(
         mapping, constants, default_currency, ignored
@@ -318,6 +355,7 @@ def _render_samples(content: bytes, filename: str, mapping: dict,
             column_constants=merged or None,
             ignored_columns=ignored or None,
             constant_sources=labels or None,
+            message_fallback=message_fallback,
         )
     except MappingRequired as exc:
         return {
@@ -381,12 +419,45 @@ def _reject_duplicate(*, organization, user, original_name: str, digest: str) ->
 
 def create_preview(*, organization, user, uploaded_file) -> dict:
     """Store preview bytes and propose a mapping with sample rows."""
-    from pipeline.jobs import record_audit
-
     original_name = getattr(uploaded_file, "name", "") or ""
     content = uploaded_file.read()
     if not content:
         raise ValidationError("Empty file.")
+    return _create_preview(
+        organization=organization,
+        user=user,
+        content=content,
+        original_name=original_name,
+        message_fallback=False,
+    )
+
+
+def create_preview_from_text(*, organization, user, text: str) -> dict:
+    """Preview pasted text as if it were an uploaded .txt file.
+
+    Tabular pastes flow through the normal mapping UI; headerless
+    single-column pastes become message rows (one per line) that the
+    interpretation lane reads, flagged message_lines for the UI.
+    """
+    content = (text or "").encode("utf-8")
+    if not content.strip():
+        raise ValidationError("Paste some text first.")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return _create_preview(
+        organization=organization,
+        user=user,
+        content=content,
+        original_name=f"pasted-text-{stamp}.txt",
+        message_fallback=True,
+    )
+
+
+def _create_preview(
+    *, organization, user, content: bytes, original_name: str,
+    message_fallback: bool,
+) -> dict:
+    from pipeline.jobs import record_audit
+
     limits = _limits()
     try:
         extension = check_upload_safety(
@@ -401,36 +472,30 @@ def create_preview(*, organization, user, uploaded_file) -> dict:
     _reject_duplicate(
         organization=organization, user=user, original_name=original_name, digest=digest
     )
-    try:
-        sheet = parse_upload(
-            content,
-            original_name,
-            max_rows=limits["max_rows"],
-            max_cols=limits["max_cols"],
-            header_scan_rows=limits["header_scan_rows"],
-        )
-        headers, detected, sources, missing = (
-            sheet.headers,
-            sheet.column_map,
-            sheet.sources,
-            [],
-        )
-    except MappingRequired as exc:
-        headers, detected, sources, missing = (
-            exc.headers,
-            exc.column_map,
-            exc.sources,
-            exc.missing,
-        )
+    headers, detected, sources, missing, total_rows = _derive_sheet(
+        content, original_name, limits, message_fallback
+    )
+    # Only the message fallback produces the synthetic message column;
+    # header matching only ever yields canonical names.
+    message_lines = detected == {MESSAGE_COLUMN: 0}
     memory = lookup_memory(organization=organization, headers=headers)
-    proposed = dict(detected)
+    # Message lines map nothing: every field comes from set values or
+    # interpretation, so there is no column proposal.
+    proposed = {} if message_lines else dict(detected)
     proposed_constants: dict = {}
     proposed_ignored: list = []
     memory_info = None
-    if memory is not None and _memory_usable(memory, headers):
-        proposed = {str(k): v for k, v in memory.mapping.items()}
-        proposed_constants = dict(memory.constants or {})
-        proposed_ignored = list(memory.ignored or [])
+    if memory is not None and (message_lines or _memory_usable(memory, headers)):
+        if not message_lines:
+            proposed = {str(k): v for k, v in memory.mapping.items()}
+            proposed_ignored = list(memory.ignored or [])
+        # Message pastes share one header signature, so only set values
+        # (typically the supplier) carry over — column positions never do,
+        # and ignored stays empty because message confirms reject it.
+        proposed_constants = {
+            str(k): v for k, v in (memory.constants or {}).items()
+            if k in HEADER_TOKENS
+        }
         memory_info = {
             "use_count": memory.use_count,
             "last_used_at": memory.last_used_at.isoformat(),
@@ -451,6 +516,7 @@ def create_preview(*, organization, user, uploaded_file) -> dict:
         "headers": headers,
         "detected": detected,
         "sources": sources,
+        "message_lines": message_lines,
     }
     adapter.save_bytes(f"previews/{key}.json", json.dumps(meta).encode("utf-8"))
     _gc_previews()
@@ -461,6 +527,7 @@ def create_preview(*, organization, user, uploaded_file) -> dict:
         proposed_constants,
         proposed_ignored,
         organization.default_currency,
+        message_fallback=message_fallback,
     )
     record_audit(
         organization.id,
@@ -480,6 +547,8 @@ def create_preview(*, organization, user, uploaded_file) -> dict:
         "detected": detected,
         "sources": sources,
         "missing": missing,
+        "message_lines": message_lines,
+        "total_rows": total_rows,
         "memory": memory_info,
         "proposed": proposed,
         "proposed_constants": proposed_constants,
@@ -516,6 +585,7 @@ def render_preview(*, key: str, user, mapping: dict,
             clean_constants,
             clean_ignored,
             organization.default_currency,
+            message_fallback=meta.get("message_lines") is True,
         ),
     }
 
@@ -548,11 +618,17 @@ def confirm_preview(*, key: str, user, mapping: dict,
 
     meta = _load_preview(key)
     organization = authorize_organization_access(user, meta["organization_id"])
+    message_lines = meta.get("message_lines") is True
+    if message_lines and (mapping or ignored):
+        raise ValidationError(
+            "Message imports read every line as-is: submit an empty "
+            "mapping and only set values such as the supplier."
+        )
     submitted, effective, clean_constants, clean_ignored = _clean_positions(
         mapping,
         meta["headers"],
         meta["detected"],
-        require_complete=True,
+        require_complete=not message_lines,
         constants=constants,
         ignored=ignored,
     )
@@ -566,18 +642,21 @@ def confirm_preview(*, key: str, user, mapping: dict,
         original_name=meta["filename"],
         digest=meta["sha256"],
     )
+    run_mapping = {
+        "headers": meta["headers"],
+        "detected": meta["detected"],
+        "confirmed": submitted,
+        "constants": clean_constants,
+        "ignored": clean_ignored,
+    }
+    if message_lines:
+        run_mapping["free_text"] = True
     run = store_upload_run(
         organization=organization,
         user=user,
         content=content,
         original_name=meta["filename"],
-        mapping={
-            "headers": meta["headers"],
-            "detected": meta["detected"],
-            "confirmed": submitted,
-            "constants": clean_constants,
-            "ignored": clean_ignored,
-        },
+        mapping=run_mapping,
     )
     remember_mapping(
         organization=organization,
@@ -602,3 +681,316 @@ def cancel_preview(*, key: str, user) -> None:
     adapter = _adapter()
     adapter.delete(f"previews/{key}.bin")
     adapter.delete(f"previews/{key}.json")
+
+
+class AssistRefused(Exception):
+    """The guard refused the turn before any token was spent."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+ASSIST_PREVIEW_LINES = 40
+ASSIST_PREVIEW_CHARS = 4000
+ASSIST_MAX_DROPS = 20
+ASSIST_TURNS = 6
+
+
+def _clean_assist_turns(conversation) -> list:
+    if not isinstance(conversation, list) or not conversation:
+        raise ValidationError("Conversation needs at least one message.")
+    turns = []
+    for turn in conversation[-ASSIST_TURNS:]:
+        if not isinstance(turn, dict):
+            raise ValidationError("Each message needs a role and content.")
+        role, content = turn.get("role"), turn.get("content")
+        if role not in ("user", "assistant"):
+            raise ValidationError("Message roles are user or assistant.")
+        if (
+            not isinstance(content, str)
+            or not content.strip()
+            or len(content) > 2000
+        ):
+            raise ValidationError("Each message must be 1..2000 characters.")
+        turns.append({"role": role, "content": content})
+    if turns[-1]["role"] != "user":
+        raise ValidationError("The conversation must end with your message.")
+    return turns
+
+
+def _content_lines(content: bytes) -> list:
+    return content.decode("utf-8", errors="replace").split("\n")
+
+
+def _assist_preview_context(*, meta, content, organization) -> dict:
+    context = {
+        "filename": meta["filename"],
+        "message_lines": bool(meta.get("message_lines")),
+        "default_currency": organization.default_currency,
+    }
+    if not context["message_lines"]:
+        context.update(
+            {
+                "headers": list(meta.get("headers") or []),
+                "detected": dict(meta.get("detected") or {}),
+            }
+        )
+        return context
+    numbered = []
+    chars = 0
+    truncated = False
+    all_lines = _content_lines(content)
+    for number, text in enumerate(all_lines, start=1):
+        stripped = text.strip()
+        if not stripped:
+            continue
+        if len(numbered) >= ASSIST_PREVIEW_LINES or chars >= ASSIST_PREVIEW_CHARS:
+            truncated = True
+            break
+        numbered.append({"line": number, "text": stripped[:200]})
+        chars += len(stripped)
+    context.update(
+        {
+            "lines": numbered,
+            "line_count": len(all_lines),
+            "total_rows": sum(1 for text in all_lines if text.strip()),
+            "truncated": truncated,
+        }
+    )
+    return context
+
+
+def _clean_assist_constants(raw) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValidationError("set_constants must be an object.")
+    cleaned = {}
+    for name, value in raw.items():
+        if name not in HEADER_TOKENS:
+            raise ValidationError(f"Unknown value {name!r}.")
+        cleaned[name] = _clean_constant(name, value)
+    return cleaned
+
+
+def _clean_assist_drops(raw, *, message_lines, content) -> list:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValidationError("drop_lines must be a list of line numbers.")
+    if raw and not message_lines:
+        raise ValidationError("Only pasted message lines can be dropped.")
+    lines = _content_lines(content)
+    drops = []
+    for number in raw:
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise ValidationError("drop_lines must hold line numbers.")
+        if not 1 <= number <= len(lines):
+            raise ValidationError(f"Line {number} is outside the paste.")
+        drops.append(number)
+    drops = sorted(set(drops))
+    if len(drops) > ASSIST_MAX_DROPS:
+        raise ValidationError(f"At most {ASSIST_MAX_DROPS} lines per request.")
+    dropped = set(drops)
+    kept = [
+        text
+        for number, text in enumerate(lines, start=1)
+        if number not in dropped and text.strip()
+    ]
+    if raw and not kept:
+        raise ValidationError("At least one pasted line must remain.")
+    return drops
+
+
+def _dropped_previews(content, drops) -> list:
+    lines = _content_lines(content)
+    return [
+        {"line": number, "text": lines[number - 1].strip()[:120]}
+        for number in drops
+    ]
+
+
+def assist_preview(*, key: str, user, conversation) -> dict:
+    """One proposed-adjustment turn against a pending preview. Reads only.
+
+    The model sees a bounded quote of the pending preview plus the
+    recent conversation, and may propose set-once values or pasted-line
+    drops. Every proposed value and line number is validated here; the
+    proposal applies only through apply_preview_assist after the user
+    confirms it in the chat.
+    """
+    from common.provider import ProviderNotConfigured, get_provider
+    from organizations.models import UserPreference
+    from pipeline.assistant_guard import inspect_question
+    from pipeline.models import AssistantFlag
+
+    meta = _load_preview(key)
+    organization = authorize_organization_access(user, meta["organization_id"])
+    turns = _clean_assist_turns(conversation)
+    if UserPreference.objects.filter(
+        user=user, assistant_banned=True
+    ).exists():
+        raise PermissionDenied("Assistant access is disabled for your account.")
+    reason = inspect_question(turns[-1]["content"])
+    if reason is not None:
+        AssistantFlag.objects.create(
+            organization=organization,
+            user=user,
+            username=user.username,
+            question=turns[-1]["content"][:2000],
+            reason=reason,
+        )
+        raise AssistRefused(reason)
+    provider = get_provider(organization_id=organization.id)
+    if provider.is_simulated:
+        raise ProviderNotConfigured("The assistant needs the paid model.")
+    content = _adapter().read_bytes(f"previews/{key}.bin")
+    context = _assist_preview_context(
+        meta=meta, content=content, organization=organization
+    )
+    question = turns[-1]["content"][:120]
+    provider_model = getattr(getattr(provider, "_config", None), "model", "")
+    if not isinstance(provider_model, str):
+        provider_model = ""
+    spent = {"total": 0}
+
+    def _note_chunk(position, total, prompt_tokens, completion_tokens):
+        from pipeline.jobs import record_usage
+
+        spent["total"] += prompt_tokens + completion_tokens
+        record_usage(
+            organization.id,
+            None,
+            "provider_call",
+            prompt_tokens + completion_tokens,
+            {
+                "provider": provider.name,
+                "model": provider_model,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "task": "assistant",
+                "question": question,
+            },
+            user=user,
+        )
+
+    result = provider.assist_preview(
+        {"preview": context, "conversation": turns}, on_chunk=_note_chunk
+    )
+    try:
+        constants = _clean_assist_constants(result.get("set_constants", {}))
+        drops = _clean_assist_drops(
+            result.get("drop_lines", []),
+            message_lines=bool(meta.get("message_lines")),
+            content=content,
+        )
+    except ValidationError as error:
+        from common.meta import ProposalUnusable
+
+        unusable = ProposalUnusable(f"proposal failed validation ({error})")
+        unusable.tokens = spent["total"]
+        raise unusable from error
+    usage = result.get("usage", {})
+    return {
+        "message": result.get("message", ""),
+        "proposal": {
+            "set_constants": constants,
+            "drop_lines": drops,
+            "dropped_previews": _dropped_previews(content, drops),
+        },
+        "tokens": usage.get("total_tokens", 0),
+    }
+
+
+def apply_preview_assist(*, key: str, user, set_constants, drop_lines) -> dict:
+    """Apply user-confirmed assist values: re-quote bytes, re-derive preview.
+
+    Dropped lines are removed from the quoted bytes and the preview is
+    re-derived exactly as a fresh upload of the remaining bytes, so the
+    lane (message or table) always matches the content. Set values merge
+    into the preview's applied constants.
+    """
+    from pipeline.jobs import record_audit
+
+    meta = _load_preview(key)
+    organization = authorize_organization_access(user, meta["organization_id"])
+    constants = _clean_assist_constants(set_constants)
+    content = _adapter().read_bytes(f"previews/{key}.bin")
+    drops = _clean_assist_drops(
+        drop_lines, message_lines=bool(meta.get("message_lines")), content=content
+    )
+    if not constants and not drops:
+        raise ValidationError("Nothing to apply.")
+    previews = _dropped_previews(content, drops)
+    if drops:
+        dropped = set(drops)
+        kept = [
+            text
+            for number, text in enumerate(_content_lines(content), start=1)
+            if number not in dropped
+        ]
+        content = "\n".join(kept).encode("utf-8")
+        _adapter().save_bytes(f"previews/{key}.bin", content)
+    try:
+        headers, detected, sources, missing, total_rows = _derive_sheet(
+            content, meta["filename"], _limits(), bool(meta.get("message_lines"))
+        )
+    except UnsupportedFile as exc:
+        raise ValidationError(str(exc)) from exc
+    message_lines = detected == {MESSAGE_COLUMN: 0}
+    applied = {**meta.get("applied_constants", {}), **constants}
+    meta.update(
+        {
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "headers": headers,
+            "detected": detected,
+            "sources": sources,
+            "message_lines": message_lines,
+            "applied_constants": applied,
+        }
+    )
+    _adapter().save_bytes(f"previews/{key}.json", json.dumps(meta).encode("utf-8"))
+    proposed = {} if message_lines else dict(detected)
+    samples = _render_samples(
+        content,
+        meta["filename"],
+        proposed,
+        dict(applied),
+        [],
+        organization.default_currency,
+        message_fallback=message_lines,
+    )
+    record_audit(
+        organization.id,
+        user,
+        "preview_assisted",
+        "preview",
+        key,
+        {"set_constants": sorted(constants), "dropped_lines": drops},
+    )
+    return {
+        "applied": {
+            "set_constants": constants,
+            "drop_lines": drops,
+            "dropped_previews": previews,
+        },
+        "preview": {
+            "key": key,
+            "filename": meta["filename"][:255],
+            "extension": meta["extension"],
+            "size_bytes": len(content),
+            "sha256": meta["sha256"],
+            "headers": _header_entries(headers),
+            "detected": detected,
+            "sources": sources,
+            "missing": missing,
+            "message_lines": message_lines,
+            "total_rows": total_rows,
+            "memory": None,
+            "proposed": proposed,
+            "proposed_constants": dict(applied),
+            "proposed_ignored": [],
+            "samples": samples,
+        },
+    }

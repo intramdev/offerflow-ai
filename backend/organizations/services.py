@@ -52,6 +52,15 @@ def set_active_organization(session, user, organization_id: int) -> Membership:
     return membership
 
 
+def _scope_to_organization(user, organization_id: int) -> None:
+    """Narrow row-policy context to an already-authorized organization."""
+    from organizations.context import set_tenant_context
+
+    user_id = getattr(user, "id", None)
+    if user_id is not None:
+        set_tenant_context(organization_id, user_id)
+
+
 def authorize_organization_access(user, organization_id: int) -> Organization:
     """Return the organization if the user holds live membership in it."""
     try:
@@ -60,6 +69,7 @@ def authorize_organization_access(user, organization_id: int) -> Organization:
         )
     except (Membership.DoesNotExist, ValueError, ValidationError):
         raise PermissionDenied("Not a member of that organization.") from None
+    _scope_to_organization(user, membership.organization_id)
     return membership.organization
 
 
@@ -81,6 +91,7 @@ def _require_manager(user, organization: Organization) -> Membership:
         raise PermissionDenied("Not a member of that organization.") from None
     if not membership.can_manage_members:
         raise PermissionDenied("Managing members requires Owner or Admin.")
+    _scope_to_organization(user, organization.id)
     return membership
 
 
@@ -110,8 +121,68 @@ def invite_member(
     )
 
 
+def _invitation_org_for_token(token: str) -> int | None:
+    """Resolve a live invitation's organization without tenant context.
+
+    The accepting user is not a member yet, so row policy would hide the
+    invitation row. The SECURITY DEFINER helper reveals only the
+    organization id of a pending invitation — nothing else — and the
+    caller still verifies the token row, the expiry, and the email match.
+    """
+    import logging
+
+    from django.db import connection, transaction
+    from django.db.utils import ProgrammingError
+
+    from organizations.context import (
+        current_role_is_privileged,
+        is_missing_function,
+    )
+
+    if connection.vendor != "postgresql":
+        # Pending only: the expiry message below stays distinct.
+        row = (
+            Invitation.objects.filter(token=token, accepted_at__isnull=True)
+            .values_list("organization_id", flat=True)
+            .first()
+        )
+        return row
+    try:
+        # Savepoint: without it the missing-function error aborts the
+        # ambient transaction and the fallback query below dies with
+        # it instead of resolving the org.
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT offerflow_invitation_org(%s)", [token])
+                found = cursor.fetchone()
+    except ProgrammingError as exc:
+        if is_missing_function(exc) and current_role_is_privileged():
+            # Legacy single-role deployment without provisioned helpers.
+            row = (
+                Invitation.objects.filter(
+                    token=token, accepted_at__isnull=True
+                )
+                .values_list("organization_id", flat=True)
+                .first()
+            )
+            return row
+        if is_missing_function(exc):
+            logging.getLogger(__name__).error(
+                "offerflow_invitation_org() is not installed; run "
+                "provision_runtime before accepting invitations with the "
+                "restricted role."
+            )
+            return None
+        raise
+    return found[0] if found else None
+
+
 def accept_invitation(*, token: str, user) -> Membership:
     """Convert a live invitation into membership for its matching user."""
+    org_id = _invitation_org_for_token(token)
+    if org_id is None:
+        raise ValidationError("Unknown or already accepted invitation.")
+    _scope_to_organization(user, org_id)
     try:
         invitation = Invitation.objects.select_related("organization").get(
             token=token, accepted_at__isnull=True
@@ -171,4 +242,5 @@ def require_organization_role(user, organization_id: int, allowed=OPERATING_ROLE
         raise PermissionDenied("Not a member of that organization.") from None
     if membership.role not in allowed:
         raise PermissionDenied("That action requires Operator, Admin, or Owner.")
+    _scope_to_organization(user, membership.organization_id)
     return membership

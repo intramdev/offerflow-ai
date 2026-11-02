@@ -198,6 +198,7 @@ class ImportRun(models.Model):
     approved_at = models.DateTimeField(null=True, blank=True)
     approved_source_sha = models.CharField(max_length=64, blank=True)
     approved_normalized_digest = models.CharField(max_length=64, blank=True)
+    approved_rules_digest = models.CharField(max_length=64, blank=True)
     # Column-mapping report: {"headers": [...], "detected": {canonical: pos},
     # "confirmed": {canonical: pos}}. The effective mapping is detected
     # updated with confirmed answers; confirmed positions are the parse
@@ -632,7 +633,11 @@ class CustomerQuote(models.Model):
     rendered outputs. line_edits holds per-line presentation overrides
     (customer-facing label, hidden flag) keyed by frozen line index;
     files and messages apply them live, while prices and sources stay
-    frozen.
+    frozen. revision counts confirmed presentations: every line edit
+    bumps it and rebinds approved_lines_digest, so a release always
+    names the exact revision it shares. source_digests freezes each
+    source run's releasable set at confirm time so remapped suppliers
+    invalidate the quote instead of leaking stale prices.
     """
 
     organization = models.ForeignKey(
@@ -658,6 +663,9 @@ class CustomerQuote(models.Model):
         related_name="created_quotes",
     )
     line_edits = models.JSONField(default=dict)
+    revision = models.PositiveIntegerField(default=1)
+    approved_lines_digest = models.CharField(max_length=64, blank=True, default="")
+    source_digests = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -737,6 +745,80 @@ class SpendAllowance(models.Model):
     period_start = models.DateField(default=timezone.localdate)
     period_spent = models.PositiveIntegerField(default=0)
     updated_at = models.DateTimeField(auto_now=True)
+
+
+class OperatorSpend(models.Model):
+    """Operator-wide token ceiling across all organizations (singleton).
+
+    Every reserve/reconcile/release also moves these counters under the
+    same row lock as the organization's allowance (operator row first,
+    then allowance, then reservation — one global order, no deadlocks),
+    so the sum of all tenants can never pass the operator's approved
+    monthly ceiling even when each tenant is within its own allowance.
+    The ceiling starts at zero: no paid dispatch anywhere until the
+    operator approves an explicit ceiling. The calendar-month period
+    snaps lazily like organization cycles; lifetime_spent never resets.
+    """
+
+    monthly_ceiling = models.PositiveIntegerField(default=0)
+    period_start = models.DateField(default=timezone.localdate)
+    period_spent = models.PositiveIntegerField(default=0)
+    tokens_reserved = models.PositiveIntegerField(default=0)
+    lifetime_spent = models.PositiveIntegerField(default=0)
+    paused = models.BooleanField(default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"Operator spend (ceiling {self.monthly_ceiling})"
+
+
+class SpendReservation(models.Model):
+    """One held token reservation with identity, lifecycle, and expiry.
+
+    States: held (budget + slot committed) -> reconciled (observed or
+    estimated spend booked) | released (failed before any possible
+    spend) | uncertain (the call may have consumed: timeout, dropped
+    connection, worker loss — counters stay held, never freed) |
+    expired (swept after expiry; uncertain expiries book the held
+    estimate as spend because the provider may have processed them).
+
+    Reconcile/release resolve by reservation id under row lock, so
+    retries, redeliveries, and double callbacks are idempotent.
+    """
+
+    class State(models.TextChoices):
+        HELD = "held", "Held"
+        RECONCILED = "reconciled", "Reconciled"
+        RELEASED = "released", "Released"
+        UNCERTAIN = "uncertain", "Uncertain"
+        EXPIRED = "expired", "Expired"
+
+    allowance = models.ForeignKey(
+        SpendAllowance,
+        on_delete=models.CASCADE,
+        related_name="reservations",
+    )
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="spend_reservations",
+    )
+    tokens = models.PositiveIntegerField()
+    state = models.CharField(
+        max_length=12, choices=State.choices, default=State.HELD
+    )
+    purpose = models.CharField(max_length=64, default="", blank=True)
+    detail = models.JSONField(default=dict)
+    actual_tokens = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    settled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"Reservation {self.id} ({self.state}, {self.tokens}t)"
 
 
 class AssistantFlag(models.Model):

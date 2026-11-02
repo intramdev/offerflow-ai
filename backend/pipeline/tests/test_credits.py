@@ -22,6 +22,7 @@ from pipeline.spending import (
     BudgetRefused,
     current_period_start,
     get_allowance,
+    get_operator_spend,
     next_reset_date,
     reconcile,
     reserve,
@@ -80,23 +81,32 @@ class MonthlyCreditTests(TestCase):
         self.user = User.objects.create_user(username="u", password="x")
         self.org = Organization.objects.create(name="Org")
         Membership.objects.create(user=self.user, organization=self.org, role="owner")
+        operator = get_operator_spend()
+        operator.monthly_ceiling = 100000
+        operator.save(update_fields=["monthly_ceiling"])
 
     def test_new_account_activates_today(self):
         allowance = get_allowance(self.org.id)
         self.assertEqual(allowance.cycle_anchor, timezone.localdate())
-        self.assertEqual(allowance.monthly_credits, 25_000_000)
+        self.assertEqual(allowance.monthly_credits, 0)
 
-    def test_new_account_inherits_config_default(self):
+    def test_new_account_starts_at_zero_pending_approval(self):
         AIProviderConfig.objects.create(default_monthly_credits=5000)
         allowance = get_allowance(self.org.id)
-        self.assertEqual(allowance.monthly_credits, 5000)
+        self.assertEqual(allowance.monthly_credits, 0)
+        with self.assertRaises(BudgetRefused):
+            reserve(self.org.id, 100, 1)
+        allowance.monthly_credits = 5000
+        allowance.save(update_fields=["monthly_credits"])
+        reservation = reserve(self.org.id, 100, 1)
+        self.assertEqual(reservation.estimate_tokens, 100)
 
     def test_fresh_config_ships_with_sane_defaults(self):
         config = AIProviderConfig.objects.create()
         self.assertEqual(config.model, "muse-spark-1.3-contributor")
         self.assertEqual(config.default_monthly_credits, 25_000_000)
         allowance = get_allowance(self.org.id)
-        self.assertEqual(allowance.monthly_credits, 25_000_000)
+        self.assertEqual(allowance.monthly_credits, 0)
 
     def test_lazy_reset_on_new_cycle(self):
         allowance = get_allowance(self.org.id)
@@ -385,6 +395,9 @@ class UsageLogPaginationTests(TestCase):
         self.client = APIClient()
         self.client.force_authenticate(self.alice)
         self.url = f"/api/orgs/{self.org.id}/usage/log/"
+        operator = get_operator_spend()
+        operator.monthly_ceiling = 100000
+        operator.save(update_fields=["monthly_ceiling"])
 
     def _loose_call(self, label, tokens=10):
         return UsageEvent.objects.create(
@@ -449,40 +462,44 @@ class UsageLogPaginationTests(TestCase):
         bad = self.client.get(self.url, {"section": "matching", "page": "x"})
         self.assertEqual(bad.status_code, 400)
 
-    def test_release_stuck_clears_only_own_company(self):
-        from pipeline.models import AuditEvent
+    def test_release_stuck_sweeps_only_own_expired(self):
+        from datetime import timedelta
+
+        from pipeline.models import AuditEvent, SpendReservation
 
         other = Organization.objects.create(name="Other")
-        mine = get_allowance(self.org.id)
-        mine.in_flight = 1
-        mine.tokens_reserved = 500
-        mine.period_spent = 100
-        mine.tokens_spent = 100
-        mine.save(
-            update_fields=[
-                "in_flight",
-                "tokens_reserved",
-                "period_spent",
-                "tokens_spent",
-            ]
+        for org_id in (self.org.id, other.id):
+            allowance = get_allowance(org_id)
+            allowance.monthly_credits = 100000
+            allowance.save(update_fields=["monthly_credits"])
+        live = reserve(self.org.id, 100, 2)
+        dead = reserve(self.org.id, 200, 2)
+        SpendReservation.objects.filter(pk=dead.id).update(
+            expires_at=timezone.now() - timedelta(seconds=10)
         )
-        theirs = get_allowance(other.id)
-        theirs.in_flight = 1
-        theirs.tokens_reserved = 700
-        theirs.save(update_fields=["in_flight", "tokens_reserved"])
+        foreign = reserve(other.id, 300, 2)
+        SpendReservation.objects.filter(pk=foreign.id).update(
+            expires_at=timezone.now() - timedelta(seconds=10)
+        )
         response = self.client.post(
             f"/api/orgs/{self.org.id}/spending/release-stuck/"
         )
         self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(response.data["released"]["in_flight"], 1)
-        mine.refresh_from_db()
-        self.assertEqual(mine.in_flight, 0)
-        self.assertEqual(mine.tokens_reserved, 0)
-        self.assertEqual(mine.period_spent, 100)
-        self.assertEqual(mine.tokens_spent, 100)
-        theirs.refresh_from_db()
+        self.assertEqual(response.data["swept"]["uncertain"], 1)
+        self.assertEqual(response.data["swept"]["expired"], 0)
+        # The expired hold converts to uncertain (still counted); the live
+        # hold is untouched, so no budget frees for double spend.
+        live_ids = {row["id"] for row in response.data["live_reservations"]}
+        self.assertEqual(live_ids, {live.id, dead.id})
+        mine = get_allowance(self.org.id)
+        self.assertEqual(mine.in_flight, 2)
+        self.assertEqual(mine.tokens_reserved, 300)
+        self.assertEqual(mine.tokens_spent, 0)
+        foreign_row = SpendReservation.objects.get(pk=foreign.id)
+        self.assertEqual(foreign_row.state, SpendReservation.State.HELD)
+        theirs = get_allowance(other.id)
         self.assertEqual(theirs.in_flight, 1)
-        self.assertEqual(theirs.tokens_reserved, 700)
+        self.assertEqual(theirs.tokens_reserved, 300)
         self.assertTrue(
             AuditEvent.objects.filter(
                 organization=self.org, action="stuck_slots_released"

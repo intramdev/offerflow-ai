@@ -27,6 +27,12 @@ export function formatDateTime(iso: string, format: DateTimeFormat): string {
   return `${day} ${p.time}`;
 }
 
+export function formatMoney(value: string | number): string {
+  const num = typeof value === "number" ? value : Number(String(value).trim());
+  if (!Number.isFinite(num)) return String(value);
+  return num.toFixed(2);
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;

@@ -265,9 +265,22 @@ export interface UsageLogPage<T> {
   results: T[];
 }
 
+export interface ReleaseStuckResult {
+  swept: { uncertain: number; expired: number; tokens_booked: number };
+  live_reservations: {
+    id: number;
+    state: string;
+    tokens: number;
+    purpose: string;
+    expires_at: string;
+  }[];
+  in_flight: number;
+  tokens_reserved: number;
+}
+
 export async function releaseStuckSlots(
   organizationId: number,
-): Promise<{ released: { in_flight: number; tokens_reserved: number } }> {
+): Promise<ReleaseStuckResult> {
   return api(`/api/orgs/${organizationId}/spending/release-stuck/`, {
     method: "POST",
   });
@@ -288,6 +301,7 @@ export interface QuoteExportTemplate {
   file_columns: string[];
   message_show_capacity: boolean;
   message_show_grade: boolean;
+  message_show_color: boolean;
   message_show_quantity: boolean;
   message_show_categories: boolean;
   message_header: string;
@@ -532,6 +546,8 @@ export interface Preview {
   detected: Record<string, number>;
   sources: Record<string, string>;
   missing: string[];
+  message_lines: boolean;
+  total_rows: number;
   memory: { use_count: number; last_used_at: string; supplier_hint: string } | null;
   proposed: Record<string, number>;
   proposed_constants: Record<string, string | number>;
@@ -548,6 +564,17 @@ export async function createPreview(
   form.append("organization_id", String(organizationId));
   form.append("file", file);
   return api<Preview>("/api/pipeline/previews/", { method: "POST", body: form });
+}
+
+export async function createPreviewFromText(
+  organizationId: number,
+  text: string,
+): Promise<Preview> {
+  return api<Preview>("/api/pipeline/previews/from-text/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ organization_id: organizationId, text }),
+  });
 }
 
 export interface RenderResult {
@@ -585,6 +612,51 @@ export async function confirmPreview(
 
 export async function cancelPreview(key: string): Promise<void> {
   await api(`/api/pipeline/previews/${key}/`, { method: "DELETE" });
+}
+
+export interface PreviewAssistProposal {
+  set_constants: Record<string, string>;
+  drop_lines: number[];
+  dropped_previews: { line: number; text: string }[];
+}
+
+export interface PreviewAssistReply {
+  message: string;
+  proposal: PreviewAssistProposal;
+  tokens: number;
+  retriable?: boolean;
+  hint?: string;
+  refusal?: string;
+}
+
+export async function assistPreview(
+  key: string,
+  messages: AssistantTurn[],
+): Promise<PreviewAssistReply> {
+  return api<PreviewAssistReply>(`/api/pipeline/previews/${key}/assist/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages }),
+  });
+}
+
+export interface PreviewAssistApplied {
+  applied: PreviewAssistProposal;
+  preview: Preview;
+}
+
+export async function applyPreviewAssist(
+  key: string,
+  proposal: { set_constants: Record<string, string>; drop_lines: number[] },
+): Promise<PreviewAssistApplied> {
+  return api<PreviewAssistApplied>(
+    `/api/pipeline/previews/${key}/assist/apply/`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(proposal),
+    },
+  );
 }
 
 // --- Pricing rules ------------------------------------------------------
@@ -802,15 +874,19 @@ export async function deleteSupplierNote(
 // --- Quotes -------------------------------------------------------------
 
 export interface QuoteLine {
+  id?: string;
   brand: string;
   model: string;
   capacity_gb: number | null;
   grade: string;
+  color?: string;
+  conditions?: string;
   supplier: string;
   quantity: number | null;
   unit_price: string;
   currency: string;
   rule: string | null;
+  manual_price?: boolean;
 }
 
 export interface QuoteFx {
@@ -839,6 +915,7 @@ export interface QuoteGroupMember {
   supplier: string;
   model_name: string;
   grade: string;
+  color?: string;
   unit_price: string;
   currency: string;
 }
@@ -847,6 +924,7 @@ export interface QuoteGroup {
   brand: string;
   capacity_gb: number | null;
   grade: string;
+  color?: string;
   canonical_model: string;
   confidence: number;
   source: string;
@@ -877,6 +955,13 @@ export interface CustomerQuoteLine extends QuoteLine {
 export interface QuoteLineEdit {
   label: string | null;
   hidden: boolean;
+  grade?: string;
+  color?: string;
+  category_id?: number | null;
+  category_name?: string;
+  quantity?: number | null;
+  supplier?: string;
+  unit_price?: string;
 }
 
 export interface CustomerQuote {
@@ -942,6 +1027,10 @@ export async function startCustomerQuote(
 
 export async function getCustomerQuote(quoteId: number): Promise<CustomerQuote> {
   return api<CustomerQuote>(`/api/pipeline/quotes/${quoteId}/`);
+}
+
+export async function deleteCustomerQuote(quoteId: number): Promise<void> {
+  await api(`/api/pipeline/quotes/${quoteId}/`, { method: "DELETE" });
 }
 
 export async function confirmCustomerQuote(

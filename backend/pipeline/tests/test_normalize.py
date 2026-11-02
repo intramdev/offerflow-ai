@@ -8,6 +8,7 @@ from pipeline.normalize import (
     classify_lock,
     compute_offer_status,
     grade_options,
+    merge_interpreted_cells,
     parse_capacity,
     parse_currency,
     parse_price,
@@ -100,6 +101,25 @@ class ParserTests(SimpleTestCase):
         self.assertIsNone(parse_price("=1+1"))
         self.assertIsNone(parse_price(None))
 
+    def test_price_european_and_mixed_formats(self):
+        self.assertEqual(parse_price("1.234,56"), Decimal("1234.56"))
+        self.assertEqual(parse_price("1,234.56"), Decimal("1234.56"))
+        self.assertEqual(parse_price("1.234.567,89"), Decimal("1234567.89"))
+        self.assertEqual(parse_price("1,234,567.89"), Decimal("1234567.89"))
+        self.assertEqual(parse_price("12.345.678"), Decimal("12345678"))
+        self.assertEqual(parse_price("1234.567"), Decimal("1234.567"))
+
+    def test_price_rejects_ambiguity(self):
+        # A lone dot with a three-digit tail reads as US decimal or EU
+        # thousands; refusing asks the reviewer instead of guessing.
+        self.assertIsNone(parse_price("1.234"))
+        self.assertIsNone(parse_price("12.345"))
+        # Broken thousands grouping on either side is refused.
+        self.assertIsNone(parse_price("1,23.45"))
+        self.assertIsNone(parse_price("1.23,45"))
+        self.assertIsNone(parse_price("1.234,56.78"))
+        self.assertIsNone(parse_price("1,234.56,78"))
+
     def test_currency(self):
         self.assertEqual(parse_currency("usd"), "USD")
         self.assertEqual(parse_currency(" USD "), "USD")
@@ -118,12 +138,88 @@ class ParserTests(SimpleTestCase):
         self.assertEqual(classify_lock(None), "unknown")
         self.assertEqual(classify_lock("maybe"), "unknown")
 
+    def test_lock_conflict_needs_clarification(self):
+        # SIM/carrier-unlocked wording plus an activation/iCloud lock
+        # signal must never resolve to an unrestricted device.
+        self.assertEqual(
+            classify_lock("Factory unlocked; iCloud locked"), "unknown"
+        )
+        self.assertEqual(classify_lock("unlocked, blacklist"), "unknown")
+        self.assertEqual(classify_lock("locked but sim free"), "unknown")
+
     def test_grade_options(self):
         self.assertEqual(grade_options("A/B"), ["A", "B", "A/B"])
         self.assertEqual(grade_options("A / B"), ["A", "B", "A / B"])
         self.assertIsNone(grade_options("A"))
         self.assertIsNone(grade_options(""))
+
+    def test_merge_keeps_readable_values(self):
+        local = {
+            "supplier": "Acme",
+            "brand": "Pear",
+            "model": "P1",
+            "capacity": "128",
+            "color": "Red",
+            "grade": "",
+            "lock": "Unlocked",
+            "quantity": "5",
+            "price": "299.99",
+            "currency": "USD",
+            "conditions": "",
+        }
+        model = dict(local)
+        model["grade"] = "A"
+        model["price"] = "199.99"
+        model["quantity"] = "9"
+        merged = merge_interpreted_cells(local, model)
+        # Only the missing grade comes from the model; readable
+        # price and quantity stay exactly as the source read them.
+        self.assertEqual(merged["grade"], "A")
+        self.assertEqual(merged["price"], "299.99")
+        self.assertEqual(merged["quantity"], "5")
+        self.assertEqual(merged["supplier"], "Acme")
         self.assertIsNone(grade_options(None))
+
+    def test_merge_drops_ungrounded_message_numbers(self):
+        local = {
+            "message": "iPhone 15 128GB Black x5 450",
+            "supplier": "Acme",
+        }
+        model = {
+            "model": "iPhone 15",
+            "capacity": "128",
+            "grade": "A",
+            "quantity": "9",
+            "price": "450",
+            "currency": "USD",
+        }
+        merged = merge_interpreted_cells(local, model)
+        # Grounded numbers come from the proposal; the invented
+        # quantity stays out so the gap asks a human instead.
+        self.assertEqual(merged["capacity"], "128")
+        self.assertEqual(merged["price"], "450")
+        self.assertNotIn("quantity", merged)
+
+    def test_merge_accepts_eu_price_transcription(self):
+        local = {"message": "P1 128GB a 1.234,56 EUR", "supplier": "Acme"}
+        merged = merge_interpreted_cells(local, {"price": "1234.56"})
+        self.assertEqual(merged["price"], "1234.56")
+
+    def test_merge_skips_grounding_without_message(self):
+        local = {
+            "supplier": "Acme",
+            "model": "P1",
+            "capacity": "128",
+            "grade": "A",
+            "lock": "Unlocked",
+            "quantity": "five",
+            "price": "299.99",
+            "currency": "USD",
+        }
+        merged = merge_interpreted_cells(local, {"quantity": "5"})
+        # Spreadsheet gaps keep the existing merged-evidence
+        # treatment: the unreadable cell is the evidence, not a line.
+        self.assertEqual(merged["quantity"], "5")
 
 
 class StatusTests(SimpleTestCase):

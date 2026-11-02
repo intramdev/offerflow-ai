@@ -11,12 +11,13 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 from openai import RateLimitError
 
-from common.meta import MetaConfig, MetaProvider, ProviderError
+from common.meta import MetaConfig, MetaProvider, ProposalUnusable, ProviderError
 from organizations.models import Membership, Organization
-from pipeline.models import SpendAllowance
+from pipeline.models import OperatorSpend, SpendAllowance
 from pipeline.spending import (
     BudgetRefused,
     get_allowance,
+    get_operator_spend,
     reconcile,
     release,
     reserve,
@@ -112,6 +113,26 @@ def _sdk_error(cls, message):
         return cls(message)
 
 
+def _one_row_cap(rows) -> int:
+    """Input cap that fits the system prompt plus exactly one row.
+
+    Derived from the live prompt so prompt wording can evolve without
+    silently changing what the chunking tests exercise: every row still
+    travels alone, and any second row still forces a new chunk.
+    """
+    from common.meta import SYSTEM_PROMPT
+    from pipeline.spending import estimate_text_tokens
+
+    system = estimate_text_tokens(SYSTEM_PROMPT)
+    widest = max(
+        estimate_text_tokens(json.dumps(row, separators=(",", ":"))) + 1
+        for row in rows
+    )
+    cap = system + widest + 5
+    assert cap < system + 2 * widest, "cap must still force one row per chunk"
+    return cap
+
+
 @override_settings(PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])
 class SpendingTests(TestCase):
     def setUp(self):
@@ -126,7 +147,14 @@ class SpendingTests(TestCase):
         for key, value in overrides.items():
             setattr(allowance, key, value)
         allowance.save()
+        operator = get_operator_spend()
+        if budget > operator.monthly_ceiling:
+            operator.monthly_ceiling = budget
+            operator.save(update_fields=["monthly_ceiling"])
         return allowance
+
+    def operator(self):
+        return OperatorSpend.objects.get()
 
     def config(self, **overrides):
         options = {
@@ -293,12 +321,12 @@ class SpendingTests(TestCase):
         completions = _EchoCompletions(prompt_tokens=10, completion_tokens=5)
         client = mock.Mock()
         client.chat.completions = completions
+        rows = [{"index": i, "data": {"blob": "x" * 250}} for i in range(3)]
         provider = MetaProvider(
-            self.config(max_input_tokens=200),
+            self.config(max_input_tokens=_one_row_cap(rows)),
             client_factory=lambda config: client,
         )
         seen = []
-        rows = [{"index": i, "data": {"blob": "x" * 400}} for i in range(3)]
         provider.interpret_table({"rows": rows}, on_chunk=lambda *a: seen.append(a))
         self.assertEqual(len(seen), 3)
         self.assertEqual(seen[0], (1, 3, 10, 5))
@@ -309,16 +337,38 @@ class SpendingTests(TestCase):
         completions = _EchoCompletions()
         client = mock.Mock()
         client.chat.completions = completions
+        rows = [
+            {"index": i, "data": {"blob": "x" * 250}} for i in range(3)
+        ]
         provider = MetaProvider(
-            self.config(max_input_tokens=200),
+            self.config(max_input_tokens=_one_row_cap(rows)),
             client_factory=lambda config: client,
         )
-        rows = [
-            {"index": i, "data": {"blob": "x" * 400}} for i in range(3)
-        ]
         result = provider.interpret_table({"rows": rows})
         self.assertGreater(len(completions.calls), 1)
         self.assertEqual(len(result["rows"]), 3)
+
+    def test_message_context_travels_and_counts(self):
+        self.allow(100000)
+        completions = _EchoCompletions()
+        client = mock.Mock()
+        client.chat.completions = completions
+        rows = [{"index": 0, "data": {"message": "P1 x2 10"}}]
+        provider = MetaProvider(
+            self.config(max_input_tokens=_one_row_cap(rows) + 500),
+            client_factory=lambda config: client,
+        )
+        provider.interpret_table({"rows": rows, "context": "Mercantile Pacific"})
+        sent = json.loads(completions.calls[0]["messages"][1]["content"])
+        self.assertEqual(sent["context"], "Mercantile Pacific")
+        self.assertEqual(len(sent["rows"]), 1)
+        # Context consumes the same budget: an over-cap context refuses
+        # before any dispatch.
+        with self.assertRaisesRegex(ProviderError, "exceeds the input cap"):
+            provider.interpret_table({"rows": rows, "context": "x" * 100000})
+        self.assertEqual(len(completions.calls), 1)
+        with self.assertRaisesRegex(ProviderError, "Unusable payload"):
+            provider.interpret_table({"rows": rows, "context": 123})
 
     def test_single_row_over_cap_refuses(self):
         self.allow(100000)
@@ -344,16 +394,387 @@ class SpendingTests(TestCase):
         )
         client = mock.Mock()
         client.chat.completions = completions
+        rows = [
+            {"index": i, "data": {"blob": "x" * 250}} for i in range(3)
+        ]
         provider = MetaProvider(
-            self.config(max_input_tokens=200),
+            self.config(max_input_tokens=_one_row_cap(rows)),
             client_factory=lambda config: client,
         )
-        rows = [
-            {"index": i, "data": {"blob": "x" * 400}} for i in range(3)
-        ]
         with self.assertRaisesRegex(ProviderError, "chunk 2/"):
             provider.interpret_table({"rows": rows})
         allowance = SpendAllowance.objects.get(organization_id=self.org.id)
         self.assertEqual(allowance.tokens_spent, 15)
         self.assertEqual(allowance.tokens_reserved, 0)
         self.assertEqual(allowance.in_flight, 0)
+
+
+@override_settings(PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])
+class ReservationLifecycleTests(SpendingTests):
+    """R1: identity, idempotent settlement, uncertain spend, estimates."""
+
+    def test_double_reconcile_books_once(self):
+        from pipeline.models import SpendReservation
+
+        self.allow(100000)
+        reservation = reserve(self.org.id, 100, 1)
+        reconcile(reservation, 60)
+        reconcile(reservation, 60)
+        allowance = SpendAllowance.objects.get(organization_id=self.org.id)
+        self.assertEqual(allowance.tokens_spent, 60)
+        self.assertEqual(allowance.tokens_reserved, 0)
+        self.assertEqual(allowance.in_flight, 0)
+        row = SpendReservation.objects.get(pk=reservation.id)
+        self.assertEqual(row.state, SpendReservation.State.RECONCILED)
+        self.assertEqual(row.actual_tokens, 60)
+
+    def test_double_release_frees_once(self):
+        self.allow(100000)
+        reservation = reserve(self.org.id, 100, 2)
+        release(reservation)
+        release(reservation)
+        allowance = SpendAllowance.objects.get(organization_id=self.org.id)
+        self.assertEqual(allowance.tokens_reserved, 0)
+        self.assertEqual(allowance.in_flight, 0)
+
+    def test_release_after_reconcile_is_noop(self):
+        self.allow(100000)
+        reservation = reserve(self.org.id, 100, 1)
+        reconcile(reservation, 60)
+        release(reservation)
+        allowance = SpendAllowance.objects.get(organization_id=self.org.id)
+        self.assertEqual(allowance.tokens_spent, 60)
+        self.assertEqual(allowance.tokens_reserved, 0)
+        self.assertEqual(allowance.in_flight, 0)
+
+    def test_timeout_holds_uncertain_not_free(self):
+        from openai import APITimeoutError
+
+        from pipeline.models import SpendReservation
+
+        self.allow(100000)
+        provider, _holder = self.provider(_sdk_error(APITimeoutError, "slow"))
+        with self.assertRaises(ProviderError):
+            provider.interpret_table({"rows": [{"index": 0, "data": {"a": 1}}]})
+        allowance = SpendAllowance.objects.get(organization_id=self.org.id)
+        self.assertEqual(allowance.tokens_spent, 0)
+        self.assertGreater(allowance.tokens_reserved, 0)
+        self.assertEqual(allowance.in_flight, 1)
+        row = SpendReservation.objects.get(organization=self.org)
+        self.assertEqual(row.state, SpendReservation.State.UNCERTAIN)
+        # A second dispatch cannot take the held slot: no extra spend.
+        with self.assertRaises(ProviderError):
+            provider.interpret_table({"rows": [{"index": 1, "data": {"a": 1}}]})
+
+    def test_late_usage_reconciles_uncertain(self):
+        from pipeline.spending import mark_uncertain
+
+        self.allow(100000)
+        reservation = reserve(self.org.id, 100, 2)
+        mark_uncertain(reservation, "timeout")
+        mark_uncertain(reservation, "timeout")
+        reconcile(reservation, 40)
+        allowance = SpendAllowance.objects.get(organization_id=self.org.id)
+        self.assertEqual(allowance.tokens_spent, 40)
+        self.assertEqual(allowance.tokens_reserved, 0)
+        self.assertEqual(allowance.in_flight, 0)
+
+    def test_sweep_books_expired_uncertain_as_spend(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from pipeline.models import SpendReservation, UsageEvent
+        from pipeline.spending import mark_uncertain, sweep_expired
+
+        self.allow(100000)
+        reservation = reserve(self.org.id, 100, 2)
+        mark_uncertain(reservation, "timeout")
+        SpendReservation.objects.filter(pk=reservation.id).update(
+            expires_at=timezone.now() - timedelta(days=2)
+        )
+        swept = sweep_expired(organization_id=self.org.id)
+        self.assertEqual(swept["expired"], 1)
+        self.assertEqual(swept["tokens_booked"], 100)
+        allowance = SpendAllowance.objects.get(organization_id=self.org.id)
+        self.assertEqual(allowance.tokens_spent, 100)
+        self.assertEqual(allowance.tokens_reserved, 0)
+        self.assertEqual(allowance.in_flight, 0)
+        event = UsageEvent.objects.get(
+            organization=self.org, kind="provider_uncertain"
+        )
+        self.assertEqual(event.quantity, 100)
+        self.assertEqual(event.detail["reservation_id"], reservation.id)
+        # Re-sweeping settles nothing twice.
+        swept = sweep_expired(organization_id=self.org.id)
+        self.assertEqual(swept["expired"], 0)
+        allowance.refresh_from_db()
+        self.assertEqual(allowance.tokens_spent, 100)
+
+    def test_sweep_converts_dead_hold_to_uncertain(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from pipeline.models import SpendReservation
+        from pipeline.spending import sweep_expired
+
+        self.allow(100000)
+        reservation = reserve(self.org.id, 100, 2)
+        SpendReservation.objects.filter(pk=reservation.id).update(
+            expires_at=timezone.now() - timedelta(seconds=5)
+        )
+        swept = sweep_expired(organization_id=self.org.id)
+        self.assertEqual(swept["uncertain"], 1)
+        row = SpendReservation.objects.get(pk=reservation.id)
+        self.assertEqual(row.state, SpendReservation.State.UNCERTAIN)
+        allowance = SpendAllowance.objects.get(organization_id=self.org.id)
+        self.assertEqual(allowance.tokens_spent, 0)
+        self.assertEqual(allowance.tokens_reserved, 100)
+        self.assertEqual(allowance.in_flight, 1)
+
+    def test_sweep_heals_phantom_counters_only(self):
+        from pipeline.spending import sweep_expired
+
+        self.allow(100000)
+        reservation = reserve(self.org.id, 100, 2)
+        SpendAllowance.objects.filter(organization_id=self.org.id).update(
+            tokens_reserved=9999, in_flight=9
+        )
+        sweep_expired(organization_id=self.org.id)
+        allowance = SpendAllowance.objects.get(organization_id=self.org.id)
+        self.assertEqual(allowance.tokens_reserved, 100)
+        self.assertEqual(allowance.in_flight, 1)
+        release(reservation)
+
+    def test_estimates_bound_and_cover_output(self):
+        from pipeline.spending import (
+            REQUEST_OVERHEAD_TOKENS,
+            estimate_request_tokens,
+            estimate_text_tokens,
+        )
+
+        self.assertEqual(estimate_text_tokens(""), 0)
+        # ceil(chars/3): strictly above the old chars//4 rule.
+        self.assertEqual(estimate_text_tokens("x" * 12), 4)
+        self.assertEqual(estimate_text_tokens("x" * 13), 5)
+        total = estimate_request_tokens(
+            texts=["system", "user payload"], max_output_tokens=2000
+        )
+        self.assertEqual(
+            total,
+            estimate_text_tokens("system")
+            + estimate_text_tokens("user payload")
+            + 2000
+            + REQUEST_OVERHEAD_TOKENS,
+        )
+        with self.assertRaises(ValueError):
+            estimate_request_tokens(texts=["x"], max_output_tokens=-1)
+
+    def test_reservation_covers_full_permitted_call(self):
+        self.allow(100000)
+        body = json.dumps({"rows": []})
+        script = _FakeResponse(body, _FakeUsage(10, 5))
+        provider, _holder = self.provider(script, max_output_tokens=2000)
+        result = provider.interpret_table({"rows": [{"index": 0, "data": {"a": 1}}]})
+        self.assertEqual(result["usage"]["total_tokens"], 15)
+        # Observed usage reconciles exactly even though the hold covered
+        # the full permitted output.
+        allowance = SpendAllowance.objects.get(organization_id=self.org.id)
+        self.assertEqual(allowance.tokens_spent, 15)
+        self.assertEqual(allowance.tokens_reserved, 0)
+
+    def test_reconcile_works_while_paused(self):
+        self.allow(100000)
+        reservation = reserve(self.org.id, 100, 1)
+        SpendAllowance.objects.filter(organization_id=self.org.id).update(
+            paused=True
+        )
+        reconcile(reservation, 60)
+        allowance = SpendAllowance.objects.get(organization_id=self.org.id)
+        self.assertEqual(allowance.tokens_spent, 60)
+        self.assertEqual(allowance.tokens_reserved, 0)
+        with self.assertRaises(BudgetRefused):
+            reserve(self.org.id, 100, 1)
+
+
+class OperatorCeilingTests(SpendingTests):
+    def test_zero_operator_refuses_approved_org(self):
+        self.allow(100000)
+        OperatorSpend.objects.update(monthly_ceiling=0)
+        with self.assertRaises(BudgetRefused):
+            reserve(self.org.id, 100, 1)
+
+    def test_operator_ceiling_binds_before_org_budget(self):
+        self.allow(100000)
+        OperatorSpend.objects.update(monthly_ceiling=150)
+        reservation = reserve(self.org.id, 100, 2)
+        with self.assertRaises(BudgetRefused):
+            reserve(self.org.id, 100, 2)
+        release(reservation)
+
+    def test_operator_ceiling_is_shared_across_orgs(self):
+        self.allow(100000)
+        org2 = Organization.objects.create(name="Other")
+        Membership.objects.create(
+            user=self.user, organization=org2, role="owner"
+        )
+        other = get_allowance(org2.id)
+        other.token_budget = 100000
+        other.monthly_credits = 100000
+        other.save()
+        OperatorSpend.objects.update(monthly_ceiling=150)
+        reservation = reserve(self.org.id, 100, 2)
+        with self.assertRaises(BudgetRefused):
+            reserve(org2.id, 100, 2)
+        release(reservation)
+        reserve(org2.id, 100, 2)
+
+    def test_reconcile_updates_operator_counters(self):
+        self.allow(100000)
+        reservation = reserve(self.org.id, 100, 1)
+        self.assertEqual(self.operator().tokens_reserved, 100)
+        reconcile(reservation, 60)
+        operator = self.operator()
+        self.assertEqual(operator.tokens_reserved, 0)
+        self.assertEqual(operator.period_spent, 60)
+        self.assertEqual(operator.lifetime_spent, 60)
+
+    def test_operator_kill_switch_blocks_new_but_settles_accepted(self):
+        self.allow(100000)
+        reservation = reserve(self.org.id, 100, 1)
+        OperatorSpend.objects.update(paused=True)
+        with self.assertRaises(BudgetRefused):
+            reserve(self.org.id, 100, 1)
+        reconcile(reservation, 60)
+        operator = self.operator()
+        self.assertEqual(operator.period_spent, 60)
+        self.assertEqual(operator.lifetime_spent, 60)
+
+    def test_operator_month_resets_without_touching_lifetime(self):
+        from datetime import timedelta as _td
+
+        from django.utils import timezone as _tz
+
+        from pipeline.spending import _snap_operator_month
+
+        self.allow(100000)
+        operator = self.operator()
+        operator.period_spent = 500
+        operator.lifetime_spent = 500
+        operator.period_start = _tz.localdate() - _td(days=40)
+        operator.save()
+        _snap_operator_month(operator)
+        operator.save()
+        operator.refresh_from_db()
+        self.assertEqual(operator.period_spent, 0)
+        self.assertEqual(operator.lifetime_spent, 500)
+
+
+@override_settings(PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])
+class OperatorSpendAdminTests(TestCase):
+    """The operator singleton must be creatable exactly once via admin.
+
+    An empty table with a blanket add refusal leaves paid dispatch
+    permanently unapproved: every reserve rolls its auto-created row
+    back, and the admin offers no row to approve.
+    """
+
+    def setUp(self):
+        from django.contrib import admin as djadmin
+        from django.test import RequestFactory
+
+        from pipeline.admin import OperatorSpendAdmin
+
+        request = RequestFactory().get("/admin/pipeline/operatorspend/add/")
+        request.user = User.objects.create_superuser(
+            username="admin", email="admin@example.test", password="x"
+        )
+        self.request = request
+        self.model_admin = OperatorSpendAdmin(OperatorSpend, djadmin.AdminSite())
+
+    def test_add_allowed_when_no_row_exists(self):
+        self.assertFalse(OperatorSpend.objects.exists())
+        self.assertTrue(self.model_admin.has_add_permission(self.request))
+
+    def test_add_refused_once_singleton_exists(self):
+        OperatorSpend.objects.create(monthly_ceiling=100)
+        self.assertFalse(self.model_admin.has_add_permission(self.request))
+
+
+class AssistEnvelopeTests(SpendingTests):
+    """The assist wire format must satisfy strict structured output.
+
+    Strict mode rejects any object without additionalProperties false
+    (the API answers 400), so free-form maps are not expressible:
+    constants travel as {name, value} pairs and fold to a dict here.
+    """
+
+    def _assist(self, body):
+        script = _FakeResponse(json.dumps(body), _FakeUsage(30, 12))
+        provider, _ = self.provider(script)
+        return provider.assist_preview(
+            {
+                "preview": {
+                    "message_lines": True,
+                    "lines": [{"line": 1, "text": "ACME pricelist"}],
+                },
+                "conversation": [
+                    {"role": "user", "content": "Set the supplier."}
+                ],
+            }
+        )
+
+    def _assert_strict(self, node):
+        if isinstance(node, dict) and node.get("type") == "object":
+            properties = node.get("properties")
+            self.assertIsInstance(properties, dict)
+            self.assertEqual(node.get("additionalProperties"), False)
+            self.assertEqual(set(node.get("required", [])), set(properties))
+            for child in properties.values():
+                self._assert_strict(child)
+        elif isinstance(node, dict) and node.get("type") == "array":
+            self._assert_strict(node.get("items", {}))
+        elif isinstance(node, dict):
+            for child in node.values():
+                self._assert_strict(child)
+        elif isinstance(node, list):
+            for child in node:
+                self._assert_strict(child)
+
+    def test_assist_schema_is_strict_compatible(self):
+        from common.meta import ASSIST_PREVIEW_RESPONSE_SCHEMA
+
+        self._assert_strict(ASSIST_PREVIEW_RESPONSE_SCHEMA)
+
+    def test_assist_prompt_preserves_section_headers(self):
+        from common.meta import ASSIST_PREVIEW_SYSTEM_PROMPT
+
+        # Dropping a grade banner would destroy the grades the
+        # importer inherits from it; pin the preservation rule.
+        self.assertIn("Never propose dropping section headers", ASSIST_PREVIEW_SYSTEM_PROMPT)
+        self.assertIn("would lose the values", ASSIST_PREVIEW_SYSTEM_PROMPT)
+
+    def test_assist_parses_constant_pairs(self):
+        self.allow(100000)
+        result = self._assist(
+            {
+                "message": "Done.",
+                "set_constants": [{"name": "supplier", "value": "ACME"}],
+                "drop_lines": [1],
+            }
+        )
+        self.assertEqual(result["set_constants"], {"supplier": "ACME"})
+        self.assertEqual(result["drop_lines"], [1])
+        self.assertEqual(result["usage"]["total_tokens"], 42)
+
+    def test_assist_rejects_malformed_pairs(self):
+        self.allow(100000)
+        with self.assertRaises(ProposalUnusable):
+            self._assist(
+                {
+                    "message": "Done.",
+                    "set_constants": [{"name": "supplier"}],
+                    "drop_lines": [],
+                }
+            )

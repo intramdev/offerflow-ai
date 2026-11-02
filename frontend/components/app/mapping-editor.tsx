@@ -36,20 +36,35 @@ import {
 
 export function MappingEditor({
   preview,
+  assistRevision = 0,
   onDone,
 }: {
   preview: Preview;
+  assistRevision?: number;
   onDone: () => void;
 }) {
   const router = useRouter();
   const { active } = useOrg();
-  const [selection, setSelection] = React.useState<FieldSelection>(() =>
-    selectionFromProposed(
+  const messageLines = preview.message_lines === true;
+  const [selection, setSelection] = React.useState<FieldSelection>(() => {
+    const initial = selectionFromProposed(
       preview.proposed,
       preview.proposed_constants ?? {},
       preview.proposed_ignored ?? [],
-    ),
-  );
+    );
+    if (!preview.message_lines) return initial;
+    // Message imports accept constants only: the backend rejects any
+    // mapping or ignored list, so start every field unset — including
+    // lock, which otherwise defaults to ignored.
+    const cleared: FieldSelection = {};
+    for (const [field, choice] of Object.entries(initial)) {
+      cleared[field] =
+        choice.kind === "custom"
+          ? choice
+          : { kind: "", position: "", value: "" };
+    }
+    return cleared;
+  });
   const [defaultCurrency, setDefaultCurrency] = React.useState("");
   const [currencies, setCurrencies] = React.useState<string[] | null>(null);
   const [samples, setSamples] = React.useState<PreviewSamples>(preview.samples);
@@ -117,6 +132,36 @@ export function MappingEditor({
     });
   }, [defaultCurrency]);
 
+  // Fields the user edited by hand always win over assisted values; the
+  // assistant may fill blank fields and refresh fields it set before.
+  const touched = React.useRef<Set<string>>(new Set());
+  const assisted = React.useRef<Set<string>>(new Set());
+  const selectionRef = React.useRef(selection);
+  selectionRef.current = selection;
+  React.useEffect(() => {
+    if (assistRevision === 0) return;
+    const current = selectionRef.current;
+    const next: FieldSelection = { ...current };
+    const constants = preview.proposed_constants ?? {};
+    const names = new Set(Object.keys(constants));
+    for (const [field, raw] of Object.entries(constants)) {
+      if (touched.current.has(field)) continue;
+      const choice = current[field];
+      if (choice && choice.kind !== "" && !assisted.current.has(field)) {
+        continue;
+      }
+      next[field] = { kind: "custom", position: "", value: String(raw) };
+    }
+    assisted.current = names;
+    setSamples(preview.samples);
+    setError(null);
+    // change() would mark fields touched; refresh quietly instead.
+    if (timer.current) clearTimeout(timer.current);
+    setSelection(next);
+    timer.current = setTimeout(() => void refresh(next), 400);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assistRevision]);
+
   async function confirm() {
     setBusy(true);
     setError(null);
@@ -146,7 +191,9 @@ export function MappingEditor({
   }
 
   const columns = shownFields(selection);
-  const missing = missingRequired(selection);
+  // Message lines map nothing: interpretation plus human reviews cover
+  // every gap, so nothing blocks confirmation.
+  const missing = messageLines ? [] : missingRequired(selection);
 
   return (
     <div className="space-y-6">
@@ -163,20 +210,48 @@ export function MappingEditor({
 
       <Card>
         <CardHeader>
-          <CardTitle>Map the columns</CardTitle>
+          <CardTitle>
+            {messageLines ? "Set values for every line" : "Map the columns"}
+          </CardTitle>
           <CardDescription>
-            {preview.filename} · {preview.headers.length} columns detected.
-            Required fields are marked. Ignore fields you never want, or set
-            one value for every row.
+            {messageLines ? (
+              <>
+                {preview.filename} · {preview.total_rows} pasted line
+                {preview.total_rows === 1 ? "" : "s"}. Each line imports as
+                one row and OfferFlow reads the fields from the text — set
+                the supplier when you know it.
+              </>
+            ) : (
+              <>
+                {preview.filename} · {preview.headers.length} columns detected.
+                Required fields are marked. Ignore fields you never want, or
+                set one value for every row.
+              </>
+            )}
           </CardDescription>
         </CardHeader>
         <CardContent>
           <FieldMapper
-            headers={preview.headers}
+            headers={messageLines ? [] : preview.headers}
             selection={selection}
-            onChange={change}
+            onChange={(next) => {
+              for (const [field, choice] of Object.entries(next)) {
+                const before = selection[field];
+                if (
+                  !before ||
+                  before.kind !== choice.kind ||
+                  before.position !== choice.position ||
+                  before.value !== choice.value
+                ) {
+                  touched.current.add(field);
+                  assisted.current.delete(field);
+                }
+              }
+              change(next);
+            }}
             autoFields={Object.keys(preview.detected)}
             currencies={currencies}
+            valuesOnly={messageLines}
           />
           {missing.length > 0 ? (
             <p className="mt-3 text-sm font-medium text-destructive" role="alert">
@@ -190,7 +265,7 @@ export function MappingEditor({
       <Card>
         <CardHeader>
           <CardTitle>
-            Sample rows{" "}
+            {messageLines ? "Pasted lines" : "Sample rows"}{" "}
             {rendering ? (
               <span className="text-sm font-normal text-muted-foreground">
                 updating…
@@ -198,9 +273,20 @@ export function MappingEditor({
             ) : null}
           </CardTitle>
           <CardDescription>
-            First {samples.rows.length} data rows as they will import. Row
-            status is computed by OfferFlow — it is not a file column and
-            cannot be mapped.
+            {messageLines ? (
+              <>
+                First {samples.rows.length} of {preview.total_rows} lines as
+                they will import. Fields are read from the text during
+                import; header and note lines are set aside, and anything
+                unclear becomes a question for you.
+              </>
+            ) : (
+              <>
+                First {samples.rows.length} data rows as they will import. Row
+                status is computed by OfferFlow — it is not a file column and
+                cannot be mapped.
+              </>
+            )}
             {samples.applied_defaults && Object.keys(samples.applied_defaults).length > 0
               ? ` Defaults applied: ${Object.entries(samples.applied_defaults)
                   .map(([field, value]) => `${field} = ${value}`)
@@ -213,6 +299,63 @@ export function MappingEditor({
             <p className="text-sm text-muted-foreground">
               No rows to show for this mapping yet.
             </p>
+          ) : messageLines ? (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Line</TableHead>
+                  <TableHead>Message</TableHead>
+                  <TableHead>Set values</TableHead>
+                  <TableHead>Row status</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {samples.rows.map((row) => {
+                  const fixed = Object.entries(row.cells).filter(
+                    ([name, value]) =>
+                      name !== "message" &&
+                      value !== null &&
+                      value !== undefined &&
+                      String(value).trim() !== "",
+                  );
+                  return (
+                    <TableRow key={row.index}>
+                      <TableCell>{row.index}</TableCell>
+                      <TableCell className="max-w-md whitespace-pre-wrap break-words">
+                        {String(row.cells.message ?? "")}
+                      </TableCell>
+                      <TableCell>
+                        {fixed.length === 0 ? (
+                          <span className="text-muted-foreground">—</span>
+                        ) : (
+                          <span className="flex flex-col items-start gap-1 text-xs">
+                            {fixed.map(([name, value]) => (
+                              <span key={name}>
+                                {name} = {String(value)}
+                              </span>
+                            ))}
+                          </span>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {row.status ? (
+                          <span className="flex flex-col items-start gap-1">
+                            <StatusBadge status={row.status} />
+                            {(row.issues ?? []).slice(0, 2).map((issue) => (
+                              <span key={issue} className="text-xs text-muted-foreground">
+                                {issue}
+                              </span>
+                            ))}
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
           ) : (
             <Table>
               <TableHeader>

@@ -97,6 +97,10 @@ SUPPLIER_DISQUALIFIERS = frozenset({"network"})
 
 REQUIRED_COLUMNS = ("supplier", "model", "price")
 
+#: Synthetic single column for pasted chat-style text: each non-empty
+#: line becomes one row whose raw line the model (or the reviewer) reads.
+MESSAGE_COLUMN = "message"
+
 ACCEPTED_EXTENSIONS = frozenset({".xlsx", ".xls", ".csv", ".txt", ".tsv", ".docx"})
 ARCHIVE_EXTENSIONS = frozenset({".xlsx", ".docx"})
 LEGACY_DOC_MESSAGE = (
@@ -278,6 +282,7 @@ def _table_to_sheet(
     column_constants: dict | None = None,
     ignored_columns: list | None = None,
     constant_sources: dict | None = None,
+    message_fallback: bool = False,
 ) -> ParsedSheet:
     """Run header scan plus row extraction over plain value rows.
 
@@ -286,6 +291,10 @@ def _table_to_sheet(
     and win over automatic detection. Constants stamp one raw value onto
     every row (recorded as a manual source); ignored names are dropped
     from the detected map.
+
+    With message_fallback (pasted chat-style text only), a headerless
+    single-column table becomes message rows — one per non-empty line —
+    instead of failing, so the interpretation lane can read each line.
     """
     header_index = None
     headers: list = []
@@ -306,7 +315,28 @@ def _table_to_sheet(
             sources = found_sources
             break
     if header_index is None:
-        raise UnsupportedFile("No header row found in the scanned rows.")
+        if not message_fallback:
+            raise UnsupportedFile("No header row found in the scanned rows.")
+        content_rows = [
+            row
+            for row in rows
+            if any(
+                value is not None and str(value).strip()
+                for value, _flag in row
+            )
+        ]
+        if not content_rows:
+            raise UnsupportedFile("No readable rows in the pasted text.")
+        if any(len(row) != 1 for row in content_rows):
+            raise UnsupportedFile(
+                "No header row found. Add a header row such as "
+                "Model, Price, Quantity — or paste one product per line "
+                "so each line can be read as a message."
+            )
+        headers = [MESSAGE_COLUMN]
+        header_index = 0
+        column_map = {MESSAGE_COLUMN: 0}
+        sources = {MESSAGE_COLUMN: "pasted"}
     if column_overrides:
         for canonical, position in column_overrides.items():
             if canonical not in HEADER_TOKENS:
@@ -405,7 +435,9 @@ def _table_to_sheet(
         for name in REQUIRED_COLUMNS
         if name not in column_map and name not in constants
     ]
-    if missing:
+    if missing and not (
+        message_fallback and set(column_map) == {MESSAGE_COLUMN}
+    ):
         raise MappingRequired(
             headers=headers,
             column_map=column_map,
@@ -550,6 +582,7 @@ def parse_delimited(
     ignored_columns: list | None = None,
     constant_sources: dict | None = None,
     forced_delimiter: str | None = None,
+    message_fallback: bool = False,
 ) -> ParsedSheet:
     """Parse csv/txt/tsv bytes with a sniffed (or forced) delimiter."""
     text = _decode_text(content)
@@ -570,6 +603,7 @@ def parse_delimited(
         column_constants=column_constants,
         ignored_columns=ignored_columns,
         constant_sources=constant_sources,
+        message_fallback=message_fallback,
     )
 
 
@@ -633,11 +667,14 @@ def parse_upload(
     column_constants: dict | None = None,
     ignored_columns: list | None = None,
     constant_sources: dict | None = None,
+    message_fallback: bool = False,
 ) -> ParsedSheet:
     """Dispatch bytes to the reader matching the filename extension.
 
     Callers run check_upload_safety first; this only refuses unknown
-    extensions and legacy .doc with guidance.
+    extensions and legacy .doc with guidance. message_fallback (pasted
+    text only) lets headerless single-column delimited text become
+    message rows; spreadsheets and documents never fall back.
     """
     extension = _extension_of(filename)
     options = {
@@ -660,7 +697,9 @@ def parse_upload(
         return parse_delimited(content, title, forced_delimiter="\t", **options)
     if extension in (".csv", ".txt"):
         title = (filename or "upload").rsplit("/", 1)[-1]
-        return parse_delimited(content, title, **options)
+        return parse_delimited(
+            content, title, message_fallback=message_fallback, **options
+        )
     if extension == ".doc":
         raise UnsupportedFile(LEGACY_DOC_MESSAGE)
     accepted = ", ".join(sorted(e[1:] for e in ACCEPTED_EXTENSIONS))

@@ -20,6 +20,8 @@ from rest_framework.views import APIView
 
 from common.storage import LocalFileAdapter
 from organizations import services as org_services
+from organizations.context import set_tenant_context
+from organizations.models import Membership
 from pipeline import review as review_services
 from pipeline.export import create_export
 from pipeline.jobs import cancel_run, remap_run
@@ -46,9 +48,13 @@ from pipeline.quotes import (
     update_rule,
 )
 from pipeline.previews import (
+    AssistRefused,
+    apply_preview_assist,
+    assist_preview,
     cancel_preview,
     confirm_preview,
     create_preview,
+    create_preview_from_text,
     render_preview,
 )
 from pipeline.serializers import (
@@ -60,6 +66,8 @@ from pipeline.serializers import (
     CustomerQuoteSerializer,
     ExportRequestSerializer,
     FileCategorySerializer,
+    PreviewAssistApplySerializer,
+    PreviewAssistSerializer,
     QuoteConfirmSerializer,
     QuoteLinesSerializer,
     SupplierInputSerializer,
@@ -77,6 +85,7 @@ from pipeline.serializers import (
     ReviewSerializer,
     RunSerializer,
     SourceFileSerializer,
+    PreviewTextSerializer,
     UploadSerializer,
     ValidationSerializer,
 )
@@ -95,55 +104,118 @@ def _as_drf_error(error: DjangoValidationError) -> DRFValidationError:
     return DRFValidationError({"detail": messages[0] if len(messages) == 1 else messages})
 
 
+def _scoped_fetch(user, getter, org_of):
+    """Fetch one tenant object and scope row policy to its organization.
+
+    The session's active organization usually matches, so the first fetch
+    runs as-is. When the object lives in another member organization, each
+    membership is retried once so multi-org members keep exactly the
+    access the application filters allow. Foreign objects still 404, and
+    the middleware clears the narrowed context after the request.
+    """
+    from django.http import Http404
+
+    try:
+        found = getter()
+    except Http404:
+        found = None
+    if found is None:
+        for org_id in (
+            Membership.objects.filter(user=user)
+            .values_list("organization_id", flat=True)
+            .order_by("organization_id")
+            .distinct()
+        ):
+            set_tenant_context(org_id, user.id)
+            try:
+                found = getter()
+            except Http404:
+                continue
+            break
+    if found is None:
+        raise Http404("No object matches the given query.")
+    set_tenant_context(org_of(found), user.id)
+    return found
+
+
 def _run_for_user(user, run_id: int) -> ImportRun:
-    return get_object_or_404(
-        ImportRun.objects.filter(organization__memberships__user=user), pk=run_id
+    return _scoped_fetch(
+        user,
+        lambda: get_object_or_404(
+            ImportRun.objects.filter(organization__memberships__user=user),
+            pk=run_id,
+        ),
+        lambda run: run.organization_id,
     )
 
 
 def _review_for_user(user, review_id: int) -> ReviewRequest:
-    return get_object_or_404(
-        ReviewRequest.objects.filter(
-            run__organization__memberships__user=user
-        ).select_related("run", "offer"),
-        pk=review_id,
+    return _scoped_fetch(
+        user,
+        lambda: get_object_or_404(
+            ReviewRequest.objects.filter(
+                run__organization__memberships__user=user
+            ).select_related("run", "offer"),
+            pk=review_id,
+        ),
+        lambda review: review.organization_id,
     )
 
 
 def _artifact_for_user(user, artifact_id: int) -> ExportArtifact:
-    return get_object_or_404(
-        ExportArtifact.objects.filter(organization__memberships__user=user),
-        pk=artifact_id,
+    return _scoped_fetch(
+        user,
+        lambda: get_object_or_404(
+            ExportArtifact.objects.filter(organization__memberships__user=user),
+            pk=artifact_id,
+        ),
+        lambda artifact: artifact.organization_id,
     )
 
 
 def _file_for_user(user, file_id: int) -> SourceFile:
-    return get_object_or_404(
-        SourceFile.objects.filter(
-            organization__memberships__user=user
-        ).select_related("organization", "uploaded_by", "category"),
-        pk=file_id,
+    return _scoped_fetch(
+        user,
+        lambda: get_object_or_404(
+            SourceFile.objects.filter(
+                organization__memberships__user=user
+            ).select_related("organization", "uploaded_by", "category"),
+            pk=file_id,
+        ),
+        lambda source_file: source_file.organization_id,
     )
 
 
 def _rule_for_user(user, rule_id: int) -> PricingRule:
-    return get_object_or_404(
-        PricingRule.objects.filter(organization__memberships__user=user),
-        pk=rule_id,
+    return _scoped_fetch(
+        user,
+        lambda: get_object_or_404(
+            PricingRule.objects.filter(organization__memberships__user=user),
+            pk=rule_id,
+        ),
+        lambda rule: rule.organization_id,
     )
 
 
 def _category_for_user(user, category_id: int) -> Category:
-    return get_object_or_404(
-        Category.objects.filter(organization__memberships__user=user),
-        pk=category_id,
+    return _scoped_fetch(
+        user,
+        lambda: get_object_or_404(
+            Category.objects.filter(organization__memberships__user=user),
+            pk=category_id,
+        ),
+        lambda category: category.organization_id,
     )
 
 
 def _supplier_for_user(user, supplier_id: int) -> Supplier:
-    return get_object_or_404(
-        Supplier.objects.filter(organization__memberships__user=user),
-        pk=supplier_id,
+    return _scoped_fetch(
+        user,
+        lambda: get_object_or_404(
+            Supplier.objects.filter(organization__memberships__user=user),
+            pk=supplier_id,
+        ),
+        lambda supplier: supplier.organization_id,
     )
 
 
@@ -450,6 +522,32 @@ class PreviewCreateView(APIView):
         return Response(preview, status=status.HTTP_201_CREATED)
 
 
+class PreviewTextView(APIView):
+    """Preview pasted text exactly like an uploaded .txt file."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = PreviewTextSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            organization = org_services.authorize_organization_access(
+                request.user, data["organization_id"]
+            )
+        except DjangoPermissionDenied as error:
+            raise DRFPermissionDenied(str(error)) from error
+        try:
+            preview = create_preview_from_text(
+                organization=organization,
+                user=request.user,
+                text=data["text"],
+            )
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
+        return Response(preview, status=status.HTTP_201_CREATED)
+
+
 class PreviewRenderView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -497,6 +595,88 @@ class PreviewCancelView(APIView):
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PreviewAssistView(APIView):
+    """One propose-then-apply assist turn against a pending preview."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, key):
+        from common.meta import ASSISTANT_REFUSAL, ProposalUnusable, ProviderError
+        from common.provider import ProviderNotConfigured
+
+        serializer = PreviewAssistSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            result = assist_preview(
+                key=key,
+                user=request.user,
+                conversation=serializer.validated_data["messages"],
+            )
+        except AssistRefused:
+            return Response(
+                {"refusal": ASSISTANT_REFUSAL}, status=status.HTTP_200_OK
+            )
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
+        except ProposalUnusable as error:
+            return Response(
+                {
+                    "message": (
+                        "I could not turn that into a safe preview change. "
+                        "Tell me the exact value to set or the line numbers "
+                        "to drop."
+                    ),
+                    "proposal": {
+                        "set_constants": {},
+                        "drop_lines": [],
+                        "dropped_previews": [],
+                    },
+                    "tokens": getattr(error, "tokens", 0),
+                    "retriable": True,
+                    "hint": str(error),
+                },
+                status=status.HTTP_200_OK,
+            )
+        except ProviderNotConfigured as error:
+            return Response(
+                {"detail": str(error)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except ProviderError as error:
+            from pipeline.spending import BudgetRefused
+
+            if isinstance(error.__cause__, BudgetRefused):
+                return Response(
+                    {"detail": str(error)},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            return Response(
+                {"detail": str(error)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(result)
+
+
+class PreviewAssistApplyView(APIView):
+    """Apply the confirmed assist proposal and return the fresh preview."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, key):
+        serializer = PreviewAssistApplySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            result = apply_preview_assist(
+                key=key,
+                user=request.user,
+                set_constants=serializer.validated_data["set_constants"],
+                drop_lines=serializer.validated_data["drop_lines"],
+            )
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
+        return Response(result)
 
 
 class RuleListView(APIView):
@@ -1031,13 +1211,18 @@ class AssistantChatView(APIView):
 
 
 class QuoteView(APIView):
-    """Preview the customer quote: one repriced line per product group."""
+    """Preview the customer quote: one repriced line per product group.
+
+    Internal preview for members: readable without release approval, but
+    labeled as such and never a shareable file. Downloads go through
+    QuoteDownloadView and the shared release checks.
+    """
 
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, run_id):
         run = _run_for_user(request.user, run_id)
-        return Response(build_quote(run))
+        return Response({**build_quote(run), "preview": True})
 
 
 class QuoteDownloadView(APIView):
@@ -1046,12 +1231,18 @@ class QuoteDownloadView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, run_id, file_format="xlsx"):
+        from pipeline.release import check_run_release
+
         run = _run_for_user(request.user, run_id)
         if file_format not in ("xlsx", "csv"):
             return Response(
                 {"detail": 'Format must be "xlsx" or "csv".'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        try:
+            check_run_release(run, for_quote=True)
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
         import io
 
         quote = build_quote(run)
@@ -1068,9 +1259,13 @@ class QuoteDownloadView(APIView):
 
 
 def _quote_for_user(user, quote_id: int) -> CustomerQuote:
-    return get_object_or_404(
-        CustomerQuote.objects.filter(organization__memberships__user=user),
-        pk=quote_id,
+    return _scoped_fetch(
+        user,
+        lambda: get_object_or_404(
+            CustomerQuote.objects.filter(organization__memberships__user=user),
+            pk=quote_id,
+        ),
+        lambda quote: quote.organization_id,
     )
 
 
@@ -1160,13 +1355,23 @@ class CustomerQuoteListView(APIView):
 
 
 class CustomerQuoteDetailView(APIView):
-    """Read one customer quote (member read)."""
+    """Read one customer quote (member read), or delete it (operators)."""
 
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, quote_id):
         quote = _quote_for_user(request.user, quote_id)
         return Response(CustomerQuoteSerializer(quote).data)
+
+    def delete(self, request, quote_id):
+        from pipeline.customer_quotes import delete_customer_quote
+
+        quote = _quote_for_user(request.user, quote_id)
+        try:
+            delete_customer_quote(quote=quote, user=request.user)
+        except DjangoPermissionDenied as error:
+            raise DRFPermissionDenied(str(error)) from error
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class CustomerQuoteConfirmView(APIView):
@@ -1194,7 +1399,7 @@ class CustomerQuoteConfirmView(APIView):
 
 
 class CustomerQuoteLinesView(APIView):
-    """Replace a ready quote's line labels and hidden flags."""
+    """Replace a ready quote's line overrides (labels, details, hidden)."""
 
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1238,31 +1443,36 @@ class CustomerQuoteDownloadView(APIView):
     def get(self, request, quote_id, file_format="xlsx"):
         import io
 
+        from pipeline.release import check_customer_quote_release
+
         quote = _quote_for_user(request.user, quote_id)
         if file_format not in ("xlsx", "csv"):
             return Response(
                 {"detail": 'Format must be "xlsx" or "csv".'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if quote.status != "ready":
-            return Response(
-                {"detail": "Confirm the product groups before downloading."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        try:
+            check_customer_quote_release(quote)
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
         from pipeline.customer_quotes import (
             effective_template,
-            export_lines,
+            present_lines,
             quote_lines_for_category,
         )
 
         wanted = request.query_params.get("category_id")
+        # Present the full frozen list first: edits bind to stable
+        # line ids (or legacy full-list positions), so filtering
+        # before presenting would misaddress them on shelves.
+        presented = present_lines(lines=quote.lines, edits=quote.line_edits)
         try:
             lines, suffix = quote_lines_for_category(
-                lines=quote.lines, category_id=wanted
+                lines=presented, category_id=wanted
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
-        shown = export_lines(lines=lines, edits=quote.line_edits)
+        shown = [line for line in lines if not line["hidden"]]
         payload = {"lines": shown, "notes": quote.notes}
         include_category = wanted is None and any(
             isinstance(line, dict) and line.get("category_name")
@@ -1288,7 +1498,7 @@ class CustomerQuoteMessageView(APIView):
     """Read the Telegram message whole or for one category (member read).
 
     The message renders live from the frozen lines, the line edits,
-    and the company's current export template, so labels, hidden
+    and the company's current export template, so overrides, hidden
     lines, and format choices always match the latest save.
     """
 
@@ -1297,21 +1507,23 @@ class CustomerQuoteMessageView(APIView):
     def get(self, request, quote_id):
         from pipeline.customer_quotes import (
             effective_template,
-            export_lines,
+            present_lines,
             quote_lines_for_category,
             render_message,
         )
 
+        from pipeline.release import check_customer_quote_release
+
         quote = _quote_for_user(request.user, quote_id)
-        if quote.status != "ready":
-            return Response(
-                {"detail": "Confirm the product groups before messaging."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        try:
+            manifest = check_customer_quote_release(quote)
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
         wanted = request.query_params.get("category_id")
+        presented = present_lines(lines=quote.lines, edits=quote.line_edits)
         try:
             lines, _ = quote_lines_for_category(
-                lines=quote.lines, category_id=wanted
+                lines=presented, category_id=wanted
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
@@ -1320,8 +1532,9 @@ class CustomerQuoteMessageView(APIView):
                 "message": render_message(
                     organization_name=quote.organization.name,
                     day=quote.created_at.date(),
-                    lines=export_lines(lines=lines, edits=quote.line_edits),
+                    lines=[line for line in lines if not line["hidden"]],
                     template=effective_template(quote.organization),
-                )
+                ),
+                "release": manifest,
             }
         )

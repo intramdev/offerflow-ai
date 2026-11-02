@@ -59,6 +59,11 @@ def normalize_grade(value) -> str:
     return (value or "").strip().lower() if isinstance(value, str) else ""
 
 
+def normalize_color(value) -> str:
+    """Color blocking key: exact up to case and surrounding space."""
+    return (value or "").strip().lower() if isinstance(value, str) else ""
+
+
 def normalize_alias(value) -> str:
     """Model-spelling key: lowercase alphanumeric only."""
     if not isinstance(value, str):
@@ -115,17 +120,19 @@ def propose_groups(*, organization, offers: list, user=None) -> dict:
             normalize_brand(offer.brand),
             offer.capacity_gb,
             normalize_grade(offer.grade),
+            normalize_color(offer.color),
         )
         blocks.setdefault(key, []).append(offer)
     groups: list[dict] = []
     notes: list[str] = []
-    for (brand_norm, capacity, grade_norm), members in sorted(
+    for (brand_norm, capacity, grade_norm, color_norm), members in sorted(
         blocks.items(),
         key=lambda item: (
             item[0][0],
             item[0][1] is None,
             item[0][1],
             item[0][2],
+            item[0][3],
         ),
     ):
         groups.extend(
@@ -136,6 +143,7 @@ def propose_groups(*, organization, offers: list, user=None) -> dict:
                 brand_norm=brand_norm,
                 capacity=capacity,
                 grade_norm=grade_norm,
+                color_norm=color_norm,
                 members=members,
                 categories=categories,
                 file_categories=file_categories,
@@ -149,6 +157,7 @@ def propose_groups(*, organization, offers: list, user=None) -> dict:
             group["capacity_gb"] is None,
             group["capacity_gb"] or 0,
             normalize_grade(group.get("grade") or ""),
+            normalize_color(group.get("color") or ""),
             normalize_alias(group["canonical_model"]),
         )
     )
@@ -171,13 +180,14 @@ def _match_block(
     brand_norm,
     capacity,
     grade_norm,
+    color_norm,
     members,
     categories,
     file_categories,
     notes,
     user=None,
 ) -> list[dict]:
-    """Match one (brand, capacity, grade) block; return groups."""
+    """Match one (brand, capacity, grade, color) block; return groups."""
     memory: dict[tuple[str, str], ProductAlias] = {}
     if capacity is not None:
         for alias in ProductAlias.objects.filter(
@@ -259,6 +269,7 @@ def _match_block(
                 brand_norm=brand_norm,
                 capacity=capacity,
                 grade_norm=grade_norm,
+                color_norm=color_norm,
                 known=sorted(by_canonical),
                 pending=pending,
                 notes=notes,
@@ -303,6 +314,7 @@ def _provider_clusters(
     brand_norm,
     capacity,
     grade_norm,
+    color_norm,
     known,
     pending,
     notes,
@@ -322,13 +334,21 @@ def _provider_clusters(
         for raw in raws
     }
     payload = {
-        "block": {"brand": brand_norm, "capacity_gb": capacity, "grade": grade_norm},
+        "block": {
+            "brand": brand_norm,
+            "capacity_gb": capacity,
+            "grade": grade_norm,
+            "color": color_norm,
+        },
         "known": known,
         "spellings": [
             {"supplier": suppliers[raw], "raw": raw} for raw in raws
         ],
     }
-    block_label = f"{brand_norm or '?'} {capacity}GB {grade_norm or 'no grade'}".strip()
+    block_label = (
+        f"{brand_norm or '?'} {capacity}GB {grade_norm or 'no grade'} "
+        f"{color_norm or 'no color'}"
+    ).strip()
 
     def _note_chunk(position, total, prompt_tokens, completion_tokens):
         from pipeline.jobs import record_usage
@@ -686,6 +706,7 @@ def _group(offers, *, canonical, confidence, source, needs_review) -> dict:
         "brand": _display_brand(offers),
         "capacity_gb": offers[0].capacity_gb,
         "grade": offers[0].grade or "",
+        "color": offers[0].color or "",
         "canonical_model": canonical,
         "confidence": confidence,
         "source": source,
@@ -702,6 +723,7 @@ def _group(offers, *, canonical, confidence, source, needs_review) -> dict:
                 "supplier": offer.supplier,
                 "model_name": offer.model_name,
                 "grade": offer.grade or "",
+                "color": offer.color or "",
                 "unit_price": str(offer.unit_price),
                 "currency": (offer.currency or "").strip().upper(),
             }
@@ -720,9 +742,9 @@ def remember_decisions(*, organization, decisions: list, expected_offer_ids) -> 
 
     Each decision is {"canonical_model": str, "offer_ids": [...]} with
     an optional "category_id" (int or null). Groups must stay inside
-    one (brand, capacity, grade) block and place every expected offer
-    exactly once. Members without a model name or capacity group fine
-    but are never remembered.
+    one (brand, capacity, grade, color) block and place every
+    expected offer exactly once. Members without a model name or
+    capacity group fine but are never remembered.
     """
     expected = {int(pk) for pk in expected_offer_ids}
     if not isinstance(decisions, list) or not decisions:
@@ -771,9 +793,16 @@ def remember_decisions(*, organization, decisions: list, expected_offer_ids) -> 
         brands = {normalize_brand(o.brand) for o in members}
         capacities = {o.capacity_gb for o in members}
         grades = {normalize_grade(o.grade) for o in members}
-        if len(brands) > 1 or len(capacities) > 1 or len(grades) > 1:
+        colors = {normalize_color(o.color) for o in members}
+        if (
+            len(brands) > 1
+            or len(capacities) > 1
+            or len(grades) > 1
+            or len(colors) > 1
+        ):
             raise ValidationError(
-                f"{label} mixes brands, capacities, or grades; split it first."
+                f"{label} mixes brands, capacities, grades, or colors; "
+                "split it first."
             )
         category_id = decision.get("category_id")
         if category_id is not None and (

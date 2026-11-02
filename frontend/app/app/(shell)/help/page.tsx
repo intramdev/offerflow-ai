@@ -86,6 +86,12 @@ export default function HelpPage() {
           Files from the same supplier are recognized: a previous mapping is
           suggested automatically, so repeated price lists import in one click.
         </Note>
+        <P>
+          You can also paste a supplier message (WhatsApp/Telegram text) into
+          the text box instead of a file: OfferFlow parses it into the same
+          preview, inheriting grade sections and currency per row, and the
+          preview assistant opens automatically to propose mapping fixes.
+        </P>
       </Section>
 
       <Section id="mapping" title="Column mapping">
@@ -158,6 +164,8 @@ export default function HelpPage() {
           text — delete stray words from supplier names — or hide whole
           lines; prices and sources stay frozen. Download it as XLSX or CSV,
           copy the per-category message for Telegram, or send both together.
+          Operators can also delete a quote from the list or the detail
+          page, with confirmation.
         </P>
         <Note>
           <strong>Settings → Quote exports</strong> decides what customers
@@ -190,8 +198,10 @@ export default function HelpPage() {
           When no model key is configured, imports run without AI
           enrichment and spend nothing. If requests fail with “No free
           in-flight slot” while nobody is working, the “Release stuck
-          slot” button on this page frees your company’s slot; other
-          companies are never affected.
+          slot” button on this page settles only your company’s expired
+          holds — live requests are never touched, and expired
+          uncertain holds book their estimate as spend. Other companies
+          are never affected.
         </Note>
       </Section>
 
@@ -201,6 +211,12 @@ export default function HelpPage() {
           opens a chat about app features. It cannot see your data or anyone
           else’s, it refuses anything outside the app, and every answer
           spends credits from the same log above.
+        </P>
+        <P>
+          When a paste preview is on screen, the chat switches to
+          preview-assistant mode: it can see only that preview, proposes
+          changes as an explicit draft, and applies them only when you click{" "}
+          <strong>Apply to preview</strong> — your own edits always win.
         </P>
       </Section>
 

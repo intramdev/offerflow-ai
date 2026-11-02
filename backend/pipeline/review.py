@@ -19,10 +19,7 @@ from pipeline.normalize import (
     LOCKED,
     UNLOCKED,
     compute_offer_status,
-    parse_capacity,
-    parse_currency,
-    parse_price,
-    parse_quantity,
+    parse_review_value,
 )
 from pipeline.validate import run_validations
 
@@ -32,37 +29,37 @@ _MISSING = object()
 def _apply_value(offer, field: str, raw) -> None:
     """Apply a reviewer-supplied value through the standard parsers."""
     if field == "supplier":
-        text = str(raw).strip() if raw is not None else ""
+        text = parse_review_value(field, raw)
         if not text:
             raise ValidationError("Supplier must not be empty.")
         offer.supplier = text
     elif field == "model_name":
-        text = str(raw).strip() if raw is not None else ""
+        text = parse_review_value(field, raw)
         if not text:
             raise ValidationError("Model must not be empty.")
         offer.model_name = text
     elif field == "capacity_gb":
-        value = parse_capacity(raw)
+        value = parse_review_value(field, raw)
         if value is None:
             raise ValidationError("Capacity must be gigabytes as a whole number.")
         offer.capacity_gb = value
     elif field == "grade":
-        text = str(raw).strip() if raw is not None else ""
+        text = parse_review_value(field, raw)
         if not text:
             raise ValidationError("Grade must not be empty.")
         offer.grade = text
     elif field == "quantity":
-        value = parse_quantity(raw)
+        value = parse_review_value(field, raw)
         if value is None:
             raise ValidationError("Quantity must be a whole number.")
         offer.quantity = value
     elif field == "unit_price":
-        value = parse_price(raw)
+        value = parse_review_value(field, raw)
         if value is None:
             raise ValidationError("Unit price must be a positive price.")
         offer.unit_price = value
     elif field == "currency":
-        value = parse_currency(raw)
+        value = parse_review_value(field, raw)
         if value is None:
             raise ValidationError("Currency must be a three-letter code.")
         offer.currency = value
@@ -319,6 +316,7 @@ def ignore_request(*, review: ReviewRequest, user):
 def approve_run(*, run, user):
     """Approve a releasable run, binding approval to exact versions."""
     from pipeline.jobs import record_audit
+    from pipeline.release import active_rules_digest
 
     if run.status != RunStatus.READY_FOR_REVIEW:
         raise ValidationError("Only runs awaiting review can be approved.")
@@ -329,12 +327,14 @@ def approve_run(*, run, user):
     run.approved_at = timezone.now()
     run.approved_source_sha = run.source_file.sha256
     run.approved_normalized_digest = normalized_digest(run)
+    run.approved_rules_digest = active_rules_digest(run.organization)
     run.save(
         update_fields=[
             "approved_by",
             "approved_at",
             "approved_source_sha",
             "approved_normalized_digest",
+            "approved_rules_digest",
             "updated_at",
         ]
     )

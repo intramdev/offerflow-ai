@@ -159,6 +159,102 @@ class PreviewFlowTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("price", response.data["detail"])
 
+    def _paste(self, user, org, text):
+        self.client.force_authenticate(user)
+        return self.client.post(
+            "/api/pipeline/previews/from-text/",
+            {"organization_id": org.id, "text": text},
+            format="json",
+        )
+
+    def test_paste_tabular_text_uses_normal_mapping(self):
+        text = "Supplier;Model;Price;Qty\nAcme;P1;10;2\n"
+        response = self._paste(self.alice, self.org_a, text)
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertFalse(response.data["message_lines"])
+        self.assertEqual(response.data["total_rows"], 1)
+        self.assertTrue(response.data["filename"].endswith(".txt"))
+
+    def test_paste_chat_lines_become_message_rows(self):
+        text = "iPhone 15 128GB Black 450\nSamsung S24 128GB 390\n"
+        response = self._paste(self.alice, self.org_a, text)
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertTrue(response.data["message_lines"])
+        self.assertEqual(response.data["total_rows"], 2)
+        self.assertEqual(response.data["missing"], [])
+        rows = response.data["samples"]["rows"]
+        self.assertEqual(
+            rows[0]["cells"]["message"], "iPhone 15 128GB Black 450"
+        )
+
+    def test_paste_blank_text_refused(self):
+        response = self._paste(self.alice, self.org_a, "   \n  ")
+        self.assertEqual(response.status_code, 400)
+
+    def test_confirm_message_paste_starts_free_text_run(self):
+        text = "iPhone 15 128GB Black 450\n"
+        key = self._paste(self.alice, self.org_a, text).data["key"]
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/pipeline/previews/{key}/confirm/",
+                {"mapping": {}, "constants": {"supplier": "Acme"}},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 201, response.content)
+        run = ImportRun.objects.get(pk=response.data["id"])
+        self.assertTrue(run.mapping.get("free_text"))
+        row = run.source_rows.get()
+        self.assertEqual(row.data["message"], "iPhone 15 128GB Black 450")
+        self.assertEqual(row.data["supplier"], "Acme")
+
+    def test_confirm_message_paste_rejects_column_mapping(self):
+        text = "iPhone 15 128GB Black 450\n"
+        key = self._paste(self.alice, self.org_a, text).data["key"]
+        response = self.client.post(
+            f"/api/pipeline/previews/{key}/confirm/",
+            {"mapping": {"model": 0}},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("empty", response.data["detail"])
+
+    def test_render_message_paste_with_set_values(self):
+        text = "iPhone 15 128GB Black x5 450\n"
+        key = self._paste(self.alice, self.org_a, text).data["key"]
+        response = self.client.post(
+            f"/api/pipeline/previews/{key}/render/",
+            {"mapping": {}, "constants": {"currency": "USD"}, "ignored": []},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.data["mapping"], {})
+        rows = response.data["samples"]["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["cells"]["message"], "iPhone 15 128GB Black x5 450"
+        )
+        self.assertEqual(rows[0]["cells"]["currency"], "USD")
+
+    def test_second_message_paste_reuses_supplier_memory(self):
+        first = self._paste(self.alice, self.org_a, "iPhone 15 128GB 450\n")
+        key = first.data["key"]
+        with self.captureOnCommitCallbacks(execute=True):
+            confirm = self.client.post(
+                f"/api/pipeline/previews/{key}/confirm/",
+                {"mapping": {}, "constants": {"supplier": "Acme"}},
+                format="json",
+            )
+        self.assertEqual(confirm.status_code, 201, confirm.content)
+        # The remembered message mapping must not poison the next paste:
+        # no synthetic column leaks back in as a mappable position.
+        second = self._paste(self.alice, self.org_a, "Galaxy S24 256GB 520\n")
+        self.assertEqual(second.status_code, 201, second.content)
+        self.assertTrue(second.data["message_lines"])
+        self.assertEqual(second.data["proposed"], {})
+        self.assertEqual(
+            second.data["proposed_constants"].get("supplier"), "Acme"
+        )
+
     def test_duplicate_bytes_refused_on_second_preview(self):
         content = make_workbook([HEADERS, complete_row()])
         preview = self._preview_bytes(self.alice, self.org_a, content)

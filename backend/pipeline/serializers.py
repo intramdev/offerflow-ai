@@ -25,6 +25,11 @@ class UploadSerializer(serializers.Serializer):
     file = serializers.FileField()
 
 
+class PreviewTextSerializer(serializers.Serializer):
+    organization_id = serializers.IntegerField(min_value=1)
+    text = serializers.CharField(allow_blank=False, trim_whitespace=False)
+
+
 class ArtifactSummarySerializer(serializers.ModelSerializer):
     class Meta:
         model = ExportArtifact
@@ -397,6 +402,22 @@ class AssistantChatSerializer(serializers.Serializer):
     )
 
 
+class PreviewAssistSerializer(serializers.Serializer):
+    messages = serializers.ListField(
+        child=serializers.DictField(), min_length=1, max_length=10
+    )
+
+
+class PreviewAssistApplySerializer(serializers.Serializer):
+    set_constants = serializers.DictField(
+        required=False,
+        default=dict,
+    )
+    drop_lines = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), required=False, default=list
+    )
+
+
 class CustomerQuoteSerializer(serializers.ModelSerializer):
     sources = serializers.SerializerMethodField()
 
@@ -411,6 +432,7 @@ class CustomerQuoteSerializer(serializers.ModelSerializer):
             "groups",
             "lines",
             "line_edits",
+            "revision",
             "notes",
             "message",
             "provider_name",

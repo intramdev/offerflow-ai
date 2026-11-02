@@ -203,7 +203,9 @@ class AIProviderConfig(models.Model):
     api_key_encrypted = models.TextField(blank=True, default="")
     model = models.CharField(max_length=128, blank=True, default=DEFAULT_AI_MODEL)
     default_monthly_credits = models.PositiveIntegerField(
-        default=DEFAULT_MONTHLY_CREDITS
+        default=DEFAULT_MONTHLY_CREDITS,
+        help_text="Admin template to copy when approving an organization. "
+        "New allowances start at zero; this value grants nothing by itself.",
     )
     updated_at = models.DateTimeField(auto_now=True)
 

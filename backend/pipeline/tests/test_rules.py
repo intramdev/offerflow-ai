@@ -129,6 +129,20 @@ class RuleServiceTests(TestCase):
         )
         self.assertEqual(fallback, general)
 
+    def test_per_run_quote_keeps_colors_on_separate_lines(self):
+        # R7: the run-level grouping also splits variants; each
+        # line carries its own color and conditions.
+        self._rule()
+        run = self._run()
+        self._offer(run, 2, color="Black", conditions="Boxed")
+        self._offer(run, 3, color="White", conditions="Loose")
+        quote = build_quote(run)
+        self.assertEqual(len(quote["lines"]), 2)
+        by_color = {line["color"]: line for line in quote["lines"]}
+        self.assertEqual(set(by_color), {"Black", "White"})
+        self.assertEqual(by_color["Black"]["conditions"], "Boxed")
+        self.assertEqual(by_color["White"]["conditions"], "Loose")
+
     def test_per_run_quote_ignores_category_rules(self):
         self._rule(
             name="Phones",
@@ -374,6 +388,48 @@ class RuleApiTests(TestCase):
             status=RunStatus.READY_FOR_REVIEW,
         )
 
+    def _approved_run(self):
+        from pipeline.quotes import build_quote
+
+        run = self._run()
+        row = SourceRow.objects.create(
+            organization=self.org,
+            run=run,
+            index=2,
+            sheet="Sheet1",
+            data={
+                "supplier": "Supplier A",
+                "brand": "Apple",
+                "model": "iPhone 15",
+                "capacity": "128GB",
+                "grade": "A",
+                "quantity": 5,
+                "price": "100",
+                "currency": "USD",
+            },
+            provenance={"sheet": "Sheet1", "row": 2},
+        )
+        NormalizedOffer.objects.create(
+            organization=self.org,
+            run=run,
+            source_row=row,
+            supplier="Supplier A",
+            brand="Apple",
+            model_name="iPhone 15",
+            capacity_gb=128,
+            grade="A",
+            quantity=5,
+            unit_price=Decimal("100.0000"),
+            currency="USD",
+            status=OfferStatus.OK,
+            provenance={"sheet": "Sheet1", "row": 2, "source_row_id": row.id},
+        )
+        build_quote(run)
+        approved = self.client.post(f"/api/pipeline/runs/{run.id}/approve/")
+        self.assertEqual(approved.status_code, 200)
+        run.refresh_from_db()
+        return run
+
     def test_create_and_list_rules(self):
         payload = dict(RULE_DATA)
         payload["organization_id"] = self.org.id
@@ -461,7 +517,7 @@ class RuleApiTests(TestCase):
         self.assertEqual(len(body["lines"]), 1)
 
     def test_quote_download_csv(self):
-        run = self._run()
+        run = self._approved_run()
         response = self.client.get(
             f"/api/pipeline/runs/{run.id}/quote/download/csv/"
         )
@@ -471,7 +527,7 @@ class RuleApiTests(TestCase):
         self.assertTrue(content.startswith("Brand,Model"))
 
     def test_quote_download_defaults_xlsx(self):
-        run = self._run()
+        run = self._approved_run()
         response = self.client.get(f"/api/pipeline/runs/{run.id}/quote/download/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -485,3 +541,22 @@ class RuleApiTests(TestCase):
             f"/api/pipeline/runs/{run.id}/quote/download/pdf/"
         )
         self.assertEqual(response.status_code, 400)
+
+    def test_quote_download_refuses_unapproved_run(self):
+        run = self._run()
+        response = self.client.get(f"/api/pipeline/runs/{run.id}/quote/download/")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("approved", response.json()["detail"].lower())
+
+    def test_quote_download_refuses_after_rule_change(self):
+        run = self._approved_run()
+        PricingRule.objects.create(organization=self.org, **RULE_DATA)
+        response = self.client.get(f"/api/pipeline/runs/{run.id}/quote/download/")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Pricing rules changed", response.json()["detail"])
+
+    def test_quote_preview_stays_open_and_labeled(self):
+        run = self._run()
+        response = self.client.get(f"/api/pipeline/runs/{run.id}/quote/")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["preview"])

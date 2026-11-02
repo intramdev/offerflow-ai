@@ -6,11 +6,11 @@ from celery import shared_task
 from django.db import transaction
 
 from common.provider import ProviderNotConfigured, get_provider
-from organizations.context import reset_tenant_context, set_tenant_context
 from pipeline.models import (
     AuditEvent,
     ImportRun,
     NormalizedOffer,
+    OfferStatus,
     ReviewKind,
     ReviewRequest,
     ReviewStatus,
@@ -20,7 +20,11 @@ from pipeline.models import (
     UsageEvent,
     transition_run,
 )
-from pipeline.normalize import compute_offer_status, normalize_cells
+from pipeline.normalize import (
+    compute_offer_status,
+    merge_interpreted_cells,
+    normalize_cells,
+)
 from pipeline.validate import run_validations
 
 
@@ -90,6 +94,8 @@ def _ask_mapping(run: ImportRun, exc) -> None:
         "constants": stored.get("constants") or {},
         "ignored": stored.get("ignored") or [],
     }
+    if stored.get("free_text") is True:
+        run.mapping["free_text"] = True
     run.save(update_fields=["mapping", "updated_at"])
     ReviewRequest.objects.filter(run=run, offer__isnull=True).delete()
     choices = [
@@ -202,25 +208,117 @@ def remap_run(*, run: ImportRun, user, mapping: dict,
     return run
 
 
+def _run_org_for_worker(run_id: int) -> int | None:
+    """Resolve a run's organization before tenant context exists.
+
+    The job payload carries only the run id, and row policy hides the run
+    row until context is set. The SECURITY DEFINER helper reveals just the
+    organization id; the run itself is fetched afterwards under policy.
+    Deployments that predate role separation fall back to a direct lookup
+    only while their connection role still bypasses row policy; anything
+    else fails closed with an explicit error in the worker log.
+    """
+    import logging
+
+    from django.db import connection
+    from django.db.utils import ProgrammingError
+
+    from organizations.context import (
+        current_role_is_privileged,
+        is_missing_function,
+    )
+
+    if connection.vendor != "postgresql":
+        return (
+            ImportRun.objects.filter(pk=run_id)
+            .values_list("organization_id", flat=True)
+            .first()
+        )
+    try:
+        # Savepoint: without it the missing-function error aborts the
+        # ambient transaction and the fallback queries below die with
+        # it instead of resolving the org.
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT offerflow_run_org(%s)", [run_id])
+                found = cursor.fetchone()
+    except ProgrammingError as exc:
+        if is_missing_function(exc) and current_role_is_privileged():
+            # Legacy single-role deployment: the bootstrap helper was
+            # never provisioned, but the role bypasses row policy anyway.
+            return (
+                ImportRun.objects.filter(pk=run_id)
+                .values_list("organization_id", flat=True)
+                .first()
+            )
+        if is_missing_function(exc):
+            logging.getLogger(__name__).error(
+                "offerflow_run_org() is not installed; run "
+                "provision_runtime before processing jobs with the "
+                "restricted role."
+            )
+            return None
+        raise
+    return found[0] if found else None
+
+
+def _fail_unresolvable_run(run_id: int) -> None:
+    """Best-effort FAILED marking when the org cannot be resolved.
+
+    Without an organization the worker cannot open tenant scope, so
+    the run would otherwise sit in uploaded forever with no recovery
+    path. The lookup below only succeeds where the connection role
+    can see the row without context (legacy privileged deployments,
+    which is also the only place this fallback can run); the
+    restricted runtime fails closed and leaves the run untouched.
+    """
+    try:
+        run = ImportRun.objects.get(pk=run_id)
+    except ImportRun.DoesNotExist:
+        return
+    if run.status in TERMINAL_STATUSES:
+        return
+    transition_run(run, RunStatus.FAILED)
+    run.error = (
+        "The worker could not resolve this run's organization; "
+        "remap the file to queue it again."
+    )
+    run.save(update_fields=["error", "updated_at"])
+    record_audit(run.organization_id, None, "run_failed", "run", run.id)
+
+
 @shared_task(name="pipeline.process_import_run", bind=True, max_retries=0)
 def process_import_run(self, run_id: int):
     """Process one run exactly once per request; redeliveries are no-ops."""
-    try:
-        with transaction.atomic():
-            run = ImportRun.objects.select_for_update().get(pk=run_id)
-            if run.status in TERMINAL_STATUSES or run.status not in (
-                RunStatus.UPLOADED,
-                RunStatus.FAILED,
-            ):
-                return f"noop:{run.status}"
-            if run.status == RunStatus.FAILED:
-                transition_run(run, RunStatus.UPLOADED)
-                run.error = ""
-                run.save(update_fields=["error", "updated_at"])
-            transition_run(run, RunStatus.PARSING)
-    except ImportRun.DoesNotExist:
+    org_id = _run_org_for_worker(run_id)
+    if org_id is None:
+        _fail_unresolvable_run(run_id)
         return "missing"
-    set_tenant_context(run.organization_id, run.source_file.uploaded_by_id or 0)
+    from organizations.context import tenant_scope
+
+    # The uploader id below is only an audit label: row policy keys tenant
+    # rows off the organization context resolved above, not off this user.
+    with tenant_scope(org_id, 0):
+        try:
+            with transaction.atomic():
+                run = ImportRun.objects.select_for_update().get(pk=run_id)
+                if run.status in TERMINAL_STATUSES or run.status not in (
+                    RunStatus.UPLOADED,
+                    RunStatus.FAILED,
+                ):
+                    return f"noop:{run.status}"
+                if run.status == RunStatus.FAILED:
+                    transition_run(run, RunStatus.UPLOADED)
+                    run.error = ""
+                    run.save(update_fields=["error", "updated_at"])
+                transition_run(run, RunStatus.PARSING)
+        except ImportRun.DoesNotExist:
+            return "missing"
+        return _run_pipeline(run)
+
+
+def _run_pipeline(run: ImportRun):
+    """Parse, interpret, and validate one run inside tenant scope."""
     try:
         if _parse_step(run):
             return "needs_input"
@@ -238,8 +336,6 @@ def process_import_run(self, run_id: int):
             run.save(update_fields=["error", "updated_at"])
         record_audit(run.organization_id, None, "run_failed", "run", run.id)
         return "failed"
-    finally:
-        reset_tenant_context()
     return "ok"
 
 
@@ -278,6 +374,7 @@ def _parse_step(run: ImportRun) -> bool:
     merged, labels, applied = _with_currency_default(
         effective, constants, run.organization.default_currency, ignored
     )
+    free_text = stored.get("free_text") is True
     try:
         sheet = parse_upload(
             content,
@@ -289,6 +386,7 @@ def _parse_step(run: ImportRun) -> bool:
             column_constants=merged or None,
             ignored_columns=ignored or None,
             constant_sources=labels or None,
+            message_fallback=free_text,
         )
     except MappingRequired as exc:
         _ask_mapping(run, exc)
@@ -306,6 +404,8 @@ def _parse_step(run: ImportRun) -> bool:
         "ignored": ignored,
         "applied_defaults": applied,
     }
+    if free_text:
+        run.mapping["free_text"] = True
     run.save(update_fields=["mapping", "updated_at"])
     SourceRow.objects.filter(run=run).delete()
     SourceRow.objects.bulk_create(
@@ -325,6 +425,30 @@ def _parse_step(run: ImportRun) -> bool:
     return False
 
 
+# Pasted lines quoted back to the model as shared interpretation context,
+# so header lines (supplier name, date) inform every product row. Cut on a
+# line boundary; the provider refuses over-cap calls rather than guessing.
+MESSAGE_CONTEXT_CHARS = 2000
+
+
+def _message_context(rows) -> str:
+    lines = []
+    for row in rows:
+        text = (row.data or {}).get("message")
+        if isinstance(text, str) and text.strip():
+            lines.append(text.strip())
+    context = "\n".join(lines)
+    if len(context) > MESSAGE_CONTEXT_CHARS:
+        cut = context.rfind("\n", 0, MESSAGE_CONTEXT_CHARS)
+        context = context[: cut if cut > 0 else MESSAGE_CONTEXT_CHARS]
+    return context
+
+
+def _is_message_row(row) -> bool:
+    text = (row.data or {}).get("message")
+    return isinstance(text, str) and bool(text.strip())
+
+
 def _interpret_step(run: ImportRun) -> None:
     from common.meta import ProviderError as MetaProviderError
 
@@ -342,6 +466,7 @@ def _interpret_step(run: ImportRun) -> None:
         if gaps:
             gap_rows.append(row)
     interpreted = None
+    non_product: set = set()
     if not gap_rows:
         provider_name, simulated = "local", True
     else:
@@ -358,6 +483,8 @@ def _interpret_step(run: ImportRun) -> None:
         payload = {
             "rows": [{"index": row.index, "data": row.data} for row in gap_rows]
         }
+        if (run.mapping or {}).get("free_text") is True:
+            payload["context"] = _message_context(rows)
 
         provider_model = getattr(getattr(provider, "_config", None), "model", "")
         if not isinstance(provider_model, str):
@@ -392,6 +519,11 @@ def _interpret_step(run: ImportRun) -> None:
                 item["index"]: item.get("fields", {})
                 for item in result.get("rows", [])
             }
+            non_product = {
+                item["index"]
+                for item in result.get("rows", [])
+                if item.get("is_product") is False
+            }
             for row in gap_rows:
                 if row.index not in interpreted:
                     raise MetaProviderError(
@@ -421,9 +553,18 @@ def _interpret_step(run: ImportRun) -> None:
     ReviewRequest.objects.filter(run=run, offer__isnull=False).delete()
     for row in rows:
         if interpreted is not None and row.index in interpreted:
-            cells = dict(interpreted[row.index])
+            cells = merge_interpreted_cells(
+                dict(row.data), interpreted[row.index]
+            )
             fields = normalize_cells(cells)
             status, gaps, reason = compute_offer_status(fields)
+            if row.index in non_product and _is_message_row(row):
+                # Header, title, date, or note line: set aside visibly as
+                # an excluded offer, never silently dropped. Spreadsheet
+                # rows ignore the flag — mapped cells are products.
+                status = OfferStatus.EXCLUDED
+                gaps = []
+                reason = "Line carries no product offer (header or note)."
         else:
             cells, fields, status, gaps, reason = local[row.index]
         offer = NormalizedOffer.objects.create(

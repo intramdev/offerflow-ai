@@ -82,7 +82,10 @@ export default function HelpPage() {
           reads XLSX, XLS, CSV, TXT, TSV, and DOCX up to 200 MB and 2000
           rows (legacy DOC is refused with guidance; ZIP archives are not
           supported). Nothing is stored until you confirm: the file is
-          parsed and you get a preview first.
+          parsed and you get a preview first. Very large tables prepare
+          in seconds and resume where they left off — only the rows on
+          screen are read until you confirm the import. Pasted text
+          shares the same 200 MB cap.
         </P>
         <Note>
           PDF and image files are not supported: picking one shows an

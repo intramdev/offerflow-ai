@@ -47,8 +47,10 @@ from pipeline.parsing import (
     check_upload_extension,
     check_upload_safety,
     column_letter,
+    delimited_extension,
     discover_sheets,
     header_signature,
+    parse_delimited_sample,
     parse_upload,
     refuse_oversize,
 )
@@ -138,8 +140,41 @@ def _derive_sheet(content, original_name, limits, message_fallback,
 
     Shared by creation, sheet switching, and assist-apply so re-derived
     previews always match what a fresh upload of the same bytes and
-    selected sheet would show.
+    selected sheet would show. Delimited tables use the bounded sample
+    parse (head rows plus an exact counted total) so a 200 MB file
+    derives in about a second instead of tens of seconds.
     """
+    extension = delimited_extension(original_name)
+    if extension and not message_fallback:
+        title = (original_name or "upload").rsplit("/", 1)[-1]
+        try:
+            sheet, total = parse_delimited_sample(
+                content,
+                title,
+                max_rows=limits["max_rows"],
+                max_cols=limits["max_cols"],
+                header_scan_rows=limits["header_scan_rows"],
+                forced_delimiter="\t" if extension == ".tsv" else None,
+                sheet_name=sheet_name,
+                data_row_budget=0,
+            )
+            return (
+                sheet.headers,
+                sheet.column_map,
+                sheet.sources,
+                [],
+                total,
+                sheet.sheet,
+            )
+        except MappingRequired as exc:
+            return (
+                exc.headers,
+                exc.column_map,
+                exc.sources,
+                exc.missing,
+                exc.total_rows,
+                exc.sheet or sheet_name,
+            )
     try:
         sheet = parse_upload(
             content,
@@ -570,20 +605,43 @@ def _render_samples(content: bytes, filename: str, mapping: dict,
     merged, labels, applied = _with_currency_default(
         mapping, constants, default_currency, ignored
     )
+    extension = delimited_extension(filename)
     try:
-        sheet = parse_upload(
-            content,
-            filename,
-            max_rows=limits["max_rows"],
-            max_cols=limits["max_cols"],
-            header_scan_rows=limits["header_scan_rows"],
-            column_overrides=mapping or None,
-            column_constants=merged or None,
-            ignored_columns=ignored or None,
-            constant_sources=labels or None,
-            message_fallback=message_fallback,
-            sheet_name=sheet_name,
-        )
+        if extension and not message_fallback:
+            # Samples show the first rows only: parse the head with
+            # true record numbers instead of materializing a 200 MB
+            # table on every mapping tweak. The budget covers skipped
+            # head rows (tabular previews never carry exclusions, but
+            # a stale set must not shift the sample window either).
+            title = (filename or "upload").rsplit("/", 1)[-1]
+            sheet, _total = parse_delimited_sample(
+                content,
+                title,
+                max_rows=limits["max_rows"],
+                max_cols=limits["max_cols"],
+                header_scan_rows=limits["header_scan_rows"],
+                column_overrides=mapping or None,
+                column_constants=merged or None,
+                ignored_columns=ignored or None,
+                constant_sources=labels or None,
+                forced_delimiter="\t" if extension == ".tsv" else None,
+                sheet_name=sheet_name,
+                data_row_budget=SAMPLE_ROWS + min(len(skip), 64),
+            )
+        else:
+            sheet = parse_upload(
+                content,
+                filename,
+                max_rows=limits["max_rows"],
+                max_cols=limits["max_cols"],
+                header_scan_rows=limits["header_scan_rows"],
+                column_overrides=mapping or None,
+                column_constants=merged or None,
+                ignored_columns=ignored or None,
+                constant_sources=labels or None,
+                message_fallback=message_fallback,
+                sheet_name=sheet_name,
+            )
     except MappingRequired as exc:
         return {
             "complete": False,
@@ -695,6 +753,9 @@ def create_preview_from_text(*, organization, user, text: str) -> dict:
     content = (text or "").encode("utf-8")
     if not content.strip():
         raise ValidationError("Paste some text first.")
+    # Pasted text shares the upload byte limit: a 200 MB paste would
+    # otherwise run the same multi-tens-of-seconds parse as a file.
+    refuse_oversize(len(content), max_bytes=_limits()["max_bytes"])
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return _create_preview(
         organization=organization,
@@ -803,6 +864,7 @@ def _create_preview(
         "sheet": selected,
         "sheets": entries,
         "sheets_omitted": sheets["omitted"],
+        "total_rows": total_rows,
         "revision": 1,
         "rules": [],
         "document_policy": "stock",
@@ -936,6 +998,7 @@ def _switch_preview_sheet(key: str, meta: dict, content: bytes, wanted: str):
             "sources": sources,
             "sheet": selected,
             "sheets_omitted": block["omitted"],
+            "total_rows": total,
         }
     )
     _adapter().save_bytes(f"previews/{key}.json", json.dumps(meta).encode("utf-8"))
@@ -1098,6 +1161,30 @@ def get_preview_draft(*, key: str, user) -> dict:
     }
 
 
+def _preview_total_rows(key: str, meta: dict, content: bytes) -> int:
+    """Stored tabular data-row total, backfilling older previews.
+
+    The count never depends on the mapping, so resume and assist
+    reuse the reviewed value instead of re-scanning 200 MB. Caller
+    must hold _preview_lock: a backfill persists the value.
+    """
+    stored = meta.get("total_rows")
+    if type(stored) is int and stored >= 0:
+        return stored
+    _h, _d, _s, _m, total, _derived = _derive_sheet(
+        content,
+        meta["filename"],
+        _limits(),
+        False,
+        meta.get("sheet"),
+    )
+    meta["total_rows"] = total
+    _adapter().save_bytes(
+        f"previews/{key}.json", json.dumps(meta).encode("utf-8")
+    )
+    return total
+
+
 def resume_preview(*, key: str, user) -> dict:
     """Rebuild the full preview payload for a pending draft.
 
@@ -1138,13 +1225,7 @@ def resume_preview(*, key: str, user) -> dict:
             total_rows = len(_content_lines(content))
         else:
             records, unresolved, sections = [], [], []
-            _h, _d, _s, _m, total_rows, _derived = _derive_sheet(
-                content,
-                meta["filename"],
-                _limits(),
-                False,
-                meta.get("sheet"),
-            )
+            total_rows = _preview_total_rows(key, meta, content)
         samples = _render_samples(
             content,
             meta["filename"],
@@ -1252,15 +1333,32 @@ def _supplier_hint(content: bytes, filename: str, mapping: dict, constants: dict
         return str(constants["supplier"]).strip()[:255]
     limits = _limits()
     try:
-        sheet = parse_upload(
-            content,
-            filename,
-            max_rows=limits["max_rows"],
-            max_cols=limits["max_cols"],
-            header_scan_rows=limits["header_scan_rows"],
-            column_overrides=mapping or None,
-            sheet_name=sheet_name,
-        )
+        extension = delimited_extension(filename)
+        if extension:
+            # Only the first data row is ever read: one head record
+            # instead of a full 200 MB parse on every confirm.
+            title = (filename or "upload").rsplit("/", 1)[-1]
+            sheet, _total = parse_delimited_sample(
+                content,
+                title,
+                max_rows=limits["max_rows"],
+                max_cols=limits["max_cols"],
+                header_scan_rows=limits["header_scan_rows"],
+                column_overrides=mapping or None,
+                forced_delimiter="\t" if extension == ".tsv" else None,
+                sheet_name=sheet_name,
+                data_row_budget=1,
+            )
+        else:
+            sheet = parse_upload(
+                content,
+                filename,
+                max_rows=limits["max_rows"],
+                max_cols=limits["max_cols"],
+                header_scan_rows=limits["header_scan_rows"],
+                column_overrides=mapping or None,
+                sheet_name=sheet_name,
+            )
     except UnsupportedFile:
         return ""
     if not sheet.rows:
@@ -2240,13 +2338,7 @@ def apply_preview_assist(
         if message_lines:
             total_rows = len(records)
         else:
-            _h, _d, _s, _m, total_rows, _derived = _derive_sheet(
-                content,
-                meta["filename"],
-                _limits(),
-                False,
-                meta.get("sheet"),
-            )
+            total_rows = _preview_total_rows(key, meta, content)
         proposed = {} if message_lines else dict(detected)
         samples = _render_samples(
             content,

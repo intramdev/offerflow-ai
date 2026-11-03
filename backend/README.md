@@ -97,7 +97,15 @@ network with no published ports.
   non-empty line becomes one candidate record with stable 1-based
   line numbers; nothing is pre-extracted. Returns the same mapping
   preview plus a `draft` block (revision, confirmed rules, records,
-  unresolved issues, sections, history).
+  unresolved issues, sections, history). Pastes share the 200 MB
+  upload cap (413 past it).
+- Tabular preview preparation (`previews/`, `render/`, `resume/`)
+  reads only the header window plus the rows on screen
+  (`parse_delimited_sample`) and reuses the stored row total, so a
+  200 MB / 2000-row table prepares in ~7 s with ~10 MB of transient
+  parsing memory beyond the upload bytes themselves (measured
+  282 MB process peak vs ~1019 MB before). Full materialization
+  happens only at import, on the worker.
 - `POST api/pipeline/previews/<key>/assist/` + `.../assist/apply/` —
   preview assistant: propose typed interpretation operations, then
   apply them only after the user clicks **Apply to preview** (user

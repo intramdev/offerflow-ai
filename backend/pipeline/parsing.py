@@ -15,10 +15,12 @@ failure message names the headers that were actually seen.
 
 from __future__ import annotations
 
+import codecs
 import csv
 import datetime
 import hashlib
 import io
+import itertools
 import re
 import zipfile
 from dataclasses import dataclass, field
@@ -66,6 +68,7 @@ class MappingRequired(UnsupportedFile):
     def __init__(
         self, *, headers: list, column_map: dict, sources: dict, missing: list, rows: list,
         sheet: str = "",
+        header_row: int = 0,
     ) -> None:
         self.headers = list(headers)
         self.column_map = dict(column_map)
@@ -73,6 +76,12 @@ class MappingRequired(UnsupportedFile):
         self.missing = list(missing)
         self.rows = list(rows)
         self.sheet = sheet
+        self.header_row = header_row
+        # Exact data-row count, filled by the bounded sample parse
+        # (whose rows hold only the head) so previews never need a
+        # second full pass to learn the total. Full parses leave it
+        # None; their total is len(rows).
+        self.total_rows = None
         seen = ", ".join(h for h in headers if h) or "(none)"
         super().__init__(
             f"Missing required columns: {', '.join(missing)}. "
@@ -343,6 +352,7 @@ def _table_to_sheet(
     constant_sources: dict | None = None,
     message_fallback: bool = False,
     raw_lines: list | None = None,
+    row_numbers: list | None = None,
 ) -> ParsedSheet:
     """Run header scan plus row extraction over plain value rows.
 
@@ -359,12 +369,21 @@ def _table_to_sheet(
     (blank lines stay in place so row numbers match the source);
     separator-split cells are discarded because the message lane
     re-reads the raw lines, never the guessed columns.
+
+    row_numbers parallels rows with true 1-based record numbers for
+    bounded head parses, so sampled rows keep the exact indices a
+    full parse would report. It must be ascending, like a real scan.
     """
+    if row_numbers is not None and len(row_numbers) != len(rows):
+        raise ValueError("row_numbers must parallel rows.")
+    numbers = (
+        row_numbers if row_numbers is not None else range(1, len(rows) + 1)
+    )
     header_index = None
     headers: list = []
     column_map: dict = {}
     sources: dict = {}
-    for row_number, row in enumerate(rows, start=1):
+    for row_number, row in zip(numbers, rows):
         if row_number > header_scan_rows:
             break
         values = [value for value, _flag in row]
@@ -460,7 +479,7 @@ def _table_to_sheet(
     def _extract() -> list:
         """Extract data rows with the final mapping (partial maps allowed)."""
         found: list = []
-        for row_number, row in enumerate(rows, start=1):
+        for row_number, row in zip(numbers, rows):
             if row_number <= header_index:
                 continue
             values = [value for value, _flag in row]
@@ -518,6 +537,7 @@ def _table_to_sheet(
             missing=missing,
             rows=data,
             sheet=title,
+            header_row=header_index,
         )
     return ParsedSheet(
         sheet=title,
@@ -641,18 +661,14 @@ def discover_sheets(content: bytes, filename: str) -> list:
             }
             for index, table in enumerate(document.tables)
         ]
-    if extension in (".csv", ".txt", ".tsv"):
+    if extension in DELIMITED_EXTENSIONS:
         title = (filename or "upload").rsplit("/", 1)[-1]
-        try:
-            lines = _decode_text(content).splitlines()
-        except UnsupportedFile:
-            raise
         return [
             {
                 "name": title,
                 "kind": "text",
                 "visible": True,
-                "rows": len(lines),
+                "rows": _count_text_lines(content),
                 "cols": None,
             }
         ]
@@ -769,6 +785,57 @@ def candidate_message_text(content: bytes) -> tuple:
     return text, False, total
 
 
+def _decode_line_stream(content: bytes, chunk_size: int = 1 << 20):
+    """Yield newline-terminated text segments in O(longest line) memory.
+
+    Splits on \\n exactly like iterating the StringIO the full reader
+    feeds to csv, so csv sees identical items without the 4x UCS-4
+    copy StringIO makes of a 200 MB decode. Codecs match _decode_text
+    (utf-8-sig, then cp1252), restarting from the first byte when the
+    first codec fails mid-stream.
+    """
+    for encoding in ("utf-8-sig", "cp1252"):
+        decoder = codecs.getincrementaldecoder(encoding)()
+        carry = ""
+        try:
+            for start in range(0, len(content), chunk_size):
+                carry += decoder.decode(
+                    content[start:start + chunk_size], final=False
+                )
+                *complete, carry = carry.split("\n")
+                for segment in complete:
+                    yield segment + "\n"
+            carry += decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            continue
+        if carry:
+            yield carry
+        return
+    raise UnsupportedFile("File could not be decoded as text.")
+
+
+def _count_text_lines(content: bytes) -> int:
+    """len(splitlines()) in O(longest line) memory.
+
+    Splitting each newline segment further cannot straddle a \\n, so
+    the concatenated per-segment splitlines equal the global ones.
+    """
+    count = 0
+    for segment in _decode_line_stream(content):
+        count += len(segment.splitlines())
+    return count
+
+
+#: Delimited containers eligible for the bounded sample parse.
+DELIMITED_EXTENSIONS = frozenset({".csv", ".txt", ".tsv"})
+
+
+def delimited_extension(filename: str) -> str:
+    """The delimited extension of a filename, or "" when not delimited."""
+    extension = _extension_of(filename)
+    return extension if extension in DELIMITED_EXTENSIONS else ""
+
+
 def _sniff_delimiter(sample_lines: list) -> str:
     """Pick the delimiter with a consistent nonzero count per line.
 
@@ -844,8 +911,139 @@ def parse_delimited(
         message_fallback=message_fallback,
         # Split on "\n" exactly like the message lane's content
         # lines, so fallback row numbers match the source lines.
-        raw_lines=text.split("\n"),
+        # Tabular parses never read it; skipping the split keeps a
+        # 200 MB table from doubling its transient memory for nothing.
+        raw_lines=text.split("\n") if message_fallback else None,
     )
+
+
+def _blank_pairs(row: list) -> bool:
+    """The _extract blank test, shared with the streaming counter."""
+    return all(
+        value is None or (isinstance(value, str) and not value.strip())
+        for value, _flag in row
+    )
+
+
+def parse_delimited_sample(
+    content: bytes,
+    title: str,
+    *,
+    max_rows: int,
+    max_cols: int,
+    header_scan_rows: int,
+    column_overrides: dict | None = None,
+    column_constants: dict | None = None,
+    ignored_columns: list | None = None,
+    constant_sources: dict | None = None,
+    forced_delimiter: str | None = None,
+    sheet_name: str | None = None,
+    data_row_budget: int,
+) -> tuple:
+    """Bounded delimited parse for previews: head rows plus exact total.
+
+    Streams the bytes twice (a head-only sniff pass, one csv pass):
+    materializes only the header window plus data_row_budget
+    non-blank data rows, while counting every record for the exact
+    data-row total. Returns (sheet, total). Mapping runs through the
+    shared _table_to_sheet core over the head with true record
+    numbers, so headers, positions, sources, and the first rows are
+    identical to a full parse; total equals len(full.rows). Raises
+    the same refusals in the same order — MappingRequired carries
+    the head rows and the exact total_rows. Importers must use
+    parse_delimited: only it yields every row.
+    """
+    _require_text_section(sheet_name, title)
+    # First five non-blank splitlines lines, exactly like the full
+    # reader's sample: no newline boundary can straddle the \n
+    # segments, so per-segment splitlines concatenate exactly.
+    sample_lines = (
+        subline
+        for segment in _decode_line_stream(content)
+        for subline in segment.splitlines()
+    )
+    sample = [
+        line
+        for line in itertools.islice(
+            (line for line in sample_lines if line.strip()), 5
+        )
+    ]
+    delimiter = forced_delimiter or _sniff_delimiter(sample)
+    early_cap = max_rows + header_scan_rows
+    head: list = []
+    numbers: list = []
+    data_kept = 0
+    content_count = 0
+    wide_number = None
+    # Record numbers of the content rows where a row-limit refusal
+    # could land, so a deep column violation keeps its exact
+    # full-parse precedence against it (at most a scan window).
+    limit_window: list = []
+    try:
+        reader = csv.reader(_decode_line_stream(content), delimiter=delimiter)
+        for number, raw in enumerate(reader, start=1):
+            if wide_number is None and len(raw) > max_cols:
+                wide_number = number
+            blank = not any(str(value).strip() for value in raw)
+            if not blank:
+                content_count += 1
+                if content_count > early_cap:
+                    raise UnsupportedFile(
+                        "Table exceeds the row intake limit."
+                    )
+                if max_rows + 1 <= content_count <= max_rows + 1 + header_scan_rows:
+                    limit_window.append(number)
+            if number <= header_scan_rows:
+                head.append([(value, False) for value in raw])
+                numbers.append(number)
+            elif not blank and data_kept < data_row_budget:
+                head.append([(value, False) for value in raw])
+                numbers.append(number)
+                data_kept += 1
+    except csv.Error as exc:
+        raise UnsupportedFile("File could not be parsed as delimited text.") from exc
+
+    def _settle(header_index: int) -> int:
+        """Exact total, raising row/column refusals in full-parse order."""
+        pre_header = sum(
+            1
+            for position, row in zip(numbers, head)
+            if position <= header_index and not _blank_pairs(row)
+        )
+        total = content_count - pre_header
+        overflow_number = None
+        if total > max_rows:
+            # The (max_rows+1)-th data row is content row
+            # #(max_rows+1+pre_header); the full parse raises there.
+            overflow_number = limit_window[pre_header]
+        # A violation at or before the overflow record raises first,
+        # exactly like the row-by-row full parse (a scan-window
+        # violation normally already raised inside _table_to_sheet).
+        if wide_number is not None and (
+            overflow_number is None or wide_number <= overflow_number
+        ):
+            raise UnsupportedFile("Table exceeds the column intake limit.")
+        if overflow_number is not None:
+            raise UnsupportedFile("Table exceeds the row intake limit.")
+        return total
+
+    try:
+        sheet = _table_to_sheet(
+            head,
+            title,
+            max_rows=max_rows,
+            max_cols=max_cols,
+            header_scan_rows=header_scan_rows,
+            column_overrides=column_overrides,
+            column_constants=column_constants,
+            ignored_columns=ignored_columns,
+            constant_sources=constant_sources,
+            row_numbers=numbers,
+        )
+    except MappingRequired as exc:
+        exc.total_rows = _settle(exc.header_row)
+        raise
+    return sheet, _settle(sheet.header_row)
 
 
 def parse_docx(

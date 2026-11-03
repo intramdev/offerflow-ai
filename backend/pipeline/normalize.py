@@ -79,6 +79,11 @@ _QUANTITY_MARK_RE = re.compile(
 )
 
 _TERMINAL_TRAILING_WORD_RE = re.compile(r"\s+[A-Za-z]{3}\s*$")
+# A unit word after the currency ("289 EUR each") is explicit pricing
+# prose, not a different number: strip one allowlisted word so the
+# terminal amount still binds to its span. Non-numeric by
+# construction, so model/capacity roles cannot leak through here.
+_TERMINAL_TRAILING_UNIT_RE = re.compile(r"\s+(each|piece|unit)\s*$", re.IGNORECASE)
 _TERMINAL_TRAILING_PUNCT_RE = re.compile(r"[^\w]+$")
 _TERMINAL_NUMBER_RE = re.compile(r"(\d[\d.,]*)\s*$")
 _TERMINAL_SEPARATORS = frozenset([" ", "\t", ":", ";", "|", "-", ",", "–", "—", ">", "(", ")"])
@@ -98,15 +103,18 @@ def terminal_amount(text: str) -> tuple[str, int, int] | None:
     """Return the terminal number token and its source span, if resolvable.
 
     The terminal token is the last number in the line once trailing
-    punctuation and one trailing 3-letter word (a currency code such as
-    "USD") are stripped. It must be separated from the text before it,
-    so "128GB" never resolves and model/capacity digits keep their own
-    roles. Returns (token, start, end) or None when no terminal number
-    can be bound to a span.
+    punctuation, one trailing unit word ("each"), and one trailing
+    3-letter word (a currency code such as "USD") are stripped. It
+    must be separated from the text before it, so "128GB" never
+    resolves and model/capacity digits keep their own roles. Returns
+    (token, start, end) or None when no terminal number can be bound
+    to a span.
     """
     if not text or not isinstance(text, str):
         return None
     candidate = text.strip()
+    candidate = _TERMINAL_TRAILING_PUNCT_RE.sub("", candidate)
+    candidate = _TERMINAL_TRAILING_UNIT_RE.sub("", candidate)
     candidate = _TERMINAL_TRAILING_PUNCT_RE.sub("", candidate)
     candidate = _strip_trailing_word(candidate)
     candidate = _TERMINAL_TRAILING_PUNCT_RE.sub("", candidate)

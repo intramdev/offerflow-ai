@@ -311,6 +311,24 @@ class TerminalSpanTests(SimpleTestCase):
         self.assertIsNotNone(found)
         self.assertEqual(found[0], "417")
 
+    def test_trailing_unit_word_after_currency_resolves(self):
+        from pipeline.normalize import terminal_amount
+
+        for text in (
+            "Apple iPhone 13 with 128GB in Grade A: 12 pcs at 289 EUR each",
+            "Phone Z - 289 each",
+            "Phone Z - 289 EACH",
+        ):
+            found = terminal_amount(text)
+            self.assertIsNotNone(found, text)
+            token, start, end = found
+            self.assertEqual(token, "289")
+            self.assertEqual(text[start:end], "289")
+        # Glued numbers and numberless lines still refuse.
+        self.assertIsNone(terminal_amount("iPhone 8 64GB each"))
+        self.assertIsNone(terminal_amount("warranty each"))
+        self.assertIsNone(terminal_amount("P1+ - Like New each"))
+
     def test_markings_detected(self):
         from pipeline.normalize import has_quantity_marking
 

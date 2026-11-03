@@ -323,8 +323,9 @@ def _check_roles_bound_to_evidence(run):
     Numeric presence is necessary but insufficient: a terminal-scoped
     offer's price must equal the terminal token re-read from its own
     line at the recorded span, and its quantity must be absent, marked
-    on the line, or human-decided. Capacity/model digits can never
-    satisfy either role through this gate.
+    on the line, human-decided, or matching a reviewed row cell.
+    Capacity/model digits can never satisfy either role through this
+    gate.
     """
     if (run.mapping or {}).get("free_text") is not True:
         return _result(
@@ -387,16 +388,27 @@ def _check_roles_bound_to_evidence(run):
                 expected["currency"] = bound["currency"]
                 actual["currency"] = offer.currency or ""
         quantity_decision = decisions.get((offer.id, "quantity"))
+        quantity_decided = (
+            quantity_decision is not None
+            and _decided_value(quantity_decision, "quantity") is not None
+        )
+        # Row cells carry only source values and reviewed corrections:
+        # the model fills gaps into offer.interpreted, never back into
+        # row.data. A quantity matching its cell (for example an
+        # accepted "out of stock means zero" correction) is reviewed
+        # evidence, not an invention.
+        cell_quantity = parse_quantity((row.data or {}).get("quantity"))
+        quantity_cell_ok = (
+            cell_quantity is not None and cell_quantity == offer.quantity
+        )
         if (
             offer.quantity is not None
-            and (
-                quantity_decision is None
-                or _decided_value(quantity_decision, "quantity") is None
-            )
+            and not quantity_decided
+            and not quantity_cell_ok
             and not has_quantity_marking(text)
         ):
             fields.append("quantity")
-            expected["quantity"] = "absent or marked on the line"
+            expected["quantity"] = "marked on the line or reviewed"
             actual["quantity"] = str(offer.quantity)
         if fields:
             failures.append(

@@ -208,7 +208,7 @@ accepted still reconcile honestly.
 
 - Backend: `OFFERFLOW_DB_ENGINE=sqlite OFFERFLOW_PROVIDER=fixture
   ./backend/.venv/bin/python backend/manage.py test pipeline
-  organizations common` — 849 discovered, 823 executed, all pass,
+  organizations common` — 869 discovered, 843 executed, all pass,
   2 skipped (pre-existing skips). Discovery and execution counts are
   reported separately and never interchanged. Covers the
   conversational import draft, revision/CAS concurrency, spending
@@ -240,7 +240,7 @@ work. Every demo claim links to the test or output behind it.
 | Typed conversational rules, price-only policy, revision binding, refresh resume | Implemented, mocked verification only | `test_preview_assist.py`, `test_generalization.py` (row-10 sheets, sectioned messages, held-out layouts); model accuracy not evaluated |
 | Tenant isolation under a restricted runtime role | Implemented + actual Docker verified | 22-test disposable-PostgreSQL suite; 3 Nov 2026: backend + worker run as `offerflow_app` (no SUPERUSER/BYPASSRLS), 0029/0030 applied, cross-tenant denial and revocation verified, warnings clean |
 | Spending reservations, concurrency, idempotency, kill switches | Implemented, mocked verification only | 10/10 mocked concurrency scenarios; real provider billing accuracy not established |
-| Real-Meta end-to-end evaluation | Evaluated on synthetic input, API path | 3 Nov 2026: sectioned 6-product message → clarification → typed price_only proposal → approved run 26 → matching XLSX export; 6/6 authorized dispatches, spend reconciled; browser-UI steps NOT RUN (no browser tool) |
+| Real-Meta end-to-end evaluation | Evaluated on synthetic input, API path | 3 Nov 2026: two formats certified — (A) sectioned price-only run 27 → artifact 12 + converted quote; (B) prose EUR stock rows run 30 → artifact 13 after 5 quantity clarifications; 8 dispatches, 35,746 tokens, spend reconciled; browser-UI steps with the independent reviewer |
 | Autonomous orchestration | Not implemented (future work) | The delivered system is AI-assisted with mandatory human review; no step-selecting controller exists |
 | Image / PDF visual understanding | Not implemented (future work) | Accepted containers are parsed as text and structure; there is no vision path |
 | Live Telegram / WhatsApp / commerce connectors | Not implemented (future work) | Message text and files are generated for manual sending; no live connections exist |

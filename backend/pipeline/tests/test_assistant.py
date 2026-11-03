@@ -340,6 +340,62 @@ class PreviewGuardTests(TestCase):
             )
         )
 
+    def test_multisentence_clarification_passes(self):
+        # Prose punctuation in a later sentence is not SQL stacking.
+        self.assertIsNone(
+            inspect_question(
+                "The final numbers are USD unit prices, not quantities. "
+                "Select the price from the final number on each product "
+                "line. Quantities are absent, so use price-only mode. "
+                "Each grade header applies only to its following products "
+                "until the next grade header. EU Spec is specification "
+                "metadata and the location/date lines are context; none "
+                "of them are products.",
+                scope=PREVIEW,
+            )
+        )
+        self.assertIsNone(
+            inspect_question(
+                "Select the price from the final number. The **total** "
+                "stays as shown.",
+                scope=PREVIEW,
+            )
+        )
+
+    def test_select_smuggling_still_blocked(self):
+        # A legitimate first select does not launder a later threat.
+        self.assertEqual(
+            inspect_question(
+                "Select the price from the final number. Also select "
+                "password from users.",
+                scope=PREVIEW,
+            ),
+            "sql",
+        )
+        self.assertEqual(
+            inspect_question(
+                "Select the price from the final number; drop table "
+                "suppliers",
+                scope=PREVIEW,
+            ),
+            "sql",
+        )
+        self.assertEqual(
+            inspect_question(
+                "Select * from the final numbers.",
+                scope=PREVIEW,
+            ),
+            "sql",
+        )
+        # The general chat scope stays strict for the same words.
+        self.assertEqual(
+            inspect_question(
+                "Select the price from the final number on each "
+                "product line."
+            ),
+            "sql",
+        )
+
     def test_italian_domain_requests_pass(self):
         self.assertIsNone(
             inspect_question(

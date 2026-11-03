@@ -130,9 +130,15 @@ def _preview_select_allowed(text: str) -> bool:
     match = _SQL_SOFT_SELECT.search(text)
     if match is None:
         return False
-    if "*" in text or _SQL_PUNCTUATION.search(text):
-        return False
     selected, target = match.group(1), match.group(2)
+    # Wildcards and SQL punctuation are judged on the select
+    # statement's own sentence: prose punctuation in a later
+    # sentence ("facts; more facts") is not statement stacking.
+    # Tenant and global nouns stay whole-tail so a second,
+    # malicious select cannot hide behind a legitimate first one.
+    statement = selected + " " + re.split(r"[.!?]", target, maxsplit=1)[0]
+    if "*" in statement or _SQL_PUNCTUATION.search(statement):
+        return False
     if _TENANT_NOUNS.search(target) or _GLOBAL_NOUNS.search(target):
         return False
     return bool(

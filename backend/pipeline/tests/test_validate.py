@@ -308,17 +308,21 @@ class RolesGateTests(TestCase):
         )
 
     def add_terminal_offer(self, price, quantity=None, currency="USD",
-                           scoped=True, text="> Phone 18 Pro 256GB - 417"):
+                           scoped=True, text="> Phone 18 Pro 256GB - 417",
+                           cell_quantity=None):
         from pipeline.normalize import terminal_amount
 
         found = terminal_amount(text)
         token, start, end = found
+        data = {"message": text, "price": token, "currency": currency}
+        if cell_quantity is not None:
+            data["quantity"] = cell_quantity
         row = SourceRow.objects.create(
             organization=self.org,
             run=self.run,
             index=5,
             sheet="",
-            data={"message": text, "price": token, "currency": currency},
+            data=data,
             provenance={
                 "sheet": "",
                 "row": 5,
@@ -396,3 +400,23 @@ class RolesGateTests(TestCase):
         self.add_terminal_offer(Decimal("16"), quantity=256, scoped=False)
         result = self.gate()
         self.assertTrue(result.passed, result.details)
+
+    def test_corrected_cell_quantity_passes(self):
+        # An accepted "out of stock means zero" correction writes the
+        # cell; the offer matching its reviewed cell is not invented.
+        self.add_terminal_offer(
+            Decimal("269"), quantity=0, currency="EUR",
+            text="Samsung Galaxy S22 with 256GB in Grade B: "
+                 "out of stock at 269 EUR each",
+            cell_quantity="0",
+        )
+        result = self.gate()
+        self.assertTrue(result.passed, result.details)
+
+    def test_cell_mismatch_still_fails(self):
+        self.add_terminal_offer(
+            Decimal("417"), quantity=5, cell_quantity="3",
+        )
+        result = self.gate()
+        self.assertFalse(result.passed)
+        self.assertIn("quantity", result.details["offers"][0]["fields"])

@@ -96,7 +96,10 @@ export default function HelpPage() {
           Applied rules are listed in the rules panel with a revision
           number, survive refreshes, and shape the import exactly as
           previewed. Price lists without stock use the price-only policy:
-          quantities stay unknown instead of being invented.
+          quantities stay unknown instead of being invented. If you
+          leave the page or refresh, unconfirmed previews wait under{" "}
+          <strong>Resume a pending import</strong> on the Upload page —
+          mapping, rules, and policy come back as you left them.
         </P>
       </Section>
 

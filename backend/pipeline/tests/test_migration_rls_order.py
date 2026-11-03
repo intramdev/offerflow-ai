@@ -23,6 +23,8 @@ RLS_MIGRATIONS = [
     ("pipeline", "0006_spendallowance_rls"),
     ("pipeline", "0009_columnmappingmemory_rls"),
     ("pipeline", "0011_pricingrule_rls"),
+    ("pipeline", "0026_tenant_rls_phase2"),
+    ("pipeline", "0030_assistidempotency"),
     ("organizations", "0002_invitation_rls"),
 ]
 

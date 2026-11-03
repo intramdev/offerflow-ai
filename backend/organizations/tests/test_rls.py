@@ -28,9 +28,11 @@ class InvitationRowPolicyTests(TestCase):
 
     @classmethod
     def setUpClass(cls):
-        super().setUpClass()
+        # Skip before TestCase enters its atomics: skipping afterwards
+        # leaks an open transaction that later tests inherit.
         if connection.vendor != "postgresql":
             raise unittest.SkipTest("row-policy tests require PostgreSQL")
+        super().setUpClass()
 
     def setUp(self):
         self.addCleanup(reset_tenant_context)

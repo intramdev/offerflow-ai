@@ -553,9 +553,11 @@ export interface PreviewSheets {
 
 export interface DraftRecordField {
   value: string | number | null;
-  state: "unknown" | "user_confirmed" | "model_proposed" | "default_proposed" | "conflicting" | "excluded";
+  state: "unknown" | "user_confirmed" | "derived" | "model_proposed" | "default_proposed" | "conflicting" | "excluded";
   by: string | null;
   rule: string | null;
+  span?: [number, number] | null;
+  line?: number | null;
 }
 
 export interface DraftRecord {
@@ -728,6 +730,31 @@ export async function cancelPreview(key: string): Promise<void> {
   await api(`/api/pipeline/previews/${key}/`, { method: "DELETE" });
 }
 
+export interface PendingPreview {
+  key: string;
+  filename: string;
+  created_at: string;
+  revision: number;
+  document_policy: "stock" | "price_only";
+  rules_count: number;
+  excluded_count: number;
+  message_lines: boolean;
+  sheet: string | null;
+}
+
+export async function listPendingPreviews(
+  organizationId: number,
+): Promise<PendingPreview[]> {
+  const body = await api<{ previews: PendingPreview[] }>(
+    `/api/pipeline/previews/pending/?organization_id=${organizationId}`,
+  );
+  return body.previews;
+}
+
+export async function resumePreview(key: string): Promise<Preview> {
+  return api<Preview>(`/api/pipeline/previews/${key}/resume/`);
+}
+
 export interface PreviewAssistProposal {
   set_constants: Record<string, string>;
   drop_lines: number[];
@@ -750,17 +777,35 @@ export interface PreviewAssistReply {
   retriable?: boolean;
   hint?: string;
   refusal?: string;
+  replayed?: boolean;
 }
 
 export async function assistPreview(
   key: string,
   messages: AssistantTurn[],
+  idempotencyKey?: string,
 ): Promise<PreviewAssistReply> {
-  return api<PreviewAssistReply>(`/api/pipeline/previews/${key}/assist/`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages }),
-  });
+  // Bounded client deadline, above the 60s provider timeout plus proxy
+  // and validation margin: a hung connection becomes a retryable
+  // error, and the retry reuses the idempotency key to recover the
+  // completed result instead of paying twice.
+  try {
+    return await api<PreviewAssistReply>(`/api/pipeline/previews/${key}/assist/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        idempotencyKey ? { messages, idempotency_key: idempotencyKey } : { messages },
+      ),
+      signal: AbortSignal.timeout(90000),
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(
+        "The assistant took too long to answer. Retry to collect the result.",
+      );
+    }
+    throw err;
+  }
 }
 
 export interface PreviewAssistApplied {

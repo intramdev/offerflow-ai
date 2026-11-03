@@ -98,8 +98,14 @@ class GeneralizationTests(TestCase):
             format="json",
         )
 
-    def _apply(self, key, operations, revision=None):
+    def _current_revision(self, key):
+        draft = self.client.get(f"/api/pipeline/previews/{key}/")
+        return draft.data["draft"]["revision"]
+
+    def _apply(self, key, operations, revision="current"):
         body = {"operations": operations}
+        if revision == "current":
+            revision = self._current_revision(key)
         if revision is not None:
             body["revision"] = revision
         return self.client.post(
@@ -108,8 +114,10 @@ class GeneralizationTests(TestCase):
             format="json",
         )
 
-    def _confirm(self, key, revision=None):
+    def _confirm(self, key, revision="current"):
         body = {"mapping": {}}
+        if revision == "current":
+            revision = self._current_revision(key)
         if revision is not None:
             body["revision"] = revision
         with self.captureOnCommitCallbacks(execute=True):

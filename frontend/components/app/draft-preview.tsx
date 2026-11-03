@@ -22,11 +22,15 @@ function FieldValue({ field, label }: { field: DraftRecordField | undefined; lab
       </span>
     );
   }
-  const confirmed = field.state === "user_confirmed";
+  const backed = field.state === "user_confirmed" || field.state === "derived";
+  const backing =
+    field.state === "derived"
+      ? `derived from ${field.by ?? "terminal rule"}${field.line ? `, source line ${field.line}` : ""}`
+      : `confirmed${field.by ? ` (${field.by})` : ""}`;
   return (
     <span
-      className={cn(!confirmed && "text-muted-foreground")}
-      title={confirmed ? `${label}: confirmed${field.by ? ` (${field.by})` : ""}` : `${label}: ${field.state}`}
+      className={cn(!backed && "text-muted-foreground")}
+      title={backed ? `${label}: ${backing}` : `${label}: ${field.state}`}
     >
       {String(field.value)}
     </span>

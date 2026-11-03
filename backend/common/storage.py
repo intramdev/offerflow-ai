@@ -8,6 +8,10 @@ callers must still check membership before reading or writing.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import os
+import tempfile
 from pathlib import Path
 
 
@@ -52,11 +56,58 @@ class LocalFileAdapter:
         return path
 
     def save_bytes(self, key: str, data: bytes) -> str:
-        """Write bytes to a validated key, creating parent directories."""
+        """Write bytes atomically: readers never see a partial file."""
         path = self._resolve(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
         return key
+
+    @contextlib.contextmanager
+    def locked_bytes(self, key: str):
+        """Hold an exclusive advisory lock for a read-modify-write cycle.
+
+        Serializes writers across threads and processes. Callers must
+        re-read inside the lock; the lock alone cannot fix a stale
+        read taken before it. Not re-entrant: never nest it.
+        """
+        path = self._resolve(key)
+        # r+b: locking never creates the file, so a lock attempt on a
+        # missing key raises FileNotFoundError instead of littering an
+        # empty file. After acquiring the lock, verify the handle still
+        # refers to the path: an atomic replace (or delete) between
+        # open() and flock() would otherwise operate on stale bytes.
+        # Saved bytes are immutable (replace, never mutate), so a
+        # matching handle is exactly the latest commit before the lock,
+        # and no other writer can commit until the lock is released.
+        while True:
+            with open(path, "r+b") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    try:
+                        same = os.path.samestat(
+                            os.fstat(handle.fileno()), os.stat(path)
+                        )
+                    except FileNotFoundError:
+                        raise FileNotFoundError(key) from None
+                    if same:
+                        yield handle
+                        return
+                    # Stale handle: another writer committed between
+                    # open() and flock(); re-open and try again.
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def read_bytes(self, key: str) -> bytes:
         """Read bytes from a validated key. Missing keys raise FileNotFoundError."""

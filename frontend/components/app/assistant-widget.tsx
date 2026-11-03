@@ -130,14 +130,47 @@ export function AssistantWidget() {
     return bubble;
   }
 
-  async function runAssist(key: string, history: AssistantTurn[]) {
-    const answer = await assistPreview(key, history.slice(-6));
+  async function assistWithRecovery(
+    key: string,
+    messages: AssistantTurn[],
+    requestKey: string,
+  ) {
+    try {
+      return await assistPreview(key, messages, requestKey);
+    } catch (err) {
+      // Only a live first attempt (409) is worth polling: the same
+      // key can never dispatch twice, so polling cannot double-spend.
+      if (!(err instanceof ApiError) || err.status !== 409) throw err;
+    }
+    setNotice("Still working — collecting the result…");
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      try {
+        return await assistPreview(key, messages, requestKey);
+      } catch (err) {
+        if (!(err instanceof ApiError) || err.status !== 409) throw err;
+      }
+    }
+    throw new Error("The assistant is still working. Retry to collect the result.");
+  }
+
+  async function runAssist(
+    key: string,
+    history: AssistantTurn[],
+    requestKey: string,
+  ) {
+    const answer = await assistWithRecovery(key, history.slice(-6), requestKey);
     if (answer.refusal) {
       pushTurn("assistant", answer.refusal);
       return;
     }
     const bubble = pushTurn("assistant", answer.message, answer.tokens);
     const notes: string[] = [];
+    if (answer.replayed) {
+      notes.push(
+        "Recovered the completed result after the interruption — no second call was charged.",
+      );
+    }
     if (answer.hint) {
       notes.push(answer.hint);
     }
@@ -161,12 +194,22 @@ export function AssistantWidget() {
     }
   }
 
+  const retryRef = React.useRef<{
+    key: string;
+    history: AssistantTurn[];
+    requestKey: string;
+  } | null>(null);
+  const [canRetry, setCanRetry] = React.useState(false);
+
   async function send() {
     const text = draft.trim();
     if (!active || !text || busy || applying) return;
     setError("");
     setNotice("");
     setDraft("");
+    setCanRetry(false);
+    retryRef.current = null;
+    const requestKey = crypto.randomUUID();
     const mine = pushTurn("user", text.slice(0, 2000));
     const history: AssistantTurn[] = [
       ...turns.map(({ role, content }) => ({ role, content })),
@@ -175,7 +218,8 @@ export function AssistantWidget() {
     setBusy(true);
     try {
       if (session) {
-        await runAssist(session.key, history);
+        retryRef.current = { key: session.key, history, requestKey };
+        await runAssist(session.key, history, requestKey);
       } else if (assistDraft) {
         committedRef.current = "pending";
         let created;
@@ -186,12 +230,42 @@ export function AssistantWidget() {
           throw err;
         }
         committedRef.current = created.key;
-        await runAssist(created.key, history);
+        retryRef.current = { key: created.key, history, requestKey };
+        await runAssist(created.key, history, requestKey);
       } else {
         const answer = await askAssistant(active.organization, history);
         pushTurn("assistant", answer.reply, answer.tokens);
       }
+      retryRef.current = null;
     } catch (err) {
+      if (retryRef.current) {
+        // The first attempt may have dispatched: retry reuses its key,
+        // so recovery can never pay for a second call.
+        setCanRetry(true);
+      } else {
+        setDraft(text);
+      }
+      setError(
+        err instanceof ApiError || err instanceof Error
+          ? err.message
+          : "Could not reach the assistant.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function retrySend() {
+    const retry = retryRef.current;
+    if (!retry || busy || applying) return;
+    setError("");
+    setCanRetry(false);
+    setBusy(true);
+    try {
+      await runAssist(retry.key, retry.history, retry.requestKey);
+      retryRef.current = null;
+    } catch (err) {
+      setCanRetry(true);
       setError(
         err instanceof ApiError || err instanceof Error
           ? err.message
@@ -204,6 +278,13 @@ export function AssistantWidget() {
 
   async function applyPending() {
     if (!session || !pending || busy || applying) return;
+    const revision = session.getRevision();
+    if (revision == null) {
+      setError(
+        "The preview revision is not loaded yet. Reload the preview and apply again.",
+      );
+      return;
+    }
     const operations = (pending.proposal.operations ?? []).filter(
       (_, index) => pending.selected[index] !== false,
     );
@@ -215,7 +296,7 @@ export function AssistantWidget() {
         set_constants: pending.proposal.set_constants,
         drop_lines: pending.proposal.drop_lines,
         operations,
-        revision: session.getRevision(),
+        revision,
       });
       const parts: string[] = [];
       const names = Object.keys(result.applied.set_constants);
@@ -458,7 +539,17 @@ export function AssistantWidget() {
           ) : null}
           {error ? (
             <p role="alert" className="border-t border-border px-4 py-2 text-xs text-red-600 dark:text-red-400">
-              {error}
+              {error}{" "}
+              {canRetry ? (
+                <button
+                  type="button"
+                  onClick={() => void retrySend()}
+                  disabled={busy || applying}
+                  className="font-semibold underline hover:no-underline disabled:opacity-50"
+                >
+                  Retry
+                </button>
+              ) : null}
             </p>
           ) : null}
           <form

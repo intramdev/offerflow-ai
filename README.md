@@ -205,15 +205,12 @@ accepted still reconcile honestly.
 
 ## Verification
 
-- Backend: `docker compose exec backend python manage.py test` — 763
-  tests: 724 pass, 1 skipped, 38 fail. All 38 reproduce identically
-  on clean HEAD `2181317` (verified by stashing all work and
-  rerunning: 44 issues there; this work fixes 6 and adds 110 tests,
-  all passing). The 38 are ambient-provider assertions, SQLite-only
-  RLS checks, and category/currency/quote-API errors that still need
-  a separate triage pass. Focused flow, spending, assist, preview,
-  draft, and generalization sets (300+ tests) all pass with mocked
-  inference.
+- Backend: `OFFERFLOW_DB_ENGINE=sqlite OFFERFLOW_PROVIDER=fixture
+  ./backend/.venv/bin/python backend/manage.py test pipeline
+  organizations common` — 829 tests, all pass, 2 skipped (pre-existing
+  skips). Covers the conversational import draft, revision/CAS
+  concurrency, spending reservations, preview/assist/quote flows, and
+  generalization layouts with mocked inference.
 - Tenant isolation: 22 PostgreSQL tests pass against a disposable
   server under the actual restricted runtime role (`iso_app`, no
   superuser, no bypass). See the runbook for the disposable-server

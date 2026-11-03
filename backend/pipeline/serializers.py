@@ -423,6 +423,9 @@ class PreviewAssistSerializer(serializers.Serializer):
     messages = serializers.ListField(
         child=serializers.DictField(), min_length=1, max_length=10
     )
+    idempotency_key = serializers.CharField(
+        max_length=64, required=False, allow_null=True
+    )
 
 
 class PreviewAssistApplySerializer(serializers.Serializer):

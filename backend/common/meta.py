@@ -203,12 +203,19 @@ ASSIST_PREVIEW_SYSTEM_PROMPT = (
     "in the given currency; propose only when the user confirms this "
     "meaning), join_lines (numbered lines forming one multi-line "
     "product record), correct (fix one field of one candidate record "
-    "by its record id), and absent (declare quantity or capacity absent "
-    "document-wide). Never propose dropping section headers that state "
+    "by its record id), absent (declare quantity or capacity absent "
+    "document-wide), and policy (propose the stock or price_only "
+    "quantity policy for this preview; absent quantity needs price_only "
+    "first). Never propose dropping section headers that state "
     "values for the lines beneath them: confirm them with section_value "
     "instead. Propose terminal_price only for lines whose final number "
     "is separated from the text before it; a number glued to letters "
-    "or a storage unit is never a terminal price. Copy the supplier "
+    "or a storage unit is never a terminal price. Propose policy "
+    "price_only only when the user confirms quantities are absent; "
+    "the user still applies the change explicitly. When price and "
+    "quantity roles are uncertain, quote two or three exact candidate "
+    "amounts from the preview and ask one focused question about their "
+    "meaning instead of guessing quantities. Copy the supplier "
     "name from header lines when it clearly names the supplier. "
     "Transcribe values exactly as shown; never invent, guess, or compute "
     "missing values, and propose nothing when unsure or when the request "
@@ -239,6 +246,7 @@ def _fold_assist_operations(parsed: dict) -> list:
     """
     operations = []
     for key in (
+        "policy",
         "classify",
         "section_value",
         "terminal_price_document",
@@ -249,6 +257,14 @@ def _fold_assist_operations(parsed: dict) -> list:
     ):
         if not isinstance(parsed.get(key, []), list):
             raise ProposalUnusable("Assist returned an unusable envelope.")
+    # Policy folds first so dependent operations (e.g. absent quantity
+    # under price_only) validate against the proposed policy in order.
+    for entry in parsed.get("policy", []):
+        if not isinstance(entry, dict) or not isinstance(
+            entry.get("policy"), str
+        ):
+            raise ProposalUnusable("Assist returned an unusable envelope.")
+        operations.append({"op": "policy", "policy": entry["policy"]})
     classify = parsed.get("classify", [])
     if any(
         not isinstance(entry, dict)
@@ -418,6 +434,12 @@ ASSIST_PREVIEW_RESPONSE_SCHEMA = {
                 {"field": {"type": "string"}}, ["field"]
             ),
         },
+        "policy": {
+            "type": "array",
+            "items": _assist_object(
+                {"policy": {"type": "string"}}, ["policy"]
+            ),
+        },
     },
     "required": [
         "message",
@@ -430,6 +452,7 @@ ASSIST_PREVIEW_RESPONSE_SCHEMA = {
         "join_lines",
         "correct",
         "absent",
+        "policy",
     ],
     "additionalProperties": False,
 }

@@ -123,6 +123,10 @@ class FileFxTests(TestCase):
         )
 
     def _confirm(self, key, payload):
+        payload = dict(payload)
+        if "revision" not in payload:
+            draft = self.client.get(f"/api/pipeline/previews/{key}/")
+            payload["revision"] = draft.data["draft"]["revision"]
         with self.captureOnCommitCallbacks(execute=True):
             return self.client.post(
                 f"/api/pipeline/previews/{key}/confirm/", payload, format="json"
@@ -269,10 +273,16 @@ class FileFxTests(TestCase):
             },
             format="multipart",
         )
+        draft = self.client.get(
+            f"/api/pipeline/previews/{preview.data['key']}/"
+        )
         with self.captureOnCommitCallbacks(execute=True):
             confirm = self.client.post(
                 f"/api/pipeline/previews/{preview.data['key']}/confirm/",
-                {"mapping": {}},
+                {
+                    "mapping": {},
+                    "revision": draft.data["draft"]["revision"],
+                },
                 format="json",
             )
         file_id = ImportRun.objects.get(pk=confirm.data["id"]).source_file_id

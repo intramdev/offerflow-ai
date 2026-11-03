@@ -218,6 +218,7 @@ def derive_records(texts: list, rules: list) -> tuple[list, list, list]:
     for rule in rules:
         if rule["kind"] == "section_value":
             sectioned.setdefault(rule["header_line"], {})[rule["field"]] = rule
+    terminals = [rule for rule in rules if rule["kind"] == "terminal_price"]
     records = []
     seen: set = set()
     for lineno, text in enumerate(texts, start=1):
@@ -270,6 +271,32 @@ def derive_records(texts: list, rules: list) -> tuple[list, list, list]:
                     "rule": override.get("id"),
                 }
             fields[field] = entry
+        # Terminal derivation is part of the resolved record, not a
+        # second view: the candidate table, unresolved counts, samples,
+        # worker snapshot, and export validation all read these fields.
+        # (Manual price corrections are rejected while a terminal rule
+        # covers the record, so derivation cannot clobber a correction.)
+        for rule in terminals:
+            if not _terminal_covers(rule, rules, record_id):
+                continue
+            last = spans[-1]
+            found = _terminal_span(texts[last - 1])
+            if found is None:
+                continue
+            amount = parse_price(found[0])
+            if amount is None:
+                continue
+            derived = {
+                "state": "derived",
+                "by": f"terminal L{last}",
+                "rule": rule.get("id"),
+                "span": [found[1], found[2]],
+                "line": last,
+            }
+            fields["price"] = {"value": str(amount), **dict(derived)}
+            fields["currency"] = {
+                "value": rule["currency"], **dict(derived)
+            }
         records.append(
             {
                 "id": record_id,
@@ -527,15 +554,14 @@ def terminal_scope_lines(texts: list, rules: list) -> set:
 def derive_record_cells(texts: list, rules: list) -> dict:
     """Canonical source cells for every candidate record.
 
-    Merges confirmed global, section, and correction values with
-    terminal-price derivation, so the preview, the worker import, and
-    the exports compute from one implementation. Returns
+    A projection of derive_records, not a second derivation: the
+    preview, the worker import, and the exports read the same resolved
+    fields the candidate table shows. Returns
     {record_id: {"lines", "class", "section", "cells", "terminal"}},
     where "terminal" carries the bound span, currency, and line when a
     covering rule resolved, and None otherwise.
     """
     records, _issues, _sections = derive_records(texts, rules or [])
-    terminals = [rule for rule in (rules or []) if rule["kind"] == "terminal_price"]
     derived = {}
     for record in records:
         cells = {}
@@ -543,22 +569,13 @@ def derive_record_cells(texts: list, rules: list) -> dict:
             if entry["state"] != "unknown" and entry["value"] is not None:
                 cells[field] = entry["value"]
         terminal = None
-        for rule in terminals:
-            if not _terminal_covers(rule, rules or [], record["id"]):
-                continue
-            last = record["lines"][-1]
-            found = _terminal_span(texts[last - 1])
-            if found is None:
-                continue
-            amount = parse_price(found[0])
-            if amount is None:
-                continue
-            cells["price"] = str(amount)
-            cells["currency"] = rule["currency"]
+        price = record["fields"].get("price") or {}
+        if price.get("state") == "derived":
+            currency = record["fields"].get("currency") or {}
             terminal = {
-                "span": [found[1], found[2]],
-                "currency": rule["currency"],
-                "line": last,
+                "span": price.get("span"),
+                "currency": currency.get("value"),
+                "line": price.get("line"),
             }
         derived[record["id"]] = {
             "lines": record["lines"],
@@ -643,6 +660,20 @@ def validate_operations(
         if not any(_unsigned(old) == probe for old in pending):
             pending.append(validated)
         per_op.append(validated)
+    # The per-op gate keeps absent-quantity out of a stock draft at
+    # creation, but a later policy switch could strand a retained
+    # absent rule under a policy that requires quantities. Validate
+    # the complete resulting set: switching back to stock must drop
+    # the absent-quantity rule in the same batch.
+    if working_policy != "price_only" and any(
+        rule.get("kind") == "absent" and rule.get("field") == "quantity"
+        for rule in pending
+    ):
+        raise DraftError(
+            "The stock policy needs quantities, but this draft keeps "
+            "a rule declaring quantity absent. Drop the "
+            "absent-quantity rule first, or stay on price_only."
+        )
     return pending, working_policy, per_op
 
 

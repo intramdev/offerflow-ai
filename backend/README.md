@@ -101,10 +101,18 @@ network with no published ports.
 - `POST api/pipeline/previews/<key>/assist/` + `.../assist/apply/` —
   preview assistant: propose typed interpretation operations, then
   apply them only after the user clicks **Apply to preview** (user
-  edits always win). Apply takes the draft `revision` and fails 409
-  when stale; unknown operation fields fail the turn outright.
+  edits always win). Apply requires the draft `revision` (400 when
+  missing) and fails 409 when stale; unknown operation fields fail
+  the turn outright.
 - `POST api/pipeline/previews/<key>/confirm/` — import the preview at
-  the given draft revision (stale revisions fail 409)
+  the given draft revision (missing revision fails 400, stale
+  revisions fail 409)
+- `GET api/pipeline/previews/pending/?organization_id=` — metadata-only
+  list of the org's unconfirmed previews (no source bytes); expired
+  drafts are collected, not listed
+- `GET api/pipeline/previews/<key>/resume/` — rebuild the full preview
+  payload (last mapping, rules, exclusions, policy) after a refresh;
+  confirmed, cancelled, or expired drafts answer unknown-or-expired
 - `GET api/pipeline/files/` + `PUT api/pipeline/files/<id>/` — file grid
   (search, rename, per-file currency date)
 - `GET api/pipeline/runs/<id>/` — run status with validations and progress
@@ -195,9 +203,16 @@ headers, which grade a section carries, how multi-line products join)
 and you apply. Rules persist server-side with a revision number, so
 refreshes, long chats, and worker processing can never silently
 change the confirmed interpretation; proposal, rules-panel, and
-confirm calls all carry the revision and fail 409 when stale. A
-price-only policy covers lists that carry prices but no stock:
-quantities stay unknown and are omitted instead of invented.
+confirm calls all require the revision (400 when missing) and fail
+409 when stale. Preview files are written atomically and every
+read-modify-write cycle holds an exclusive per-preview file lock,
+so two concurrent writers cannot collapse two revisions into one.
+A price-only policy covers lists that carry prices but no stock:
+quantities stay unknown and are omitted instead of invented, and
+switching back to stock while an absent-quantity rule persists is
+rejected until that rule is dropped. Leaving the Upload page never
+loses work: pending drafts stay server-side and are resumable with
+their mapping, rules, and policy intact.
 
 ## Simulated mode
 
@@ -366,7 +381,18 @@ Run the steps in order, from the repository root, with the stack up:
    ```sh
    docker compose restart backend worker
    ```
-3. Provision the restricted role (replace `RUNTIME_PASSWORD` with a fresh
+3. Apply any pending migrations on the admin connection BEFORE
+   provisioning, so verification sees the final schema (notably
+   `pipeline/0029_memory_supplier_scope`, which scopes mapping memory
+   per supplier; without it a second supplier's write is skipped with
+   a warning instead of stored):
+   ```sh
+   docker compose exec -T backend python manage.py migrate --database=admin
+   docker compose exec -T backend python manage.py showmigrations --database=admin | grep '\[ \]'
+   ```
+   The second command must print nothing (no `[ ]` unapplied entries).
+   Rollback for this step alone: `migrate pipeline 0028 --database=admin`.
+4. Provision the restricted role (replace `RUNTIME_PASSWORD` with a fresh
    URL-safe secret, e.g. from `openssl rand -base64 18 | tr -dc A-Za-z0-9`):
    ```sh
    docker compose exec -T backend python manage.py provision_runtime \
@@ -374,13 +400,13 @@ Run the steps in order, from the repository root, with the stack up:
    ```
    The command verifies role attributes, table grants, bootstrap
    helpers, and every row policy, and fails loudly if any check fails.
-4. In `.env`, point the runtime at the new role:
-   `OFFERFLOW_DB_USER=offerflow_app` with the password from step 3.
+5. In `.env`, point the runtime at the new role:
+   `OFFERFLOW_DB_USER=offerflow_app` with the password from step 4.
    Then restart both consumers:
    ```sh
    docker compose restart backend worker
    ```
-5. Verify:
+6. Verify:
    - `curl http://127.0.0.1:8384/api/health/` shows
      `"runtime_role_privileged": false`.
    - `docker compose exec -T backend python manage.py check` reports no
@@ -390,7 +416,7 @@ Run the steps in order, from the repository root, with the stack up:
    - Sign in, upload a small file, and confirm the run processes (this
      exercises the worker bootstrap under the restricted role); accept
      one invitation to exercise the invitation resolver.
-6. From now on, run schema and superuser commands on the admin
+7. From now on, run schema and superuser commands on the admin
    connection: `migrate --database=admin`,
    `createsuperuser --database=admin`. Plain `migrate` targets the
    restricted runtime and fails by design.

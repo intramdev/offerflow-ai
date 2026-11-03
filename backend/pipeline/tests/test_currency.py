@@ -76,6 +76,10 @@ class DefaultCurrencyTests(TestCase):
         )
 
     def _confirm(self, key, payload):
+        payload = dict(payload)
+        if "revision" not in payload:
+            draft = self.client.get(f"/api/pipeline/previews/{key}/")
+            payload["revision"] = draft.data["draft"]["revision"]
         with self.captureOnCommitCallbacks(execute=True):
             return self.client.post(
                 f"/api/pipeline/previews/{key}/confirm/", payload, format="json"

@@ -11,22 +11,30 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Textarea } from "@/components/ui/textarea";
 import {
   ApiError,
+  cancelPreview,
   createPreview,
   createPreviewFromText,
   isMessageCandidate,
+  listPendingPreviews,
+  resumePreview,
   type MessageCandidate,
+  type PendingPreview,
   type Preview,
 } from "@/lib/api";
+import { formatDateTime } from "@/lib/format";
 import { UploadDropzone } from "./UploadDropzone";
 
 export default function UploadPage() {
-  const { active, loading, memberships } = useOrg();
+  const { active, loading, memberships, prefs } = useOrg();
   const assist = usePreviewAssist();
   const [preview, setPreview] = React.useState<Preview | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [pasted, setPasted] = React.useState("");
   const [candidate, setCandidate] = React.useState<MessageCandidate | null>(null);
+  const [pending, setPending] = React.useState<PendingPreview[] | null>(null);
+  const [pendingRefresh, setPendingRefresh] = React.useState(0);
+  const [resuming, setResuming] = React.useState<string | null>(null);
 
   async function onFile(file: File) {
     if (!active) return;
@@ -86,6 +94,38 @@ export default function UploadPage() {
     .split("\n")
     .filter((line) => line.trim() !== "").length;
 
+  async function onResume(key: string) {
+    setResuming(key);
+    setError(null);
+    try {
+      setPreview(await resumePreview(key));
+    } catch (err) {
+      // The draft may have expired or been confirmed elsewhere:
+      // refresh the list so the dead entry disappears.
+      setPendingRefresh((count) => count + 1);
+      setError(
+        err instanceof ApiError ? err.message : "Could not resume the preview.",
+      );
+    } finally {
+      setResuming(null);
+    }
+  }
+
+  async function onDiscardPending(key: string) {
+    setResuming(key);
+    setError(null);
+    try {
+      await cancelPreview(key);
+      setPendingRefresh((count) => count + 1);
+    } catch (err) {
+      setError(
+        err instanceof ApiError ? err.message : "Could not discard the preview.",
+      );
+    } finally {
+      setResuming(null);
+    }
+  }
+
   // While a preview is open the floating assistant can propose changes
   // to it; applying swaps in the fresh preview, whose bumped draft
   // revision tells the editor to merge the assisted values.
@@ -138,6 +178,27 @@ export default function UploadPage() {
     });
     return () => assist.setDraft(null);
   }, [previewKey, pasted, active]);
+
+  // No preview open: offer resumable pending imports, so a refresh
+  // never strands confirmed rules and mapping work.
+  React.useEffect(() => {
+    if (previewKey || !active) {
+      setPending(null);
+      return;
+    }
+    let cancelled = false;
+    setPending(null);
+    listPendingPreviews(active.organization)
+      .then((items) => {
+        if (!cancelled) setPending(items);
+      })
+      .catch(() => {
+        if (!cancelled) setPending([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [previewKey, active, pendingRefresh]);
 
   if (loading) {
     return <p className="text-sm text-muted-foreground">Loading your workspace…</p>;
@@ -193,6 +254,61 @@ export default function UploadPage() {
         </p>
       </div>
       {error ? <ErrorNotice message={error} /> : null}
+      {pending && pending.length > 0 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Resume a pending import</CardTitle>
+            <CardDescription>
+              Unconfirmed previews keep their mapping, rules, and policy.
+              Expired drafts disappear automatically.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ul className="space-y-3">
+              {pending.map((item) => (
+                <li
+                  key={item.key}
+                  className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-md border p-3"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium">{item.filename}</p>
+                    <p className="text-sm text-muted-foreground">
+                      {formatDateTime(item.created_at, prefs.datetime_format)}
+                      {" · "}revision {item.revision}
+                      {" · "}
+                      {item.document_policy === "price_only"
+                        ? "Price-only"
+                        : "Stock"}
+                      {item.message_lines ? " · pasted text" : ""}
+                      {item.sheet ? ` · ${item.sheet}` : ""}
+                      {item.rules_count > 0
+                        ? ` · ${item.rules_count} rule${item.rules_count === 1 ? "" : "s"}`
+                        : ""}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      onClick={() => void onResume(item.key)}
+                      disabled={resuming !== null}
+                    >
+                      {resuming === item.key ? "Resuming…" : "Resume"}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void onDiscardPending(item.key)}
+                      disabled={resuming !== null}
+                    >
+                      Discard
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
+      ) : null}
       {candidate ? (
         <Card>
           <CardHeader>

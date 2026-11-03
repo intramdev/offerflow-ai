@@ -860,3 +860,53 @@ class AssistantFlag(models.Model):
     class Meta:
         ordering = ["-created_at"]
         indexes = [models.Index(fields=["organization", "created_at"])]
+
+
+class AssistIdempotency(models.Model):
+    """One idempotent preview-assist request.
+
+    The browser generates one key per send. If the connection drops
+    after dispatch, retrying with the same key returns the stored
+    result instead of paying for a second model call; a key whose
+    first attempt is still running answers 409 instead of dispatching
+    again. Keys are tenant-scoped and bound to one exact request, so
+    a retry can never return another company's answer.
+    """
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="assist_idempotency",
+    )
+    key = models.CharField(max_length=64)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    preview_key = models.CharField(max_length=64)
+    request_hash = models.CharField(max_length=64)
+    state = models.CharField(
+        max_length=8,
+        choices=[
+            ("pending", "Pending"),
+            ("done", "Done"),
+            ("failed", "Failed"),
+        ],
+        default="pending",
+    )
+    response = models.JSONField(null=True, blank=True)
+    tokens = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "key"],
+                name="unique_org_assist_key",
+            )
+        ]
+        indexes = [models.Index(fields=["organization", "updated_at"])]

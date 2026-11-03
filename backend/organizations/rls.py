@@ -39,6 +39,7 @@ TENANT_POLICIES = {
     "pipeline_customerquote": "pipeline_customerquote_org_isolation",
     "pipeline_spendreservation": "pipeline_spendreservation_org_isolation",
     "pipeline_assistantflag": "pipeline_assistantflag_org_isolation",
+    "pipeline_assistidempotency": "pipeline_assistidempotency_org_isolation",
     "organizations_invitation": "invitation_org_isolation",
     "organizations_membership": "membership_user_or_org_isolation",
 }

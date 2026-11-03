@@ -49,6 +49,7 @@ from pipeline.quotes import (
 )
 from pipeline.parsing import MessageCandidateFile
 from pipeline.previews import (
+    AssistInFlight,
     AssistRefused,
     DraftConflictError,
     apply_preview_assist,
@@ -58,7 +59,9 @@ from pipeline.previews import (
     create_preview,
     create_preview_from_text,
     get_preview_draft,
+    list_pending_previews,
     render_preview,
+    resume_preview,
 )
 from pipeline.serializers import (
     AnswerSerializer,
@@ -588,6 +591,16 @@ class PreviewConfirmView(APIView):
     def post(self, request, key):
         serializer = MappingSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        if serializer.validated_data.get("revision") is None:
+            return Response(
+                {
+                    "detail": (
+                        "Confirm needs the draft revision you reviewed. "
+                        "Reload the preview and confirm again."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         try:
             run = confirm_preview(
                 key=key,
@@ -610,6 +623,42 @@ class PreviewConfirmView(APIView):
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
         return Response(RunSerializer(run).data, status=status.HTTP_201_CREATED)
+
+
+class PreviewPendingListView(APIView):
+    """Metadata-only list of the org's resumable pending previews."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        organization_id = request.query_params.get("organization_id")
+        if organization_id is None:
+            return Response(
+                {"detail": "organization_id query parameter is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            items = list_pending_previews(
+                user=request.user, organization_id=organization_id
+            )
+        except DjangoPermissionDenied as error:
+            raise DRFPermissionDenied(str(error)) from error
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
+        return Response({"previews": items})
+
+
+class PreviewResumeView(APIView):
+    """Rebuild the full preview payload for a pending draft."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, key):
+        try:
+            preview = resume_preview(key=key, user=request.user)
+        except DjangoValidationError as error:
+            raise _as_drf_error(error) from error
+        return Response(preview)
 
 
 class PreviewCancelView(APIView):
@@ -646,10 +695,18 @@ class PreviewAssistView(APIView):
                 key=key,
                 user=request.user,
                 conversation=serializer.validated_data["messages"],
+                idempotency_key=serializer.validated_data.get(
+                    "idempotency_key"
+                ),
             )
         except AssistRefused:
             return Response(
                 {"refusal": ASSISTANT_REFUSAL}, status=status.HTTP_200_OK
+            )
+        except AssistInFlight as error:
+            return Response(
+                {"detail": str(error), "retryable": True},
+                status=status.HTTP_409_CONFLICT,
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
@@ -701,6 +758,16 @@ class PreviewAssistApplyView(APIView):
     def post(self, request, key):
         serializer = PreviewAssistApplySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        if serializer.validated_data.get("revision") is None:
+            return Response(
+                {
+                    "detail": (
+                        "Apply needs the draft revision you reviewed. "
+                        "Reload the preview and apply again."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         try:
             result = apply_preview_assist(
                 key=key,

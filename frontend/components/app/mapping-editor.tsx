@@ -232,6 +232,13 @@ export function MappingEditor({
   }
 
   async function confirm() {
+    const revision = preview.draft?.revision ?? null;
+    if (revision == null) {
+      setError(
+        "The preview revision is not loaded yet. Reload the preview and confirm again.",
+      );
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -242,7 +249,7 @@ export function MappingEditor({
         payload.constants,
         payload.ignored,
         preview.sheets.selected,
-        preview.draft?.revision ?? null,
+        revision,
       );
       router.push(`/app/runs/${run.id}`);
     } catch (err) {

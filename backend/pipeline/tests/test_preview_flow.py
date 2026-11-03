@@ -87,11 +87,15 @@ class PreviewFlowTests(TestCase):
             format="multipart",
         )
 
+    def _revision(self, key):
+        draft = self.client.get(f"/api/pipeline/previews/{key}/")
+        return draft.data["draft"]["revision"]
+
     def _confirm(self, key, mapping):
         with self.captureOnCommitCallbacks(execute=True):
             return self.client.post(
                 f"/api/pipeline/previews/{key}/confirm/",
-                {"mapping": mapping},
+                {"mapping": mapping, "revision": self._revision(key)},
                 format="json",
             )
 
@@ -106,6 +110,32 @@ class PreviewFlowTests(TestCase):
                 },
                 format="multipart",
             )
+
+    def test_resume_restores_file_mapping_and_samples(self):
+        key = self._preview(
+            self.alice, self.org_a, [HEADERS, complete_row()]
+        ).data["key"]
+        rendered = self.client.post(
+            f"/api/pipeline/previews/{key}/render/",
+            {"mapping": {"supplier": 0, "price": 8}},
+            format="json",
+        )
+        self.assertEqual(rendered.status_code, 200, rendered.content)
+        pending = self.client.get(
+            f"/api/pipeline/previews/pending/?organization_id={self.org_a.id}"
+        )
+        self.assertEqual([item["key"] for item in pending.json()["previews"]], [key])
+        resumed = self.client.get(f"/api/pipeline/previews/{key}/resume/")
+        self.assertEqual(resumed.status_code, 200, resumed.content)
+        body = resumed.json()
+        # The last rendered effective mapping is restored, detection
+        # included — the editor selection comes back intact.
+        self.assertEqual(body["proposed"], rendered.json()["mapping"])
+        self.assertEqual(body["proposed"]["supplier"], 0)
+        self.assertEqual(body["proposed"]["price"], 8)
+        self.assertTrue(body["samples"]["rows"])
+        self.assertEqual(body["draft"]["revision"], 1)
+        self.assertEqual(body["total_rows"], 1)
 
     def test_preview_proposes_detected_mapping_without_importing(self):
         response = self._preview(self.alice, self.org_a, [HEADERS, complete_row()])
@@ -207,7 +237,11 @@ class PreviewFlowTests(TestCase):
         with self.captureOnCommitCallbacks(execute=True):
             response = self.client.post(
                 f"/api/pipeline/previews/{key}/confirm/",
-                {"mapping": {}, "constants": {"supplier": "Acme"}},
+                {
+                    "mapping": {},
+                    "constants": {"supplier": "Acme"},
+                    "revision": self._revision(key),
+                },
                 format="json",
             )
         self.assertEqual(response.status_code, 201, response.content)
@@ -222,7 +256,7 @@ class PreviewFlowTests(TestCase):
         key = self._paste(self.alice, self.org_a, text).data["key"]
         response = self.client.post(
             f"/api/pipeline/previews/{key}/confirm/",
-            {"mapping": {"model": 0}},
+            {"mapping": {"model": 0}, "revision": self._revision(key)},
             format="json",
         )
         self.assertEqual(response.status_code, 400)
@@ -251,7 +285,11 @@ class PreviewFlowTests(TestCase):
         with self.captureOnCommitCallbacks(execute=True):
             confirm = self.client.post(
                 f"/api/pipeline/previews/{key}/confirm/",
-                {"mapping": {}, "constants": {"supplier": "Acme"}},
+                {
+                    "mapping": {},
+                    "constants": {"supplier": "Acme"},
+                    "revision": self._revision(key),
+                },
                 format="json",
             )
         self.assertEqual(confirm.status_code, 201, confirm.content)
@@ -621,6 +659,10 @@ class PreviewSheetTests(TestCase):
             format="multipart",
         )
 
+    def _revision(self, key):
+        draft = self.client.get(f"/api/pipeline/previews/{key}/")
+        return draft.data["draft"]["revision"]
+
     def test_preview_reports_selection_and_omission(self):
         response = self._preview_bytes(two_sheet_workbook())
         self.assertEqual(response.status_code, 201, response.content)
@@ -670,7 +712,7 @@ class PreviewSheetTests(TestCase):
         with self.captureOnCommitCallbacks(execute=True):
             confirm = self.client.post(
                 f"/api/pipeline/previews/{key}/confirm/",
-                {"mapping": {}},
+                {"mapping": {}, "revision": self._revision(key)},
                 format="json",
             )
         self.assertEqual(confirm.status_code, 201, confirm.content)

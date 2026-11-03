@@ -84,6 +84,12 @@ export default function HelpPage() {
           until you confirm: the file is parsed and you get a preview first.
         </P>
         <Note>
+          PDF and image files are not supported: picking one shows an
+          instant message naming the accepted formats, before anything is
+          uploaded. There is no image or PDF reading — only the listed
+          text and spreadsheet containers are parsed.
+        </Note>
+        <Note>
           Files from the same supplier are recognized: a previous mapping is
           suggested automatically, so repeated price lists import in one click.
         </Note>
@@ -123,6 +129,22 @@ export default function HelpPage() {
           read — a missing price, an unknown unit — land in the review queue
           on the run page. Fix the value inline, or press{" "}
           <strong>Ignore record</strong> to drop the row from the quote.
+        </P>
+        <P>
+          Capacity and grade are phone requirements. When a spreadsheet
+          carries no capacity or grade information at all, you get one
+          file-wide question instead of per-row demands: confirm{" "}
+          <strong>phones or devices</strong> to keep answering per row, or{" "}
+          <strong>other products</strong> to stand those fields down as not
+          applicable — nothing is invented either way.
+        </P>
+        <P>
+          When the same product appears twice in one file at different
+          prices, neither price is trusted silently: each row asks you to
+          choose the authoritative current price. The losing row stays on
+          record with its source reference but leaves the quote. Products
+          that genuinely differ (capacity, color, grade) are never treated
+          as conflicts.
         </P>
         <Note>
           Once every question is answered or ignored, the run validates

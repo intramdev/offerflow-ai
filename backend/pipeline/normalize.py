@@ -36,6 +36,24 @@ LOCKED = "locked"
 UNLOCKED = "unlocked"
 UNKNOWN = "unknown"
 
+#: Product domains for required-field rules. Device files (phones and
+#: similar) require capacity and grade per row; general files (office
+#: supplies and the like) treat them as not applicable. Anything other
+#: than DOMAIN_GENERAL behaves as device, so undecided files keep the
+#: established phone checks.
+DOMAIN_DEVICE = "device"
+DOMAIN_GENERAL = "general"
+
+#: Reviewer-facing domain answers, in choice order. The first keeps
+#: per-row device questions; the second resolves them as not applicable.
+DOMAIN_CHOICE_DEVICE = "Phones or devices — capacity and grade required"
+DOMAIN_CHOICE_GENERAL = "Other products — capacity and grade do not apply"
+DOMAIN_CHOICES = (DOMAIN_CHOICE_DEVICE, DOMAIN_CHOICE_GENERAL)
+DOMAIN_BY_CHOICE = {
+    DOMAIN_CHOICE_DEVICE: DOMAIN_DEVICE,
+    DOMAIN_CHOICE_GENERAL: DOMAIN_GENERAL,
+}
+
 # Gap field -> canonical source cell. Only these cells may come from a
 # model proposal; everything else stays exactly as the source read it.
 GAP_CELL_FIELDS = {
@@ -392,7 +410,10 @@ def _plain_equal(left: str, right: str) -> bool:
 
 
 def merge_interpreted_cells(
-    local_cells: dict, interpreted_cells: dict, document_policy: str = "stock"
+    local_cells: dict,
+    interpreted_cells: dict,
+    document_policy: str = "stock",
+    domain: str = DOMAIN_DEVICE,
 ) -> dict:
     """Fold a model proposal into source cells without overwriting reads.
 
@@ -407,11 +428,13 @@ def merge_interpreted_cells(
     the gap open for a human instead of silently adopting invention.
     Optional cells (brand, color, conditions) are adopted when the
     source left them empty, so a correct proposal is preserved rather
-    than dropped for being optional.
+    than dropped for being optional. Under the general domain the
+    device cells (capacity, grade) are never gaps, so proposals for
+    them are not adopted either.
     """
     fields = normalize_cells(local_cells)
     _status, gaps, _reason = compute_offer_status(
-        fields, document_policy=document_policy
+        fields, document_policy=document_policy, domain=domain
     )
     wanted = {
         GAP_CELL_FIELDS[gap["field"]]
@@ -490,7 +513,7 @@ def _short(raw) -> str:
 
 
 def compute_offer_status(
-    fields: dict, document_policy: str = "stock"
+    fields: dict, document_policy: str = "stock", domain: str = DOMAIN_DEVICE
 ) -> tuple[str, list, str]:
     """Decide ok/excluded/needs_input for normalized fields.
 
@@ -501,6 +524,8 @@ def compute_offer_status(
     that was provided but cannot be read asks for confirmation.
     Under the price_only document policy an absent quantity stays unknown
     instead of raising a gap; stock lists still require it.
+    Under the general domain capacity and grade are not applicable, so
+    they raise no gaps; device files keep the established per-row checks.
     """
     from pipeline.models import OfferStatus
 
@@ -523,7 +548,8 @@ def compute_offer_status(
                 "question": "Model is missing for this row. Supply the model name.",
             }
         )
-    if fields.get("capacity_gb") is None:
+    device_fields_apply = domain != DOMAIN_GENERAL
+    if device_fields_apply and fields.get("capacity_gb") is None:
         gaps.append(
             {
                 "field": "capacity_gb",
@@ -537,7 +563,7 @@ def compute_offer_status(
         )
     grade = (fields.get("grade") or "").strip()
     grade_raw = (fields.get("grade_raw") or "").strip()
-    if not grade:
+    if device_fields_apply and not grade:
         options = grade_options(grade_raw)
         if options is not None:
             gaps.append(

@@ -5,7 +5,12 @@ import * as React from "react";
 
 import { cn } from "@/lib/cn";
 
-const ACCEPTED = ".xlsx,.xls,.csv,.txt,.tsv,.docx";
+// Single source for the chooser hint and the pre-upload check below:
+// the accept attribute only filters the dialog, so picked files are
+// re-checked before anything is sent.
+export const ACCEPTED_EXTENSIONS = ["xlsx", "xls", "csv", "txt", "tsv", "docx"];
+
+const ACCEPTED = ACCEPTED_EXTENSIONS.map((ext) => `.${ext}`).join(",");
 
 export function UploadDropzone({
   disabled,

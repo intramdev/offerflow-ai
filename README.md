@@ -208,12 +208,18 @@ accepted still reconcile honestly.
 
 - Backend: `OFFERFLOW_DB_ENGINE=sqlite OFFERFLOW_PROVIDER=fixture
   ./backend/.venv/bin/python backend/manage.py test pipeline
-  organizations common` — 869 discovered, 843 executed, all pass,
-  2 skipped (pre-existing skips). Discovery and execution counts are
+  organizations common` — 881 discovered, 855 executed, 2 skipped
+  (pre-existing skips). Discovery and execution counts are
   reported separately and never interchanged. Covers the
   conversational import draft, revision/CAS concurrency, spending
-  reservations, preview/assist/quote flows, and generalization
-  layouts with mocked inference.
+  reservations, preview/assist/quote flows, domain-aware required
+  fields, price-conflict resolution, and generalization
+  layouts with mocked inference. Note: 7 `common.tests` errors
+  (compose/frontend-config file probes) occur when the suite runs
+  inside the backend container, where the repo root is not mounted;
+  they are identical on the clean base commit (verified via stash
+  comparison). The provider must be `fixture` here — without it,
+  spending tests fail for lack of an operator ceiling.
 - Tenant isolation: 22 PostgreSQL tests pass against a disposable
   server under the actual restricted runtime role (`iso_app`, no
   superuser, no bypass). See the runbook for the disposable-server
@@ -224,10 +230,15 @@ accepted still reconcile honestly.
 - Simulated mode emits zero model traffic by construction: no key is
   configured, the worker has no external route, and every synthetic
   artifact is labeled.
-- Live Meta evaluation: **NOT RUN**. The mocked suites above verify
-  contracts and failure paths; they say nothing about model accuracy.
-  See `backend/LIVE_EVAL_PLAN.md` for the bounded plan awaiting owner
-  authorization.
+- Live Meta evaluation: run on synthetic input via the API path
+  (3 Nov 2026). Sectioned price-only and prose EUR stock rows were
+  approved with matching exports; a general-domain conflict file
+  reached ready_for_review with 9/9 gates (approval intentionally
+  not exercised). 9 dispatches, 37,131 provider-reported tokens,
+  spend reconciled to the token with zero unknown charges.
+  Browser-UI steps ran with the independent reviewer. The mocked
+  suites verify contracts and failure paths; they say nothing about
+  model accuracy. See `backend/LIVE_EVAL_PLAN.md` and NEW_WORK.md.
 
 ## Capability evidence
 
@@ -240,9 +251,12 @@ work. Every demo claim links to the test or output behind it.
 | Typed conversational rules, price-only policy, revision binding, refresh resume | Implemented, mocked verification only | `test_preview_assist.py`, `test_generalization.py` (row-10 sheets, sectioned messages, held-out layouts); model accuracy not evaluated |
 | Tenant isolation under a restricted runtime role | Implemented + actual Docker verified | 22-test disposable-PostgreSQL suite; 3 Nov 2026: backend + worker run as `offerflow_app` (no SUPERUSER/BYPASSRLS), 0029/0030 applied, cross-tenant denial and revocation verified, warnings clean |
 | Spending reservations, concurrency, idempotency, kill switches | Implemented, mocked verification only | 10/10 mocked concurrency scenarios; real provider billing accuracy not established |
-| Real-Meta end-to-end evaluation | Evaluated on synthetic input, API path | 3 Nov 2026: two formats certified — (A) sectioned price-only run 27 → artifact 12 + converted quote; (B) prose EUR stock rows run 30 → artifact 13 after 5 quantity clarifications; 8 dispatches, 35,746 tokens, spend reconciled; browser-UI steps with the independent reviewer |
+| Real-Meta end-to-end evaluation | Evaluated on synthetic input, API path | 3 Nov 2026: (A) sectioned price-only run 27 → artifact 12 + converted quote; (B) prose EUR stock rows run 30 → artifact 13 after 5 quantity clarifications; (C) general-domain conflict file run 33 → ready_for_review, 9/9 gates; 9 dispatches, 37,131 tokens, spend reconciled; browser-UI steps with the independent reviewer |
+| Domain-aware required fields; same-file price conflicts | Implemented + API verified on live stack | `test_product_domain.py` (12 tests); run 33: one domain question stood 6 device gaps down as not-applicable, one conflict choice authorized 20 EUR over 25 EUR with both rows preserved; 9th gate `price_conflicts_resolved` |
+| Unsupported-format handling (PDF, images) | Implemented, API verified; no vision path | Backend 400 names the rejected extension; the upload page refuses instantly without streaming; PDF/image files are not supported and there is no vision path |
 | Autonomous orchestration | Not implemented (future work) | The delivered system is AI-assisted with mandatory human review; no step-selecting controller exists |
-| Image / PDF visual understanding | Not implemented (future work) | Accepted containers are parsed as text and structure; there is no vision path |
+| Image / PDF visual understanding | Not implemented (future work) | Accepted containers are parsed as text and structure; PDF/image uploads are refused with a clear message; there is no vision path |
+| Cross-source joins (catalog PDF/CSV/image reconciliation) | Not implemented (future work) | Each import is validated against its own source file; matching a price list against an existing catalog or catalog images is not implemented |
 | Live Telegram / WhatsApp / commerce connectors | Not implemented (future work) | Message text and files are generated for manual sending; no live connections exist |
 
 OfferFlow AI is the submitted prototype: new hackathon work in this

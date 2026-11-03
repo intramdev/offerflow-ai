@@ -22,7 +22,49 @@ import {
   type Preview,
 } from "@/lib/api";
 import { formatDateTime } from "@/lib/format";
-import { UploadDropzone } from "./UploadDropzone";
+import { ACCEPTED_EXTENSIONS, UploadDropzone } from "./UploadDropzone";
+
+// Mirrors the advertised limit and the server default intake cap, so an
+// oversized or unsupported pick fails instantly instead of streaming
+// through the proxy only to be refused.
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+const RICH_MEDIA_EXTENSIONS = new Set([
+  "pdf",
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "tiff",
+  "heic",
+]);
+
+function formatMegabytes(bytes: number): string {
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function rejectUnsupported(file: File): string | null {
+  const dot = file.name.lastIndexOf(".");
+  const ext = dot >= 0 ? file.name.slice(dot + 1).toLowerCase() : "";
+  if (!ACCEPTED_EXTENSIONS.includes(ext)) {
+    const extra = RICH_MEDIA_EXTENSIONS.has(ext)
+      ? " PDF and image files are not supported."
+      : "";
+    return (
+      `“${file.name}” is not a supported file type.${extra} ` +
+      `Accepted formats: ${ACCEPTED_EXTENSIONS.join(", ")}.`
+    );
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    return (
+      `“${file.name}” is ${formatMegabytes(file.size)}; files must be ` +
+      `${formatMegabytes(MAX_UPLOAD_BYTES)} or smaller.`
+    );
+  }
+  return null;
+}
 
 export default function UploadPage() {
   const { active, loading, memberships, prefs } = useOrg();
@@ -38,6 +80,11 @@ export default function UploadPage() {
 
   async function onFile(file: File) {
     if (!active) return;
+    const rejection = rejectUnsupported(file);
+    if (rejection) {
+      setError(rejection);
+      return;
+    }
     setBusy(true);
     setError(null);
     setCandidate(null);

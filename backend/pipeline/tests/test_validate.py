@@ -86,7 +86,7 @@ class ValidationTests(TestCase):
         self.add_offer(3, "7", 7)
         passed, results = run_validations(self.run)
         self.assertTrue(passed)
-        self.assertEqual(len(results), 8)
+        self.assertEqual(len(results), 9)
         self.assertEqual(
             {item.name for item in results},
             {
@@ -97,6 +97,7 @@ class ValidationTests(TestCase):
                 "rows_reconcile_with_evidence",
                 "roles_bound_to_evidence",
                 "no_incompatible_merge",
+                "price_conflicts_resolved",
                 "releasable_or_explicit_empty",
             },
         )

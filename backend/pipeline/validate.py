@@ -20,6 +20,7 @@ from pipeline.models import (
     ValidationResult,
 )
 from pipeline.normalize import (
+    DOMAIN_DEVICE,
     LOCKED,
     REVIEWABLE_FIELDS,
     has_quantity_marking,
@@ -74,13 +75,19 @@ def _is_ignored(decision) -> bool:
     return isinstance(value, dict) and value.get("ignored") is True
 
 
+def _is_not_applicable(decision) -> bool:
+    value = decision.value
+    return isinstance(value, dict) and value.get("not_applicable") is True
+
+
 def _decided_value(decision, field):
     """The value a decision authorizes, or None when it carries none.
 
     Ignore-decisions authorize exclusion, never a value; choices carry
-    the picked grade or lock state verbatim.
+    the picked grade or lock state verbatim. Not-applicable decisions
+    likewise authorize no value: the absent evidence stands as-is.
     """
-    if _is_ignored(decision):
+    if _is_ignored(decision) or _is_not_applicable(decision):
         return None
     if decision.request.kind == ReviewKind.CHOICE:
         return decision.choice or None
@@ -89,18 +96,91 @@ def _decided_value(decision, field):
     return None
 
 
-def _prices_match(actual, expected) -> bool:
+def prices_match(actual, expected) -> bool:
+    """Compare two prices within storage-rounding tolerance."""
     if actual is None or expected is None:
         return actual is None and expected is None
     return abs(Decimal(str(actual)) - Decimal(str(expected))) <= _PRICE_TOLERANCE
 
 
-def _expected_fields(offer, document_policy: str = "stock") -> dict:
+def _conflict_key(offer) -> tuple:
+    """Identity for same-file price conflicts.
+
+    Deliberately conservative: brand, capacity, color, grade, lock, and
+    currency differences all mark true variants, which never conflict.
+    Same-file scope matches one supplier price list with one effective
+    date; cross-file supersession is replacement, not conflict.
+    """
+
+    def norm(text):
+        return (text or "").strip().casefold()
+
+    return (
+        norm(offer.supplier),
+        norm(offer.brand),
+        norm(offer.model_name),
+        offer.capacity_gb,
+        norm(offer.color),
+        norm(offer.grade),
+        offer.lock_state,
+        offer.currency,
+    )
+
+
+def price_label(value) -> str:
+    """Compact canonical label for one readable price (choice round-trip).
+
+    Plain fixed notation: Decimal.normalize() alone would render 20 as
+    "2E+1", which is correct but unreadable as a review choice.
+    """
+    return format(Decimal(str(value)).normalize(), "f")
+
+
+def find_price_conflicts(offers) -> list:
+    """Group non-excluded offers whose identical products disagree on price.
+
+    Returns [{"offers", "prices"}] with prices as normalized labels
+    sorted numerically. Rows without a readable price keep their own
+    value gap and never join a conflict.
+    """
+    groups: dict = {}
+    for offer in offers:
+        if offer.status == OfferStatus.EXCLUDED:
+            continue
+        groups.setdefault(_conflict_key(offer), []).append(offer)
+    conflicts = []
+    for members in groups.values():
+        priced = [offer for offer in members if offer.unit_price is not None]
+        distinct: list = []
+        for offer in priced:
+            if any(
+                prices_match(offer.unit_price, other.unit_price)
+                for other in distinct
+            ):
+                continue
+            distinct.append(offer)
+        if len(distinct) > 1:
+            labels = sorted(
+                {price_label(offer.unit_price) for offer in distinct},
+                key=Decimal,
+            )
+            conflicts.append({"offers": priced, "prices": labels})
+    return conflicts
+
+
+def _run_domain(run) -> str:
+    return (run.mapping or {}).get("domain", DOMAIN_DEVICE)
+
+
+def _expected_fields(
+    offer, document_policy: str = "stock", domain: str = DOMAIN_DEVICE
+) -> dict:
     """Normalized evidence for one offer, model cells folded in narrowly."""
     row = offer.source_row
     cells = merge_interpreted_cells(
         dict(row.data or {}), offer.interpreted or {},
         document_policy=document_policy,
+        domain=domain,
     )
     return normalize_cells(cells)
 
@@ -126,6 +206,7 @@ def evaluate_validations(run) -> list:
         _check_rows_reconcile_with_evidence(run),
         _check_roles_bound_to_evidence(run),
         _check_no_merge(run),
+        _check_price_conflicts_resolved(run),
         _check_releasable_or_explicit_empty(run),
     ]
 
@@ -183,7 +264,9 @@ def _check_quantities_reconcile(run):
             # model-filled quantity gap counts exactly once on each side.
             # Without a proposal this still yields None (unparseable).
             raw = _expected_fields(
-                offer, (run.mapping or {}).get("document_policy", "stock")
+                offer,
+                (run.mapping or {}).get("document_policy", "stock"),
+                _run_domain(run),
             )["quantity"]
         # An approved clarification supplies the quantity the raw
         # cell could not; only rows with neither stay unparseable.
@@ -250,9 +333,10 @@ def _check_rows_reconcile_with_evidence(run):
         .order_by("id")
     )
     policy = (run.mapping or {}).get("document_policy", "stock")
+    domain = _run_domain(run)
     for offer in offers:
         row = offer.source_row
-        expected = _expected_fields(offer, policy)
+        expected = _expected_fields(offer, policy, domain)
         bad_fields = []
         actual_map = {}
         expected_map = {}
@@ -270,7 +354,7 @@ def _check_rows_reconcile_with_evidence(run):
             )
             want = decided if decided is not None else expected[attr]
             if attr == "unit_price":
-                authorized = _prices_match(actual, want)
+                authorized = prices_match(actual, want)
             else:
                 authorized = actual == want
             if not authorized:
@@ -372,7 +456,7 @@ def _check_roles_bound_to_evidence(run):
                     fields.append("unit_price")
                     expected["unit_price"] = f"span {recorded}"
                     actual["unit_price"] = f"span {[start, end]}"
-                elif want is None or not _prices_match(offer.unit_price, want):
+                elif want is None or not prices_match(offer.unit_price, want):
                     fields.append("unit_price")
                     expected["unit_price"] = "" if want is None else str(want)
                     actual["unit_price"] = (
@@ -452,6 +536,34 @@ def _check_no_merge(run):
         "Each offer maps to exactly one source row; nothing was merged."
         if passed
         else "Offer-to-row mapping is not one to one.",
+    )
+
+
+def _check_price_conflicts_resolved(run):
+    offers = list(
+        run.offers.select_related("source_row").order_by("id")
+    )
+    conflicts = find_price_conflicts(offers)
+    if conflicts:
+        detail = [
+            {
+                "offer_ids": [offer.id for offer in item["offers"]],
+                "prices": item["prices"],
+            }
+            for item in conflicts
+        ]
+        return _result(
+            run,
+            "price_conflicts_resolved",
+            False,
+            f"{len(conflicts)} product(s) carry conflicting prices.",
+            {"conflicts": detail},
+        )
+    return _result(
+        run,
+        "price_conflicts_resolved",
+        True,
+        "No conflicting prices among quotable offers.",
     )
 
 

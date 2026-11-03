@@ -21,6 +21,7 @@ from pipeline.models import (
     transition_run,
 )
 from pipeline.normalize import (
+    DOMAIN_DEVICE,
     compute_offer_status,
     merge_interpreted_cells,
     normalize_cells,
@@ -706,6 +707,7 @@ def _interpret_step(run: ImportRun) -> None:
     from pipeline.normalize import has_quantity_marking
 
     policy = (run.mapping or {}).get("document_policy", "stock")
+    domain = (run.mapping or {}).get("domain", DOMAIN_DEVICE)
     rows = list(run.source_rows.order_by("index"))
     # Local-first: the model copies the same cells the localizer reads, so
     # rows that normalize cleanly never need a paid call. Only gap rows go
@@ -716,7 +718,7 @@ def _interpret_step(run: ImportRun) -> None:
         cells = dict(row.data or {})
         fields = normalize_cells(cells)
         status, gaps, reason = compute_offer_status(
-            fields, document_policy=policy
+            fields, document_policy=policy, domain=domain
         )
         local[row.index] = (cells, fields, status, gaps, reason)
         if gaps:
@@ -851,10 +853,11 @@ def _interpret_step(run: ImportRun) -> None:
             cells = merge_interpreted_cells(
                 dict(row.data), interpreted[row.index],
                 document_policy=policy,
+                domain=domain,
             )
             fields = normalize_cells(cells)
             status, gaps, reason = compute_offer_status(
-                fields, document_policy=policy
+                fields, document_policy=policy, domain=domain
             )
             scoped = bool((row.provenance or {}).get("terminal_scope"))
             if row.index in non_product and _is_message_row(row) and not scoped:
@@ -917,6 +920,10 @@ def _interpret_step(run: ImportRun) -> None:
             }
         ),
     )
+    from pipeline.review import raise_domain_question, reconcile_price_conflicts
+
+    raise_domain_question(run=run)
+    reconcile_price_conflicts(run=run)
     transition_run(run, RunStatus.VALIDATION)
 
 

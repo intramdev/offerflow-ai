@@ -77,6 +77,7 @@ class PipelineApiTests(TestCase):
     def test_wrong_extension_refused(self):
         response = self.upload(self.alice, self.org_a, [HEADERS, complete_row()], name="sup.pdf")
         self.assertEqual(response.status_code, 400)
+        self.assertIn(".pdf", response.data["detail"])
         self.assertIn("Accepted formats", response.data["detail"])
 
     def test_csv_upload_accepted(self):

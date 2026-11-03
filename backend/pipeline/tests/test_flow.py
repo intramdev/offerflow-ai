@@ -106,6 +106,18 @@ class PipelineFlowTests(TestCase):
         answer_request(review=by_field["grade"], user=self.user, choice="A")
         answer_request(review=by_field["unit_price"], user=self.user, value="99.99")
         run.refresh_from_db()
+        # The answered row now prices P1 at 99.99 against the two
+        # 299.99 rows: same product, same file, so a human picks the
+        # authority. Every member of the group gets the question.
+        conflicts = list(
+            run.reviews.filter(
+                status=ReviewStatus.OPEN, field="price_conflict"
+            ).order_by("id")
+        )
+        self.assertEqual(len(conflicts), 3)
+        self.assertEqual(conflicts[0].choices, ["99.99", "299.99"])
+        answer_request(review=conflicts[0], user=self.user, choice="299.99")
+        run.refresh_from_db()
         self.assertEqual(run.status, RunStatus.READY_FOR_REVIEW)
         self.assertTrue(all(item.passed for item in run.validations.all()))
 
@@ -124,12 +136,12 @@ class PipelineFlowTests(TestCase):
         self.assertEqual(hashlib.sha256(xlsx_bytes).hexdigest(), xlsx.sha256)
         workbook = load_workbook(io.BytesIO(xlsx_bytes), read_only=True, data_only=True)
         data_rows = list(workbook["offers"].iter_rows(min_row=2, values_only=True))
-        self.assertEqual(len(data_rows), 3)
+        self.assertEqual(len(data_rows), 2)
         self.assertEqual(data_rows[0][2], "P1")
         self.assertEqual(data_rows[0][11], "Sheet1")
         self.assertEqual(data_rows[0][12], 2)
         excluded_rows = list(workbook["excluded"].iter_rows(min_row=2, values_only=True))
-        self.assertEqual(len(excluded_rows), 1)
+        self.assertEqual(len(excluded_rows), 2)
         meta = {
             cells[0]: cells[1]
             for cells in workbook["meta"].iter_rows(min_row=2, values_only=True)
@@ -138,7 +150,7 @@ class PipelineFlowTests(TestCase):
 
         csv_bytes = adapter.read_bytes(csv_artifact.storage_key)
         lines = csv_bytes.decode("utf-8-sig").strip().splitlines()
-        self.assertEqual(len(lines), 4)
+        self.assertEqual(len(lines), 3)
         self.assertTrue(lines[0].startswith("supplier,brand,model"))
 
     def test_org_default_yields_to_file_currency_column(self):

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
+
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from pipeline.export import normalized_digest
 from pipeline.models import (
+    NormalizedOffer,
     OfferStatus,
     ReviewDecision,
     ReviewKind,
@@ -16,14 +19,32 @@ from pipeline.models import (
     transition_run,
 )
 from pipeline.normalize import (
+    DOMAIN_BY_CHOICE,
+    DOMAIN_CHOICES,
+    DOMAIN_DEVICE,
+    DOMAIN_GENERAL,
     LOCKED,
     UNLOCKED,
     compute_offer_status,
     parse_review_value,
 )
-from pipeline.validate import run_validations
+from pipeline.validate import (
+    find_price_conflicts,
+    price_label,
+    prices_match,
+    run_validations,
+)
 
 _MISSING = object()
+
+#: File-wide question asking whether device fields apply to the file.
+DOMAIN_FIELD = "domain"
+
+#: Per-offer question choosing the authoritative price within a file.
+CONFLICT_FIELD = "price_conflict"
+
+#: Device-only gap fields a general-domain answer stands down.
+_DEVICE_GAP_FIELDS = ("capacity_gb", "grade")
 
 
 def _apply_value(offer, field: str, raw) -> None:
@@ -171,6 +192,316 @@ def _answer_mapping(*, review: ReviewRequest, user, choice: str):
     return decision
 
 
+def raise_domain_question(*, run):
+    """Ask once whether a device-evidence-free file is general-domain.
+
+    Returns the created review, or None when the file already shows
+    device data, asks no device gaps, or already carries the question.
+    Table lane only: a spreadsheet without capacity/grade columns is
+    decisive evidence, while message prose may carry device meaning
+    the parser has not extracted yet, so pasted lines keep the
+    established per-row questions.
+    """
+    stored = run.mapping or {}
+    if stored.get("free_text") is True:
+        return None
+    if stored.get("domain") in (DOMAIN_DEVICE, DOMAIN_GENERAL):
+        return None
+    if run.reviews.filter(offer__isnull=True, field=DOMAIN_FIELD).exists():
+        return None
+    if not run.reviews.filter(
+        status=ReviewStatus.OPEN,
+        offer__isnull=False,
+        field__in=_DEVICE_GAP_FIELDS,
+    ).exists():
+        return None
+    if (
+        run.offers.exclude(capacity_gb__isnull=True).exists()
+        or run.offers.exclude(grade="").exists()
+    ):
+        return None
+    count = run.offers.count()
+    rows = "1 row" if count == 1 else f"{count} rows"
+    question = (
+        f"This file gives no capacity or grade information on any of "
+        f"its {rows}. Are these phones or devices, where capacity and "
+        f"grade are required for each row, or other products, where "
+        f"capacity and grade do not apply?"
+    )
+    return ReviewRequest.objects.create(
+        organization_id=run.organization_id,
+        run=run,
+        offer=None,
+        kind=ReviewKind.CHOICE,
+        field=DOMAIN_FIELD,
+        question=question,
+        evidence={"rows": count},
+        choices=list(DOMAIN_CHOICES),
+    )
+
+
+def _mark_answered(review: ReviewRequest) -> None:
+    review.status = ReviewStatus.ANSWERED
+    review.resolved_at = timezone.now()
+    review.save(update_fields=["status", "resolved_at"])
+
+
+def _answer_domain(*, review: ReviewRequest, user, choice: str = ""):
+    """Record the file's product domain; stand down N/A device gaps."""
+    from pipeline.jobs import record_audit
+
+    run = review.run
+    from organizations.context import set_tenant_context
+
+    set_tenant_context(run.organization_id, user.id if user is not None else 0)
+    if run.status != RunStatus.NEEDS_INPUT:
+        raise ValidationError("That run is not awaiting input.")
+    if not choice or choice not in (review.choices or []):
+        raise ValidationError("Pick one of the offered answers.")
+    domain = DOMAIN_BY_CHOICE.get(choice)
+    if domain is None:
+        raise ValidationError("Pick one of the offered answers.")
+    stored = dict(run.mapping or {})
+    stored["domain"] = domain
+    run.mapping = stored
+    run.save(update_fields=["mapping", "updated_at"])
+    _mark_answered(review)
+    decision = ReviewDecision.objects.create(
+        organization_id=run.organization_id,
+        request=review,
+        decided_by=user,
+        choice=choice,
+        value={"domain": domain},
+    )
+    if domain == DOMAIN_GENERAL:
+        for open_review in run.reviews.filter(
+            status=ReviewStatus.OPEN,
+            offer__isnull=False,
+            field__in=_DEVICE_GAP_FIELDS,
+        ):
+            _mark_answered(open_review)
+            ReviewDecision.objects.create(
+                organization_id=run.organization_id,
+                request=open_review,
+                decided_by=user,
+                choice="",
+                value={"not_applicable": True},
+            )
+        policy = stored.get("document_policy", "stock")
+        for offer in run.offers.all():
+            if offer.status == OfferStatus.EXCLUDED:
+                continue
+            status, _gaps, reason = compute_offer_status(
+                _offer_fields(offer),
+                document_policy=policy,
+                domain=domain,
+            )
+            offer.status = status
+            offer.exclusion_reason = reason
+            if run.reviews.filter(
+                offer=offer, status=ReviewStatus.OPEN
+            ).exists():
+                offer.status = OfferStatus.NEEDS_INPUT
+            offer.save()
+    _settle_run(run, user)
+    record_audit(
+        run.organization_id, user, "review_answered", "review", review.id,
+        {"field": review.field, "domain": domain},
+    )
+    return decision
+
+
+def _conflict_question(offers: list, prices: list) -> str:
+    first = offers[0]
+    clauses = []
+    for offer in sorted(offers, key=lambda item: item.source_row.index):
+        label = next(
+            label
+            for label in prices
+            if prices_match(offer.unit_price, Decimal(label))
+        )
+        clauses.append(
+            f"{label} {offer.currency} on sheet row {offer.source_row.index}"
+        )
+    return (
+        f"\u201c{first.model_name}\u201d from {first.supplier} is priced "
+        f"differently in this file: {'; '.join(clauses)}. Choose the "
+        f"authoritative current price; the other row stays on record but "
+        f"leaves the quote. If neither price is confirmed, leave this "
+        f"open and ask the supplier."
+    )
+
+
+def reconcile_price_conflicts(*, run) -> None:
+    """Create, refresh, or retire same-file price-conflict questions.
+
+    Open questions always reflect the live group: changed groups get
+    refreshed wording and choices, and dissolved groups retire as moot
+    instead of dangling. Answered decisions are never rewritten.
+    """
+    conflicts = find_price_conflicts(
+        run.offers.select_related("source_row").order_by("id")
+    )
+    live_offer_ids: set = set()
+    for item in conflicts:
+        offers = item["offers"]
+        prices = item["prices"]
+        question = _conflict_question(offers, prices)
+        offer_ids = [offer.id for offer in offers]
+        for offer in offers:
+            live_offer_ids.add(offer.id)
+            evidence = {
+                "provenance": offer.provenance,
+                "price_conflict": True,
+                "offer_ids": offer_ids,
+                "prices": prices,
+            }
+            existing = run.reviews.filter(
+                offer=offer, field=CONFLICT_FIELD, status=ReviewStatus.OPEN
+            ).first()
+            if existing is None:
+                ReviewRequest.objects.create(
+                    organization_id=run.organization_id,
+                    run=run,
+                    offer=offer,
+                    kind=ReviewKind.CHOICE,
+                    field=CONFLICT_FIELD,
+                    question=question,
+                    evidence=evidence,
+                    choices=list(prices),
+                )
+            else:
+                existing.question = question
+                existing.choices = list(prices)
+                existing.evidence = evidence
+                existing.save(
+                    update_fields=["question", "choices", "evidence"]
+                )
+    for stale in run.reviews.filter(
+        field=CONFLICT_FIELD, status=ReviewStatus.OPEN
+    ).exclude(offer_id__in=live_offer_ids):
+        _mark_answered(stale)
+        ReviewDecision.objects.create(
+            organization_id=run.organization_id,
+            request=stale,
+            decided_by=None,
+            choice="",
+            value={"moot": True},
+        )
+
+
+def _answer_price_conflict(*, review: ReviewRequest, user, choice: str = ""):
+    """Authorize one conflicting price; supersede the losing rows.
+
+    Losing rows are excluded with their provenance intact, never
+    deleted or revalued. Every row is preserved for the record.
+    """
+    from pipeline.jobs import record_audit
+
+    run = review.run
+    from organizations.context import set_tenant_context
+
+    set_tenant_context(run.organization_id, user.id if user is not None else 0)
+    if run.status != RunStatus.NEEDS_INPUT:
+        raise ValidationError("That run is not awaiting input.")
+    if not choice or choice not in (review.choices or []):
+        raise ValidationError("Pick one of the offered prices.")
+    try:
+        chosen = Decimal(choice)
+    except InvalidOperation:
+        raise ValidationError("That price is not valid.") from None
+    offer_ids = (review.evidence or {}).get("offer_ids") or []
+    group = [
+        offer
+        for offer in NormalizedOffer.objects.filter(
+            id__in=offer_ids, run=run
+        ).select_related("source_row")
+        if offer.status != OfferStatus.EXCLUDED
+    ]
+    if not group:
+        raise ValidationError("Those rows are no longer part of this run.")
+    survivors = {
+        offer.id
+        for offer in group
+        if offer.unit_price is not None
+        and prices_match(offer.unit_price, chosen)
+    }
+    if not survivors:
+        raise ValidationError(
+            "That price matches no remaining row; the conflict changed."
+        )
+    stored = run.mapping or {}
+    policy = stored.get("document_policy", "stock")
+    domain = stored.get("domain", DOMAIN_DEVICE)
+    currency = group[0].currency
+    display = price_label(chosen)
+    answered_decision = None
+    for offer in group:
+        if offer.id in survivors:
+            for conflict in run.reviews.filter(
+                offer=offer, field=CONFLICT_FIELD, status=ReviewStatus.OPEN
+            ):
+                _mark_answered(conflict)
+                decision = ReviewDecision.objects.create(
+                    organization_id=run.organization_id,
+                    request=conflict,
+                    decided_by=user,
+                    choice=choice,
+                    value=None,
+                )
+                if conflict.id == review.id:
+                    answered_decision = decision
+            status, _gaps, reason = compute_offer_status(
+                _offer_fields(offer),
+                document_policy=policy,
+                domain=domain,
+            )
+            offer.status = status
+            offer.exclusion_reason = reason
+            if run.reviews.filter(
+                offer=offer, status=ReviewStatus.OPEN
+            ).exists():
+                offer.status = OfferStatus.NEEDS_INPUT
+            offer.save()
+        else:
+            offer.status = OfferStatus.EXCLUDED
+            offer.exclusion_reason = (
+                "Superseded by price-conflict decision "
+                f"(review {review.id}): chose {display} {currency}."
+            )[:255]
+            offer.save()
+            for open_review in run.reviews.filter(
+                offer=offer, status=ReviewStatus.OPEN
+            ):
+                _mark_answered(open_review)
+                if open_review.field == CONFLICT_FIELD:
+                    value: dict | None = {"superseded_by": choice}
+                    decided_choice = choice
+                else:
+                    value = {"ignored": True, "superseded_by": choice}
+                    decided_choice = ""
+                decision = ReviewDecision.objects.create(
+                    organization_id=run.organization_id,
+                    request=open_review,
+                    decided_by=user,
+                    choice=decided_choice,
+                    value=value,
+                )
+                if open_review.id == review.id:
+                    answered_decision = decision
+    reconcile_price_conflicts(run=run)
+    _settle_run(run, user)
+    record_audit(
+        run.organization_id, user, "review_answered", "review", review.id,
+        {"field": review.field, "choice": choice},
+    )
+    record_audit(
+        run.organization_id, user, "price_conflict_resolved", "run", run.id,
+        {"choice": choice, "offer_ids": [offer.id for offer in group]},
+    )
+    return answered_decision
+
+
 def answer_request(*, review: ReviewRequest, user, choice: str = "", value=_MISSING):
     """Record an answer, re-evaluate the offer, and advance the run."""
     from pipeline.jobs import record_audit
@@ -178,7 +509,11 @@ def answer_request(*, review: ReviewRequest, user, choice: str = "", value=_MISS
     if review.status != ReviewStatus.OPEN:
         raise ValidationError("That review request is already answered.")
     if review.offer_id is None:
+        if review.field == DOMAIN_FIELD:
+            return _answer_domain(review=review, user=user, choice=choice)
         return _answer_mapping(review=review, user=user, choice=choice)
+    if review.kind == ReviewKind.CHOICE and review.field == CONFLICT_FIELD:
+        return _answer_price_conflict(review=review, user=user, choice=choice)
     run = review.run
     from organizations.context import set_tenant_context
 
@@ -207,10 +542,20 @@ def answer_request(*, review: ReviewRequest, user, choice: str = "", value=_MISS
         raise ValidationError(f"Unknown review kind {review.kind!r}.")
     offer.save()
 
-    policy = (review.run.mapping or {}).get("document_policy", "stock")
+    stored = review.run.mapping or {}
+    policy = stored.get("document_policy", "stock")
+    domain = stored.get("domain", DOMAIN_DEVICE)
     status, gaps, reason = compute_offer_status(
-        _offer_fields(offer), document_policy=policy
+        _offer_fields(offer), document_policy=policy, domain=domain
     )
+    if (
+        run.reviews.filter(offer=offer, status=ReviewStatus.OPEN)
+        .exclude(id=review.id)
+        .exists()
+    ):
+        # Another question (for example a price conflict) still
+        # constrains this row, so it cannot go OK yet.
+        status, reason = OfferStatus.NEEDS_INPUT, ""
     offer.status = status
     offer.exclusion_reason = reason
     offer.save()
@@ -244,6 +589,9 @@ def answer_request(*, review: ReviewRequest, user, choice: str = "", value=_MISS
             evidence={"provenance": provenance, "raw": raw_cells},
             choices=gap.get("choices", []),
         )
+    # An answer can form a new conflict (a filled price joining a
+    # same-identity row) or leave a changed group behind.
+    reconcile_price_conflicts(run=run)
     _settle_run(run, user)
     record_audit(
         run.organization_id, user, "review_answered", "review", review.id,
@@ -308,6 +656,9 @@ def ignore_request(*, review: ReviewRequest, user):
             value={"ignored": True},
         )
         resolved += 1
+    # Excluding a row can dissolve its conflict group; the surviving
+    # rows' questions go moot instead of dangling.
+    reconcile_price_conflicts(run=run)
     _settle_run(run, user)
     record_audit(
         run.organization_id, user, "review_ignored", "offer", offer.id,

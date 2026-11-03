@@ -238,7 +238,10 @@ def check_upload_safety(
         raise UnsupportedFile(LEGACY_DOC_MESSAGE)
     if extension not in ACCEPTED_EXTENSIONS:
         accepted = ", ".join(sorted(e[1:] for e in ACCEPTED_EXTENSIONS))
-        raise UnsupportedFile(f"Accepted formats: {accepted}.")
+        raise UnsupportedFile(
+            f"Unsupported file type {extension or '(none)'}. "
+            f"Accepted formats: {accepted}."
+        )
     if extension in ARCHIVE_EXTENSIONS:
         check_archive_safety(
             content,

@@ -79,9 +79,10 @@ export default function HelpPage() {
       <Section id="upload" title="Upload & preview">
         <P>
           Drop a supplier file on the <strong>Upload</strong> page. OfferFlow
-          reads XLSX, XLS, CSV, TXT, TSV, and DOCX (legacy DOC is refused
-          with guidance; ZIP archives are not supported). Nothing is stored
-          until you confirm: the file is parsed and you get a preview first.
+          reads XLSX, XLS, CSV, TXT, TSV, and DOCX up to 200 MB and 2000
+          rows (legacy DOC is refused with guidance; ZIP archives are not
+          supported). Nothing is stored until you confirm: the file is
+          parsed and you get a preview first.
         </P>
         <Note>
           PDF and image files are not supported: picking one shows an

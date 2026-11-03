@@ -47,7 +47,7 @@ from pipeline.quotes import (
     render_quote_xlsx,
     update_rule,
 )
-from pipeline.parsing import MessageCandidateFile
+from pipeline.parsing import MessageCandidateFile, UploadTooLarge
 from pipeline.previews import (
     AssistInFlight,
     AssistRefused,
@@ -250,6 +250,11 @@ class UploadView(APIView):
                 organization=organization,
                 user=request.user,
                 uploaded_file=data["file"],
+            )
+        except UploadTooLarge as error:
+            return Response(
+                {"detail": str(error)},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
@@ -534,6 +539,11 @@ class PreviewCreateView(APIView):
                     "explanation": str(candidate),
                 }
             )
+        except UploadTooLarge as error:
+            return Response(
+                {"detail": str(error)},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error
         return Response(preview, status=status.HTTP_201_CREATED)
@@ -559,6 +569,11 @@ class PreviewTextView(APIView):
                 organization=organization,
                 user=request.user,
                 text=data["text"],
+            )
+        except UploadTooLarge as error:
+            return Response(
+                {"detail": str(error)},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             )
         except DjangoValidationError as error:
             raise _as_drf_error(error) from error

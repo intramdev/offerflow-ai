@@ -58,7 +58,7 @@ export function UploadDropzone({
         {dragging ? "Drop the file to preview it" : "Drag a supplier file here, or click to choose"}
       </p>
       <p className="mt-1 text-sm text-muted-foreground">
-        xlsx, xls, csv, txt, tsv, or docx — up to 10 MB. Nothing imports until
+        xlsx, xls, csv, txt, tsv, or docx — up to 200 MB. Nothing imports until
         you confirm the preview.
       </p>
       <input

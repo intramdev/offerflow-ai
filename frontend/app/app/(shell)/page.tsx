@@ -27,7 +27,7 @@ import { ACCEPTED_EXTENSIONS, UploadDropzone } from "./UploadDropzone";
 // Mirrors the advertised limit and the server default intake cap, so an
 // oversized or unsupported pick fails instantly instead of streaming
 // through the proxy only to be refused.
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 200_000_000;
 
 const RICH_MEDIA_EXTENSIONS = new Set([
   "pdf",
@@ -42,7 +42,9 @@ const RICH_MEDIA_EXTENSIONS = new Set([
 ]);
 
 function formatMegabytes(bytes: number): string {
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  // Decimal megabytes, matching the server message ("200 MB").
+  if (bytes % 1_000_000 === 0) return `${bytes / 1_000_000} MB`;
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
 }
 
 function rejectUnsupported(file: File): string | null {

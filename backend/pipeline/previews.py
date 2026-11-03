@@ -42,12 +42,15 @@ from pipeline.parsing import (
     MappingRequired,
     MessageCandidateFile,
     UnsupportedFile,
+    UploadTooLarge,
     candidate_message_text,
+    check_upload_extension,
     check_upload_safety,
     column_letter,
     discover_sheets,
     header_signature,
     parse_upload,
+    refuse_oversize,
 )
 
 PREVIEW_TTL = timedelta(hours=24)
@@ -98,6 +101,23 @@ def _gc_previews() -> None:
         return
     cutoff = datetime.now(timezone.utc) - PREVIEW_TTL
     adapter = _adapter()
+    for orphan in root.glob("*.bin"):
+        # A metadata write that failed mid-preview leaves bytes no
+        # session can resume; at 200 MB each these must not linger.
+        if not orphan.with_suffix(".json").exists():
+            try:
+                expired = (
+                    datetime.fromtimestamp(
+                        orphan.stat().st_mtime, tz=timezone.utc
+                    )
+                    < cutoff
+                )
+            except OSError:
+                continue
+            if expired and re.fullmatch(
+                r"[A-Za-z0-9_-]{8,64}", orphan.stem or ""
+            ):
+                adapter.delete(f"previews/{orphan.stem}.bin")
     for meta_path in root.glob("*.json"):
         try:
             meta = json.loads(meta_path.read_text())
@@ -642,6 +662,14 @@ def _reject_duplicate(*, organization, user, original_name: str, digest: str) ->
 def create_preview(*, organization, user, uploaded_file) -> dict:
     """Store preview bytes and propose a mapping with sample rows."""
     original_name = getattr(uploaded_file, "name", "") or ""
+    # Extension, then declared size: both refuse without reading the
+    # body, so a hostile 200 MB pick costs no 200 MB read. The size
+    # error stays an UploadTooLarge (413), never a plain refusal.
+    try:
+        check_upload_extension(original_name)
+    except UnsupportedFile as exc:
+        raise ValidationError(str(exc)) from exc
+    refuse_oversize(uploaded_file.size, max_bytes=_limits()["max_bytes"])
     content = uploaded_file.read()
     if not content:
         raise ValidationError("Empty file.")
@@ -688,6 +716,8 @@ def _create_preview(
             max_bytes=limits["max_bytes"],
             max_uncompressed_bytes=limits["max_uncompressed_bytes"],
         )
+    except UploadTooLarge:
+        raise
     except UnsupportedFile as exc:
         raise ValidationError(str(exc)) from exc
     digest = hashlib.sha256(content).hexdigest()
@@ -747,7 +777,14 @@ def _create_preview(
 
     key = secrets.token_urlsafe(24)
     adapter = _adapter()
-    adapter.save_bytes(f"previews/{key}.bin", content)
+    try:
+        adapter.save_bytes(f"previews/{key}.bin", content)
+    except OSError:
+        # A failed bytes write (for example a full disk on a large
+        # upload) must surface loudly and leave no phantom preview.
+        adapter.delete(f"previews/{key}.bin")
+        adapter.delete(f"previews/{key}.json")
+        raise
     sheets = _sheet_block(entries, selected)
     meta = {
         "organization_id": organization.id,
@@ -776,7 +813,14 @@ def _create_preview(
             "ignored": proposed_ignored,
         },
     }
-    adapter.save_bytes(f"previews/{key}.json", json.dumps(meta).encode("utf-8"))
+    try:
+        adapter.save_bytes(
+            f"previews/{key}.json", json.dumps(meta).encode("utf-8")
+        )
+    except OSError:
+        adapter.delete(f"previews/{key}.bin")
+        adapter.delete(f"previews/{key}.json")
+        raise
     _gc_previews()
     samples = _render_samples(
         content,

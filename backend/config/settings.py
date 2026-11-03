@@ -250,8 +250,9 @@ DEFAULT_FROM_EMAIL = _env(
     "OFFERFLOW_EMAIL_FROM", "OfferFlow AI <no-reply@example.com>"
 )
 
-# Spreadsheet intake limits (overridable per environment).
-OFFERFLOW_UPLOAD_MAX_BYTES = int(_env("OFFERFLOW_UPLOAD_MAX_BYTES", str(10 * 1024 * 1024)) or 0)
+# Spreadsheet intake limits (overridable per environment). The upload cap
+# is exact bytes on the wire; the UI/docs show it as decimal megabytes.
+OFFERFLOW_UPLOAD_MAX_BYTES = int(_env("OFFERFLOW_UPLOAD_MAX_BYTES", "200000000") or 0)
 OFFERFLOW_MAX_UNCOMPRESSED_BYTES = int(
     _env("OFFERFLOW_MAX_UNCOMPRESSED_BYTES", str(64 * 1024 * 1024)) or 0
 )

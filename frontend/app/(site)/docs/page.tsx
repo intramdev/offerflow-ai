@@ -93,7 +93,7 @@ export default function Docs() {
         <li>
           Accepted input: one file per upload — <code>.xlsx</code>,{" "}
           <code>.xls</code>, <code>.csv</code>, <code>.txt</code>,{" "}
-          <code>.tsv</code>, or <code>.docx</code> — up to 10 MB and 2000
+          <code>.tsv</code>, or <code>.docx</code> — up to 200 MB and 2000
           rows. Legacy <code>.doc</code> is refused with guidance. Headers
           may sit below row one. Macros, formulas-as-code, and external
           links are never executed or followed.

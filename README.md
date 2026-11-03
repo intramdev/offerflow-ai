@@ -19,7 +19,7 @@ for it.
 ## What it does
 
 - **Preview-first import** — upload `.xlsx`, `.xls`, `.csv`, `.txt`, `.tsv`,
-  or `.docx` (up to 10 MB / 2000 rows; legacy `.doc` is refused with
+  or `.docx` (up to 200 MB / 2000 rows; legacy `.doc` is refused with
   guidance). You see a live preview and adjust the column mapping before
   anything is imported. Columns can be ignored or replaced with a fixed
   value, and remembered mappings are proposed for repeat suppliers.

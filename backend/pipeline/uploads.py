@@ -13,7 +13,14 @@ from django.core.exceptions import ValidationError
 from common.storage import LocalFileAdapter
 from pipeline.jobs import enqueue_run, record_audit
 from pipeline.models import ImportRun, RuleSetVersion, SourceFile
-from pipeline.parsing import UnsupportedFile, check_upload_safety, discover_sheets
+from pipeline.parsing import (
+    UnsupportedFile,
+    UploadTooLarge,
+    check_upload_extension,
+    check_upload_safety,
+    discover_sheets,
+    refuse_oversize,
+)
 
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -106,6 +113,15 @@ def store_upload_run(
 def create_upload(*, organization, user, uploaded_file) -> ImportRun:
     """Persist a direct upload and start its run. Raises on any refusal."""
     original_name = getattr(uploaded_file, "name", "") or ""
+    # Extension, then declared size: both refuse without reading the
+    # body, so a hostile 200 MB upload costs no 200 MB read.
+    try:
+        check_upload_extension(original_name)
+    except UnsupportedFile as exc:
+        raise ValidationError(str(exc)) from exc
+    refuse_oversize(
+        uploaded_file.size, max_bytes=settings.OFFERFLOW_UPLOAD_MAX_BYTES
+    )
     content = uploaded_file.read()
     if not content:
         raise ValidationError("Empty file.")
@@ -116,6 +132,8 @@ def create_upload(*, organization, user, uploaded_file) -> ImportRun:
             max_bytes=settings.OFFERFLOW_UPLOAD_MAX_BYTES,
             max_uncompressed_bytes=settings.OFFERFLOW_MAX_UNCOMPRESSED_BYTES,
         )
+    except UploadTooLarge:
+        raise
     except UnsupportedFile as exc:
         raise ValidationError(str(exc)) from exc
     digest = hashlib.sha256(content).hexdigest()

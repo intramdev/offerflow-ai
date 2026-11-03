@@ -89,7 +89,7 @@ network with no published ports.
 ## Pipeline endpoints
 
 - `POST api/pipeline/uploads/` — multipart `organization_id` + `file`
-  (`.xlsx`, `.xls`, `.csv`, `.txt`, `.tsv`, `.docx`; 10 MB / 2000 rows;
+  (`.xlsx`, `.xls`, `.csv`, `.txt`, `.tsv`, `.docx`; 200 MB / 2000 rows;
   `.doc` refused with guidance)
 - `POST api/pipeline/previews/` + `GET api/pipeline/previews/<key>/render/`
   — preview-first import with live mapping

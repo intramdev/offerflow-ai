@@ -205,18 +205,55 @@ def _extension_of(filename: str) -> str:
     return f".{chunks[-1]}" if len(chunks) > 1 else ""
 
 
+def format_megabytes(num_bytes: int) -> str:
+    """Decimal megabytes for user-facing size messages ("200 MB")."""
+    whole, remainder = divmod(int(num_bytes), 1_000_000)
+    if remainder == 0:
+        return f"{whole} MB"
+    return f"{num_bytes / 1_000_000:.1f} MB"
+
+
+class UploadTooLarge(UnsupportedFile):
+    """An upload whose byte size exceeds the intake limit.
+
+    Subclasses UnsupportedFile so existing guards keep catching it;
+    views map it to 413 instead of 400.
+    """
+
+
+def check_upload_extension(filename: str) -> str:
+    """Refuse unsupported extensions without touching file bytes."""
+    extension = _extension_of(filename)
+    if extension == ".doc":
+        raise UnsupportedFile(LEGACY_DOC_MESSAGE)
+    if extension not in ACCEPTED_EXTENSIONS:
+        accepted = ", ".join(sorted(e[1:] for e in ACCEPTED_EXTENSIONS))
+        raise UnsupportedFile(
+            f"Unsupported file type {extension or '(none)'}. "
+            f"Accepted formats: {accepted}."
+        )
+    return extension
+
+
+def refuse_oversize(num_bytes: int, *, max_bytes: int) -> None:
+    """Refuse an oversized upload from its declared size, no read needed."""
+    if num_bytes > max_bytes:
+        raise UploadTooLarge(
+            f"File is {format_megabytes(num_bytes)}; uploads must be "
+            f"{format_megabytes(max_bytes)} or smaller."
+        )
+
+
 def check_plain_size(content: bytes, *, max_bytes: int) -> None:
     """Refuse an oversized non-archive upload."""
-    if len(content) > max_bytes:
-        raise UnsupportedFile(f"File exceeds the {max_bytes} byte intake limit.")
+    refuse_oversize(len(content), max_bytes=max_bytes)
 
 
 def check_archive_safety(
     content: bytes, *, max_bytes: int, max_uncompressed_bytes: int
 ) -> None:
     """Refuse oversized, corrupt, macro-enabled, or zip-bombed uploads."""
-    if len(content) > max_bytes:
-        raise UnsupportedFile(f"File exceeds the {max_bytes} byte intake limit.")
+    refuse_oversize(len(content), max_bytes=max_bytes)
     try:
         archive = zipfile.ZipFile(io.BytesIO(content))
     except zipfile.BadZipFile:
@@ -233,15 +270,7 @@ def check_upload_safety(
     content: bytes, filename: str, *, max_bytes: int, max_uncompressed_bytes: int
 ) -> str:
     """Dispatch hostile-file guards by extension. Returns the extension."""
-    extension = _extension_of(filename)
-    if extension == ".doc":
-        raise UnsupportedFile(LEGACY_DOC_MESSAGE)
-    if extension not in ACCEPTED_EXTENSIONS:
-        accepted = ", ".join(sorted(e[1:] for e in ACCEPTED_EXTENSIONS))
-        raise UnsupportedFile(
-            f"Unsupported file type {extension or '(none)'}. "
-            f"Accepted formats: {accepted}."
-        )
+    extension = check_upload_extension(filename)
     if extension in ARCHIVE_EXTENSIONS:
         check_archive_safety(
             content,
@@ -769,9 +798,23 @@ def parse_delimited(
     text = _decode_text(content)
     sample = [line for line in text.splitlines() if line.strip()][:5]
     delimiter = forced_delimiter or _sniff_delimiter(sample)
+    # Refuse an over-limit table while reading, before materializing
+    # millions of rows: the header sits within the first
+    # header_scan_rows non-blank rows, so anything beyond max_rows
+    # data rows past that window can never import.
+    early_cap = max_rows + header_scan_rows
     try:
         reader = csv.reader(io.StringIO(text), delimiter=delimiter)
-        rows = [[(value, False) for value in row] for row in reader]
+        rows = []
+        content_count = 0
+        for raw in reader:
+            rows.append([(value, False) for value in raw])
+            if any(str(value).strip() for value in raw):
+                content_count += 1
+                if content_count > early_cap:
+                    raise UnsupportedFile(
+                        "Table exceeds the row intake limit."
+                    )
     except csv.Error as exc:
         raise UnsupportedFile("File could not be parsed as delimited text.") from exc
     return _table_to_sheet(
@@ -814,6 +857,10 @@ def parse_docx(
     if not document.tables:
         raise UnsupportedFile("Document contains no tables.")
     names = [f"table{index + 1}" for index in range(len(document.tables))]
+    # A table this tall can never import (headers live in the first
+    # header_scan_rows rows, data is capped at max_rows), so refuse or
+    # skip it before copying every cell.
+    tall = max_rows + header_scan_rows
     if sheet_name is not None:
         if sheet_name not in names:
             seen = ", ".join(names)
@@ -821,6 +868,8 @@ def parse_docx(
                 f"Table {sheet_name!r} not found. Available: {seen}."
             )
         table = document.tables[names.index(sheet_name)]
+        if len(table.rows) > tall:
+            raise UnsupportedFile("Table exceeds the row intake limit.")
         rows = [
             [(cell.text.strip(), False) for cell in row.cells] for row in table.rows
         ]
@@ -836,7 +885,11 @@ def parse_docx(
             constant_sources=constant_sources,
         )
     best: MappingRequired | None = None
+    saw_tall = False
     for index, table in enumerate(document.tables):
+        if len(table.rows) > tall:
+            saw_tall = True
+            continue
         rows = [
             [(cell.text.strip(), False) for cell in row.cells] for row in table.rows
         ]
@@ -859,6 +912,8 @@ def parse_docx(
             continue
     if best is not None:
         raise best
+    if saw_tall:
+        raise UnsupportedFile("Table exceeds the row intake limit.")
     raise UnsupportedFile("Document tables hold no recognizable headers.")
 
 

@@ -776,6 +776,7 @@ class PreviewAssistApplyView(APIView):
                 drop_lines=serializer.validated_data["drop_lines"],
                 operations=serializer.validated_data.get("operations"),
                 revision=serializer.validated_data.get("revision"),
+                base_revision=serializer.validated_data.get("base_revision"),
             )
         except DraftConflictError as error:
             return Response(

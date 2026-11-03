@@ -141,9 +141,11 @@ export default function Docs() {
         </li>
         <li>
           When the paid model lane is up, a Muse chat bubble answers
-          app-how-to questions and every turn spends credits. It has no
-          access to company data; abuse attempts are refused free and
-          flagged for the administrator.
+          app-how-to questions and every turn spends credits. On the
+          upload screen it can also see your pending import preview to
+          propose mapping fixes; other companies&apos; data stays out of
+          reach. Abuse attempts are refused free and flagged for the
+          administrator.
         </li>
         <li>
           Organization owners can download every company row and file, or

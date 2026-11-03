@@ -28,6 +28,8 @@ interface Bubble extends AssistantTurn {
 interface PendingProposal {
   bubbleKey: number;
   proposal: PreviewAssistProposal;
+  /** Draft revision the proposal was computed against. */
+  baseRevision: number;
   /** Checked operation cards, by index into proposal.operations. */
   selected: boolean[];
 }
@@ -187,6 +189,7 @@ export function AssistantWidget() {
       setPending({
         bubbleKey: bubble.key,
         proposal: answer.proposal,
+        baseRevision: answer.base_revision,
         selected: (answer.proposal.operations ?? []).map(() => true),
       });
     } else {
@@ -240,7 +243,9 @@ export function AssistantWidget() {
     } catch (err) {
       if (retryRef.current) {
         // The first attempt may have dispatched: retry reuses its key,
-        // so recovery can never pay for a second call.
+        // so a completed result replays without a second charge. If
+        // the attempt failed instead, the retry is a new call that
+        // may spend again.
         setCanRetry(true);
       } else {
         setDraft(text);
@@ -285,6 +290,15 @@ export function AssistantWidget() {
       );
       return;
     }
+    if (pending.baseRevision !== revision) {
+      // The draft moved since this proposal was computed (e.g. a manual
+      // correction): applying it could supersede confirmed decisions.
+      // The server enforces the same check; stop here with guidance.
+      setError(
+        `This proposal was made for revision ${pending.baseRevision}, but the draft is now at revision ${revision}. Ask the assistant again so the proposal is recomputed.`,
+      );
+      return;
+    }
     const operations = (pending.proposal.operations ?? []).filter(
       (_, index) => pending.selected[index] !== false,
     );
@@ -297,6 +311,7 @@ export function AssistantWidget() {
         drop_lines: pending.proposal.drop_lines,
         operations,
         revision,
+        base_revision: pending.baseRevision,
       });
       const parts: string[] = [];
       const names = Object.keys(result.applied.set_constants);
@@ -323,12 +338,10 @@ export function AssistantWidget() {
       );
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
-        // Another tab changed the draft: the page already shows the
-        // newest preview, so keep the proposal and let the user
-        // review the rules panel, adjust the selection, and retry.
-        setError(
-          `${err.message} Review the rules on this page, then apply again or discard.`,
-        );
+        // The draft moved since this proposal was computed. The
+        // server message already says to ask again; keep the stale
+        // proposal visible for reference but do not resend it.
+        setError(err.message);
       } else {
         setError(
           err instanceof ApiError ? err.message : "Could not apply the proposal.",

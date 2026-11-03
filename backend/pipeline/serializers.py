@@ -440,6 +440,7 @@ class PreviewAssistApplySerializer(serializers.Serializer):
         child=serializers.DictField(), required=False, default=list
     )
     revision = serializers.IntegerField(min_value=1, required=False)
+    base_revision = serializers.IntegerField(min_value=1, required=False)
 
     def validate(self, attrs):
         unknown = set(self.initial_data or {}) - {
@@ -447,6 +448,7 @@ class PreviewAssistApplySerializer(serializers.Serializer):
             "drop_lines",
             "operations",
             "revision",
+            "base_revision",
         }
         if unknown:
             raise serializers.ValidationError(

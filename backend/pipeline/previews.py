@@ -1362,16 +1362,24 @@ class AssistInFlight(Exception):
 
 # A pending attempt older than this is presumed dead (the process
 # died mid-call): a retry reclaims the key for a new attempt. The
-# old attempt's spend stays under the reservation lifecycle — the
-# retry is an explicit new attempt, never a silent double charge.
+# abandoned attempt's uncertain spend stays booked under the
+# reservation lifecycle, and the retry is an explicit new attempt
+# that may spend again — only completed-result replay avoids a
+# second charge.
 IDEMPOTENCY_RECLAIM_SECONDS = 600
 
 _IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
-def _assist_request_hash(preview_key: str, turns: list) -> str:
+def _assist_request_hash(preview_key: str, turns: list, base_revision) -> str:
+    # The draft revision is part of the request identity: the same
+    # conversation against a changed draft is a different request, so
+    # a reconnect replay can never serve a proposal computed against
+    # older confirmed rules.
     payload = json.dumps(
-        [preview_key, turns], sort_keys=True, separators=(",", ":")
+        [preview_key, turns, base_revision],
+        sort_keys=True,
+        separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -1440,11 +1448,14 @@ def _claim_assist_key(
 class DraftConflictError(Exception):
     """The writer's draft revision is stale; reload before retrying."""
 
-    def __init__(self, revision_actual: int, revision_expected):
+    def __init__(self, revision_actual: int, revision_expected, detail=None):
         super().__init__(
-            f"Draft is at revision {revision_actual}; request targeted "
-            f"{revision_expected}. Reload the preview and review the "
-            "latest rules before retrying."
+            detail
+            or (
+                f"Draft is at revision {revision_actual}; request targeted "
+                f"{revision_expected}. Reload the preview and review the "
+                "latest rules before retrying."
+            )
         )
         self.revision_actual = revision_actual
         self.revision_expected = revision_expected
@@ -1675,12 +1686,14 @@ def assist_preview(
     drops. Every proposed value and line number is validated here; the
     proposal applies only through apply_preview_assist after the user
     confirms it in the chat. With idempotency_key, a retry after a
-    dropped connection replays the stored result instead of paying
-    for a second call, and a still-running attempt answers 409.
+    dropped connection replays the completed result instead of paying
+    for a second call, and a still-running attempt answers 409. A
+    retry after a failed or reclaimed attempt is an explicit new
+    call that may spend again.
     """
     from common.provider import ProviderNotConfigured, get_provider
     from organizations.models import UserPreference
-    from pipeline.assistant_guard import inspect_question
+    from pipeline.assistant_guard import PREVIEW, inspect_question
     from pipeline.models import AssistantFlag
 
     meta = _load_preview(key)
@@ -1690,7 +1703,7 @@ def assist_preview(
         user=user, assistant_banned=True
     ).exists():
         raise PermissionDenied("Assistant access is disabled for your account.")
-    reason = inspect_question(turns[-1]["content"])
+    reason = inspect_question(turns[-1]["content"], scope=PREVIEW)
     if reason is not None:
         AssistantFlag.objects.create(
             organization=organization,
@@ -1703,13 +1716,14 @@ def assist_preview(
     provider = get_provider(organization_id=organization.id)
     if provider.is_simulated:
         raise ProviderNotConfigured("The assistant needs the paid model.")
+    base_revision = meta.get("revision", 1)
     record = None
     if idempotency_key is not None:
         record = _claim_assist_key(
             organization=organization,
             user=user,
             preview_key=key,
-            request_hash=_assist_request_hash(key, turns),
+            request_hash=_assist_request_hash(key, turns, base_revision),
             idempotency_key=idempotency_key,
         )
         if record.state == "done":
@@ -1806,6 +1820,7 @@ def assist_preview(
             "dropped_previews": _dropped_previews(content, drops),
             "operations": operations,
         },
+        "base_revision": base_revision,
         "context_coverage": context_coverage,
         "tokens": usage.get("total_tokens", 0),
         "replayed": False,
@@ -1855,7 +1870,14 @@ def _draft_block(meta: dict, *, lines, records, unresolved, sections) -> dict:
 
 
 def apply_preview_assist(
-    *, key: str, user, set_constants, drop_lines, operations=None, revision=None
+    *,
+    key: str,
+    user,
+    set_constants,
+    drop_lines,
+    operations=None,
+    revision=None,
+    base_revision=None,
 ) -> dict:
     """Apply user-confirmed operations to the preview draft.
 
@@ -1863,7 +1885,10 @@ def apply_preview_assist(
     validates everything. The original bytes are never rewritten:
     exclusions are recorded rules and headers/detection stay as first
     read. Every change bumps the revision; a stale writer gets a
-    DraftConflictError instead of silently overwriting.
+    DraftConflictError instead of silently overwriting. When the
+    caller passes the proposal's base_revision, it must still match
+    the draft: a proposal computed before newer confirmed decisions
+    cannot silently supersede them.
     """
     with _preview_lock(key):
         from pipeline.draft import (
@@ -1877,6 +1902,18 @@ def apply_preview_assist(
         meta = _ensure_draft(_load_preview(key))
         organization = authorize_organization_access(user, meta["organization_id"])
         require_organization_role(user, meta["organization_id"])
+        current = meta.get("revision", 1)
+        if base_revision is not None and base_revision != current:
+            raise DraftConflictError(
+                current,
+                base_revision,
+                detail=(
+                    f"This proposal was made for draft revision "
+                    f"{base_revision}, but the draft is now at revision "
+                    f"{current}. Ask the assistant again so the proposal "
+                    "is recomputed against the latest confirmed rules."
+                ),
+            )
         try:
             content = _adapter().read_bytes(f"previews/{key}.bin")
         except FileNotFoundError:

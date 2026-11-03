@@ -215,6 +215,89 @@ class PreviewAssistTests(TestCase):
             AssistantFlag.objects.filter(organization=self.org_a).count(), 1
         )
 
+    def test_assist_accepts_domain_phrasing_without_flag(self):
+        AIProviderConfig.objects.create(model="admin-model")
+        key = self._paste(self.alice, self.org_a, PASTE).data["key"]
+
+        def _fake(payload, on_chunk=None):
+            on_chunk(1, 1, 30, 12)
+            return self._envelope()
+
+        messages = [
+            "Select the price from the final number on each product line.",
+            "Drop all header lines from this draft, keeping every product.",
+            "Show me another example of a price in this preview.",
+        ]
+        with self._paid_env(), mock.patch.object(
+            MetaProvider, "assist_preview", side_effect=_fake
+        ) as mocked:
+            for message in messages:
+                response = self._assist(key, message)
+                self.assertEqual(response.status_code, 200, response.content)
+                self.assertIn("proposal", response.json())
+        self.assertEqual(mocked.call_count, 3)
+        self.assertFalse(
+            AssistantFlag.objects.filter(organization=self.org_a).exists()
+        )
+
+    def test_apply_rejects_proposal_computed_before_manual_edit(self):
+        AIProviderConfig.objects.create(model="admin-model")
+        key = self._paste(self.alice, self.org_a, PASTE).data["key"]
+
+        def _fake(payload, on_chunk=None):
+            on_chunk(1, 1, 30, 12)
+            return self._envelope()
+
+        with self._paid_env(), mock.patch.object(
+            MetaProvider, "assist_preview", side_effect=_fake
+        ):
+            answer = self._assist(
+                key, "Set the supplier and drop the footer."
+            )
+        self.assertEqual(answer.status_code, 200, answer.content)
+        body = answer.json()
+        self.assertEqual(body["base_revision"], 1)
+        # A manual correction moves the draft to revision 2.
+        manual = self._apply(
+            key, set_constants={"supplier": "Manual Co"}, drop_lines=[]
+        )
+        self.assertEqual(manual.status_code, 200, manual.content)
+        # Applying the rev-1 proposal against rev 2 must fail even
+        # though the caller names the current revision: the proposal
+        # predates the confirmed manual decision.
+        proposal = body["proposal"]
+        stale = self._apply(
+            key,
+            set_constants=proposal["set_constants"],
+            drop_lines=proposal["drop_lines"],
+            operations=proposal["operations"],
+            revision=2,
+            base_revision=body["base_revision"],
+        )
+        self.assertEqual(stale.status_code, 409, stale.content)
+        self.assertIn("recomputed", stale.json()["detail"])
+        draft = self.client.get(f"/api/pipeline/previews/{key}/").data[
+            "draft"
+        ]
+        self.assertEqual(draft["revision"], 2)
+        suppliers = [
+            rule["value"]
+            for rule in draft["rules"]
+            if rule.get("field") == "supplier"
+        ]
+        self.assertEqual(suppliers, ["Manual Co"])
+        # Re-asking the same question at revision 2 dispatches fresh
+        # work bound to the new revision instead of replaying rev-1
+        # thinking.
+        with self._paid_env(), mock.patch.object(
+            MetaProvider, "assist_preview", side_effect=_fake
+        ) as mocked:
+            fresh = self._assist(
+                key, "Set the supplier and drop the footer."
+            )
+        self.assertEqual(fresh.json()["base_revision"], 2)
+        mocked.assert_called_once()
+
     def test_assist_rejects_bad_proposal_with_hint_and_spend(self):
         AIProviderConfig.objects.create(model="admin-model")
         key = self._paste(self.alice, self.org_a, PASTE).data["key"]
@@ -566,18 +649,49 @@ class AssistIdempotencyTests(PreviewAssistTests):
         )
         self.assertEqual(UsageEvent.objects.count(), 1)
 
+    def test_same_key_after_draft_change_is_not_replayed(self):
+        AIProviderConfig.objects.create(model="admin-model")
+        preview = self._paste(self.alice, self.org_a, PASTE).data["key"]
+
+        def _fake(payload, on_chunk=None):
+            on_chunk(1, 1, 30, 12)
+            return self._envelope()
+
+        with self._paid_env(), mock.patch.object(
+            MetaProvider, "assist_preview", side_effect=_fake
+        ) as mocked:
+            first = self._assist_keyed(preview, "Set the supplier.", "k-rev")
+        self.assertEqual(first.status_code, 200, first.content)
+        self.assertEqual(first.json()["base_revision"], 1)
+        manual = self._apply(
+            preview, set_constants={"supplier": "Manual Co"}, drop_lines=[]
+        )
+        self.assertEqual(manual.status_code, 200, manual.content)
+        # Same key, same words, changed draft: the stored rev-1 answer
+        # must not replay as if it were computed against rev 2.
+        with self._paid_env(), mock.patch.object(
+            MetaProvider, "assist_preview", side_effect=_fake
+        ) as mocked:
+            again = self._assist_keyed(preview, "Set the supplier.", "k-rev")
+        self.assertEqual(again.status_code, 400, again.content)
+        self.assertIn("different request", again.json()["detail"])
+        mocked.assert_not_called()
+
     def test_in_flight_key_conflicts_without_dispatch(self):
         from pipeline.previews import _assist_request_hash
 
         AIProviderConfig.objects.create(model="admin-model")
         preview = self._paste(self.alice, self.org_a, PASTE).data["key"]
         turns = [{"role": "user", "content": "Set the supplier."}]
+        revision = self.client.get(
+            f"/api/pipeline/previews/{preview}/"
+        ).data["draft"]["revision"]
         AssistIdempotency.objects.create(
             organization=self.org_a,
             key="k-live",
             user=self.alice,
             preview_key=preview,
-            request_hash=_assist_request_hash(preview, turns),
+            request_hash=_assist_request_hash(preview, turns, revision),
             state="pending",
         )
 
@@ -604,12 +718,15 @@ class AssistIdempotencyTests(PreviewAssistTests):
         AIProviderConfig.objects.create(model="admin-model")
         preview = self._paste(self.alice, self.org_a, PASTE).data["key"]
         turns = [{"role": "user", "content": "Set the supplier."}]
+        revision = self.client.get(
+            f"/api/pipeline/previews/{preview}/"
+        ).data["draft"]["revision"]
         row = AssistIdempotency.objects.create(
             organization=self.org_a,
             key="k-stale",
             user=self.alice,
             preview_key=preview,
-            request_hash=_assist_request_hash(preview, turns),
+            request_hash=_assist_request_hash(preview, turns, revision),
             state="pending",
         )
         AssistIdempotency.objects.filter(pk=row.pk).update(

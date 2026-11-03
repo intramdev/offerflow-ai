@@ -88,9 +88,9 @@ export default function Demo() {
         </li>
         <li>Row 3 is excluded with the reason “locked device”, listed openly.</li>
         <li>
-          Row 4 pauses: the missing price is never guessed. The reviewer
-          supplies it, lets the model try to read it (paid lane), or drops
-          the row from the quote.
+          Row 4 pauses: the missing price is not invented. The reviewer
+          supplies it, lets the model try to read it from the source
+          (paid lane), or drops the row from the quote.
         </li>
       </ul>
 

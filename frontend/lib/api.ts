@@ -772,6 +772,7 @@ export interface PreviewAssistCoverage {
 export interface PreviewAssistReply {
   message: string;
   proposal: PreviewAssistProposal;
+  base_revision: number;
   context_coverage?: PreviewAssistCoverage;
   tokens: number;
   retriable?: boolean;
@@ -787,8 +788,10 @@ export async function assistPreview(
 ): Promise<PreviewAssistReply> {
   // Bounded client deadline, above the 60s provider timeout plus proxy
   // and validation margin: a hung connection becomes a retryable
-  // error, and the retry reuses the idempotency key to recover the
-  // completed result instead of paying twice.
+  // error, and the retry reuses the idempotency key. When the first
+  // attempt completed, the retry replays its stored result without a
+  // second charge; after a failed or expired attempt the retry is an
+  // explicit new call that may spend again.
   try {
     return await api<PreviewAssistReply>(`/api/pipeline/previews/${key}/assist/`, {
       method: "POST",
@@ -820,6 +823,7 @@ export async function applyPreviewAssist(
     drop_lines: number[];
     operations?: AssistOperation[];
     revision?: number | null;
+    base_revision?: number | null;
   },
 ): Promise<PreviewAssistApplied> {
   return api<PreviewAssistApplied>(

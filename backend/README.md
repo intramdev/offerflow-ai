@@ -382,16 +382,21 @@ Run the steps in order, from the repository root, with the stack up:
    docker compose restart backend worker
    ```
 3. Apply any pending migrations on the admin connection BEFORE
-   provisioning, so verification sees the final schema (notably
-   `pipeline/0029_memory_supplier_scope`, which scopes mapping memory
-   per supplier; without it a second supplier's write is skipped with
-   a warning instead of stored):
+   provisioning, so verification sees the final schema — notably
+   `pipeline/0029_memory_supplier_scope` (mapping memory per
+   supplier; without it a second supplier's write is skipped with a
+   warning instead of stored) and `pipeline/0030_assistidempotency`
+   (keyed chat results; without it the keyed assist endpoint fails
+   with `relation pipeline_assistidempotency does not exist`):
    ```sh
    docker compose exec -T backend python manage.py migrate --database=admin
    docker compose exec -T backend python manage.py showmigrations --database=admin | grep '\[ \]'
    ```
    The second command must print nothing (no `[ ]` unapplied entries).
    Rollback for this step alone: `migrate pipeline 0028 --database=admin`.
+   Before restarting anything below, confirm no import run is still
+   processing (Runs page) and no provider call is in flight, so the
+   restart cannot strand a Celery task mid-call.
 4. Provision the restricted role (replace `RUNTIME_PASSWORD` with a fresh
    URL-safe secret, e.g. from `openssl rand -base64 18 | tr -dc A-Za-z0-9`):
    ```sh

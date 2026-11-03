@@ -95,7 +95,8 @@ for it.
 - **Help center** — the in-app Help item documents every screen.
 - **Quote line editing** — rewrite any ready quote's customer-facing
   product text or hide whole lines; labels apply to files and the
-  Telegram message while prices and sources stay frozen.
+  generated message text (copy-paste for Telegram) while prices and
+  sources stay frozen. There is no live Telegram bot or connector.
 - **Quote export template** — per-company settings choose the XLSX/CSV
   columns, the message rows' details, and a custom header and footer.
   Supplier names stay out of customer outputs unless opted back in.
@@ -207,10 +208,12 @@ accepted still reconcile honestly.
 
 - Backend: `OFFERFLOW_DB_ENGINE=sqlite OFFERFLOW_PROVIDER=fixture
   ./backend/.venv/bin/python backend/manage.py test pipeline
-  organizations common` — 829 tests, all pass, 2 skipped (pre-existing
-  skips). Covers the conversational import draft, revision/CAS
-  concurrency, spending reservations, preview/assist/quote flows, and
-  generalization layouts with mocked inference.
+  organizations common` — 840 discovered, 814 executed, all pass,
+  2 skipped (pre-existing skips). Discovery and execution counts are
+  reported separately and never interchanged. Covers the
+  conversational import draft, revision/CAS concurrency, spending
+  reservations, preview/assist/quote flows, and generalization
+  layouts with mocked inference.
 - Tenant isolation: 22 PostgreSQL tests pass against a disposable
   server under the actual restricted runtime role (`iso_app`, no
   superuser, no bypass). See the runbook for the disposable-server
@@ -225,6 +228,28 @@ accepted still reconcile honestly.
   contracts and failure paths; they say nothing about model accuracy.
   See `backend/LIVE_EVAL_PLAN.md` for the bounded plan awaiting owner
   authorization.
+
+## Capability evidence
+
+What is implemented, how it was verified, and what remains future
+work. Every demo claim links to the test or output behind it.
+
+| Capability | Status | Evidence |
+|---|---|---|
+| Spreadsheet / paste-text import → preview → clarify → approve → export | Implemented; live-stack re-verification pending | Isolated backend suite (SQLite, mocked inference); live Docker checks await the schema/role switch |
+| Typed conversational rules, price-only policy, revision binding, refresh resume | Implemented, mocked verification only | `test_preview_assist.py`, `test_generalization.py` (row-10 sheets, sectioned messages, held-out layouts); model accuracy not evaluated |
+| Tenant isolation under a restricted runtime role | Implemented in code; live switch pending | 22-test disposable-PostgreSQL suite; the running stack still connects as superuser |
+| Spending reservations, concurrency, idempotency, kill switches | Implemented, mocked verification only | 10/10 mocked concurrency scenarios; real provider billing accuracy not established |
+| Real-Meta end-to-end evaluation | **NOT RUN** | `backend/LIVE_EVAL_PLAN.md` awaits execution; earlier exploratory chat calls certified no export path |
+| Autonomous orchestration | Not implemented (future work) | The delivered system is AI-assisted with mandatory human review; no step-selecting controller exists |
+| Image / PDF visual understanding | Not implemented (future work) | Accepted containers are parsed as text and structure; there is no vision path |
+| Live Telegram / WhatsApp / commerce connectors | Not implemented (future work) | Message text and files are generated for manual sending; no live connections exist |
+
+OfferFlow AI is the submitted prototype: new hackathon work in this
+repository, not a pre-event commercial product. Anything above marked
+future work is also described that way in the demo and submission —
+the original proposal's broader ambitions (visual inputs, autonomous
+long-running workflow) are acknowledged gaps, not delivered claims.
 
 ## Development and data
 

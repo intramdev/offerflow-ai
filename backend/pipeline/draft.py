@@ -19,6 +19,7 @@ from decimal import Decimal
 
 from pipeline.normalize import (
     parse_capacity,
+    parse_currency,
     parse_price,
     parse_quantity,
 )
@@ -57,6 +58,7 @@ OP_KINDS = frozenset(
         "absent",
         "policy",
         "drop_rule",
+        "field_split",
     }
 )
 
@@ -64,8 +66,25 @@ MAX_OPERATIONS = 50
 MAX_JOIN_LINES = 20
 MAX_RULES = 200
 
+#: Separators a field_split rule may use: the four delimited shapes
+#: the intake can read. Anything else stays a single message line.
+SPLIT_SEPARATORS = (";", ",", "\t", "|")
+
+#: A split pattern names between two and eight field positions.
+SPLIT_MIN_FIELDS = 2
+SPLIT_MAX_FIELDS = 8
+
 _NUMBER_TOKEN_RE = re.compile(r"\d[\d.,]*")
 _RECORD_RE = re.compile(r"^L(\d+)(?:-L(\d+))?$")
+
+#: Currency mentions inside one split cell: a 3-letter code, US$, or an
+#: unambiguous symbol. More than one distinct mention refuses the cell.
+_SPLIT_CURRENCY_RE = re.compile(r"US\$|[$€£]|[Kk][čČ]|\b[A-Za-z]{3}\b")
+
+#: Trailing unit words a split quantity cell may carry ("12 pcs").
+_SPLIT_QTY_UNIT_RE = re.compile(
+    r"^(.*?)\s*(pc|pcs|units?|pieces?)$", re.IGNORECASE
+)
 
 
 class DraftError(Exception):
@@ -177,6 +196,82 @@ def _joins_of(rules: list) -> list:
     return [rule for rule in rules if rule["kind"] == "join_lines"]
 
 
+def _split_with_spans(line: str, separator: str) -> list:
+    """Split one line, keeping each cell's exact character span."""
+    parts = []
+    start = 0
+    for chunk in line.split(separator):
+        parts.append((chunk, start, start + len(chunk)))
+        start += len(chunk) + len(separator)
+    return parts
+
+
+def _split_price_cell(cell: str):
+    """Read (amount, currency) from one split price cell.
+
+    Returns (amount_str, currency_or_None), or None when the cell is
+    blank, ambiguous, or unreadable. A bare number takes no currency;
+    one currency mention rides along; two mentions refuse the cell
+    instead of guessing which one prices the product.
+    """
+    text = (cell or "").strip()
+    if not text:
+        return None
+    mentions = _SPLIT_CURRENCY_RE.findall(text)
+    if not mentions:
+        amount = parse_price(text)
+        return (str(amount), None) if amount is not None else None
+    if len(mentions) > 1:
+        return None
+    currency = parse_currency(mentions[0])
+    if currency is None:
+        return None
+    remainder = _SPLIT_CURRENCY_RE.sub("", text, count=1).strip()
+    amount = parse_price(remainder)
+    if amount is None:
+        return None
+    return str(amount), currency
+
+
+def _split_quantity_cell(cell: str):
+    """Read a stock count from one split quantity cell.
+
+    A bare whole number, optionally trailed by a unit word
+    ("12 pcs"). Anything else stays unknown for the reviewer.
+    """
+    text = (cell or "").strip()
+    if not text:
+        return None
+    match = _SPLIT_QTY_UNIT_RE.match(text)
+    number = match.group(1).strip() if match else text
+    if not number:
+        return None
+    return parse_quantity(number)
+
+
+def _split_field_value(field: str, cell: str):
+    """Parse one split position; returns (value, currency) or None.
+
+    The currency element is only ever set for price cells that name
+    their own currency ("289 EUR"); every other field yields None.
+    """
+    if field == "price":
+        return _split_price_cell(cell)
+    if field == "quantity":
+        parsed = _split_quantity_cell(cell)
+        return (parsed, None) if parsed is not None else None
+    if field == "capacity":
+        parsed = parse_capacity((cell or "").strip())
+        return (parsed, None) if parsed is not None else None
+    if field == "currency":
+        parsed = parse_currency((cell or "").strip())
+        return (parsed, None) if parsed is not None else None
+    text = (cell or "").strip()
+    if not text:
+        return None
+    return text[:255], None
+
+
 def derive_records(texts: list, rules: list) -> tuple[list, list, list]:
     """Derive candidate records, unresolved issues, and sections.
 
@@ -219,6 +314,7 @@ def derive_records(texts: list, rules: list) -> tuple[list, list, list]:
         if rule["kind"] == "section_value":
             sectioned.setdefault(rule["header_line"], {})[rule["field"]] = rule
     terminals = [rule for rule in rules if rule["kind"] == "terminal_price"]
+    splits = [rule for rule in rules if rule["kind"] == "field_split"]
     records = []
     seen: set = set()
     for lineno, text in enumerate(texts, start=1):
@@ -262,15 +358,57 @@ def derive_records(texts: list, rules: list) -> tuple[list, list, list]:
                     "by": f"section L{section}",
                     "rule": rule.get("id"),
                 }
+            fields[field] = entry
+        # Confirmed split positions apply next: only single-line
+        # records whose width matches the pattern, only compatible
+        # cells, and an explicit currency position always wins over
+        # a currency riding inside a price cell. Corrections apply
+        # after the split, so a per-record fix can repair one
+        # exceptional line without changing the pattern.
+        for rule in splits:
+            scoped = rule.get("lines")
+            if scoped is not None and lineno not in scoped:
+                continue
+            if len(spans) != 1:
+                continue
+            parts = _split_with_spans(texts[lineno - 1], rule["separator"])
+            if len(parts) != len(rule["fields"]):
+                continue
+            embedded_currency = None
+            for position, field in enumerate(rule["fields"]):
+                parsed = _split_field_value(field, parts[position][0])
+                if parsed is None:
+                    continue
+                value, extra = parsed
+                if field == "price" and extra is not None:
+                    embedded_currency = (extra, parts[position][1:])
+                fields[field] = {
+                    "value": value,
+                    "state": "derived",
+                    "by": f"split L{lineno}",
+                    "rule": rule.get("id"),
+                    "span": list(parts[position][1:]),
+                    "line": lineno,
+                }
+            if embedded_currency is not None and fields["currency"]["state"] == "unknown":
+                extra, span = embedded_currency
+                fields["currency"] = {
+                    "value": extra,
+                    "state": "derived",
+                    "by": f"split L{lineno}",
+                    "rule": rule.get("id"),
+                    "span": list(span),
+                    "line": lineno,
+                }
+        for field in sorted(RULE_VALUE_FIELDS):
             override = corrects.get(record_id, {}).get(field)
             if override is not None:
-                entry = {
+                fields[field] = {
                     "value": override["value"],
                     "state": "user_confirmed",
                     "by": "correction",
                     "rule": override.get("id"),
                 }
-            fields[field] = entry
         # Terminal derivation is part of the resolved record, not a
         # second view: the candidate table, unresolved counts, samples,
         # worker snapshot, and export validation all read these fields.
@@ -321,9 +459,19 @@ def derive_records(texts: list, rules: list) -> tuple[list, list, list]:
 def _unresolved(records: list, rules: list) -> list:
     issues = []
     known = {rule["field"] for rule in rules if rule["kind"] == "global"}
-    if "supplier" not in known and not any(
-        rule["kind"] == "section_value" and rule["field"] == "supplier"
+    split_fields = {
+        field
         for rule in rules
+        if rule["kind"] == "field_split"
+        for field in rule.get("fields") or []
+    }
+    if (
+        "supplier" not in known
+        and "supplier" not in split_fields
+        and not any(
+            rule["kind"] == "section_value" and rule["field"] == "supplier"
+            for rule in rules
+        )
     ):
         issues.append(
             {
@@ -332,11 +480,23 @@ def _unresolved(records: list, rules: list) -> list:
                 "reason": "No supplier confirmed for this document.",
             }
         )
-    if "currency" not in known and not any(
-        rule["kind"] in ("section_value", "terminal_price")
-        and rule.get("currency", rule.get("value"))
-        for rule in rules
-    ):
+    currency_known = (
+        "currency" in known
+        or "currency" in split_fields
+        or any(
+            rule["kind"] in ("section_value", "terminal_price")
+            and rule.get("currency", rule.get("value"))
+            for rule in rules
+        )
+        or (
+            bool(records)
+            and all(
+                record["fields"]["currency"]["state"] != "unknown"
+                for record in records
+            )
+        )
+    )
+    if not currency_known:
         issues.append(
             {
                 "scope": "document",
@@ -513,6 +673,36 @@ def _validate_one(op: dict, *, texts, rules, policy: str) -> dict | None:
         if not any(rule.get("id") == target for rule in rules):
             raise DraftError(f"Rule {target} is not on this draft.")
         return {"kind": "drop_rule", "rule": target}
+    if kind == "field_split":
+        _check_op_fields(op, {"separator", "fields", "lines"}, kind)
+        separator = op.get("separator")
+        if separator not in SPLIT_SEPARATORS:
+            raise DraftError(
+                f"Separator must be one of {', '.join(repr(s) for s in SPLIT_SEPARATORS)}."
+            )
+        fields = op.get("fields")
+        if (
+            not isinstance(fields, list)
+            or not (SPLIT_MIN_FIELDS <= len(fields) <= SPLIT_MAX_FIELDS)
+            or any(field not in RULE_VALUE_FIELDS for field in fields)
+        ):
+            raise DraftError(
+                "fields must list two to eight known field names in "
+                "position order."
+            )
+        if len(set(fields)) != len(fields):
+            raise DraftError("fields must not repeat a field.")
+        scoped = op.get("lines")
+        if scoped is None or scoped == []:
+            scoped = None
+        else:
+            scoped = _line_numbers(scoped, line_count=line_count, name="lines")
+        return {
+            "kind": "field_split",
+            "separator": separator,
+            "fields": list(fields),
+            "lines": scoped,
+        }
     raise DraftError(f"Unsupported operation {kind!r}.")
 
 
@@ -602,6 +792,10 @@ def _replaces(new: dict, old: dict) -> bool:
         return new.get("scope") == old.get("scope")
     if new["kind"] == "correct":
         return new["record"] == old["record"] and new["field"] == old["field"]
+    if new["kind"] == "field_split":
+        return (new.get("lines") is None) == (old.get("lines") is None) and (
+            new.get("lines") is None or new["lines"] == old["lines"]
+        )
     return False
 
 

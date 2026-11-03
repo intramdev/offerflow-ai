@@ -102,7 +102,11 @@ export default function HelpPage() {
           proposed change as a card, and apply the ones you agree with.
           Applied rules are listed in the rules panel with a revision
           number, survive refreshes, and shape the import exactly as
-          previewed. Price lists without stock use the price-only policy:
+          previewed. Lines with separators but no headers (for example
+          “Model;Capacity;Grade;Price;Quantity”) are read as message
+          lines too: tell the chat what each position means and confirm
+          the split it proposes — positions are never guessed. Price
+          lists without stock use the price-only policy:
           quantities stay unknown instead of being invented. If you
           leave the page or refresh, unconfirmed previews wait under{" "}
           <strong>Resume a pending import</strong> on the Upload page —

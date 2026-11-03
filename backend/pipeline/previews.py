@@ -686,8 +686,11 @@ def create_preview_from_text(*, organization, user, text: str) -> dict:
     """Preview pasted text as if it were an uploaded .txt file.
 
     Tabular pastes flow through the normal mapping UI; headerless
-    single-column pastes become message rows (one per line) that the
-    interpretation lane reads, flagged message_lines for the UI.
+    pastes become message rows (one per source line, exact text kept)
+    that the interpretation lane reads, flagged message_lines for
+    the UI. Delimited lines without headers are read as message
+    lines too — the assistant clarifies what each position means
+    before anything is mapped.
     """
     content = (text or "").encode("utf-8")
     if not content.strip():

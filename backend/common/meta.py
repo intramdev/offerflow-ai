@@ -317,11 +317,18 @@ ASSIST_PREVIEW_SYSTEM_PROMPT = (
     "meaning), join_lines (numbered lines forming one multi-line "
     "product record), correct (fix one field of one candidate record "
     "by its record id), absent (declare quantity or capacity absent "
-    "document-wide), and policy (propose the stock or price_only "
+    "document-wide), policy (propose the stock or price_only "
     "quantity policy for this preview; absent quantity needs price_only "
-    "first). Never propose dropping section headers that state "
+    "first), and field_split (product lines that share one separator "
+    "with the same positions in every line: name the separator and "
+    "the field of each position in order, e.g. model, capacity, "
+    "grade, price, quantity; lines lists the covered line numbers, "
+    "or an empty list for the whole document). Never propose dropping section headers that state "
     "values for the lines beneath them: confirm them with section_value "
-    "instead. Propose terminal_price only for lines whose final number "
+    "instead. Propose field_split only after the user confirms what "
+    "each position means; when positions are uncertain, quote the "
+    "exact candidate cells and ask one focused question instead of "
+    "guessing. Propose terminal_price only for lines whose final number "
     "is separated from the text before it; a number glued to letters "
     "or a storage unit is never a terminal price. Propose policy "
     "price_only only when the user confirms quantities are absent; "
@@ -367,6 +374,7 @@ def _fold_assist_operations(parsed: dict) -> list:
         "join_lines",
         "correct",
         "absent",
+        "field_split",
     ):
         if not isinstance(parsed.get(key, []), list):
             raise ProposalUnusable("Assist returned an unusable envelope.")
@@ -461,6 +469,24 @@ def _fold_assist_operations(parsed: dict) -> list:
         ):
             raise ProposalUnusable("Assist returned an unusable envelope.")
         operations.append({"op": "absent", "field": entry["field"]})
+    for entry in parsed.get("field_split", []):
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("separator"), str)
+            or not isinstance(entry.get("fields"), list)
+            or not all(isinstance(name, str) for name in entry["fields"])
+            or not isinstance(entry.get("lines"), list)
+            or not all(_is_line_number(n) for n in entry["lines"])
+        ):
+            raise ProposalUnusable("Assist returned an unusable envelope.")
+        operations.append(
+            {
+                "op": "field_split",
+                "separator": entry["separator"],
+                "fields": entry["fields"],
+                "lines": entry["lines"],
+            }
+        )
     return operations
 
 
@@ -553,6 +579,21 @@ ASSIST_PREVIEW_RESPONSE_SCHEMA = {
                 {"policy": {"type": "string"}}, ["policy"]
             ),
         },
+        "field_split": {
+            "type": "array",
+            "items": _assist_object(
+                {
+                    "separator": {"type": "string"},
+                    "fields": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "lines": {
+                        "type": "array", "items": {"type": "integer"},
+                    },
+                },
+                ["separator", "fields", "lines"],
+            ),
+        },
     },
     "required": [
         "message",
@@ -566,6 +607,7 @@ ASSIST_PREVIEW_RESPONSE_SCHEMA = {
         "correct",
         "absent",
         "policy",
+        "field_split",
     ],
     "additionalProperties": False,
 }

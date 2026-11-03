@@ -280,10 +280,16 @@ class ParsingTests(SimpleTestCase):
         self.assertEqual(sheet.rows[0].provenance["row"], 1)
         self.assertEqual(sheet.rows[1].provenance["row"], 3)
 
-    def test_message_fallback_rejects_multicolumn_text(self):
+    def test_message_fallback_reads_multicolumn_lines(self):
         content = b"a,b\n1,2\n"
+        sheet = parse_named(content, "paste.txt", message_fallback=True)
+        self.assertEqual(sheet.headers, ["message"])
+        self.assertEqual(sheet.rows[0].data["message"], "a,b")
+        self.assertEqual(sheet.rows[1].data["message"], "1,2")
+
+    def test_message_fallback_rejects_blank_text(self):
         with self.assertRaises(UnsupportedFile):
-            parse_named(content, "paste.txt", message_fallback=True)
+            parse_named(b"\n  \n", "paste.txt", message_fallback=True)
 
     def test_message_fallback_off_keeps_hard_error(self):
         content = b"iPhone 15 128GB Black 450\n"

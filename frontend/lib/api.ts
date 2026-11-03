@@ -584,6 +584,8 @@ export interface DraftRule {
   policy?: string;
   rule?: string;
   reason?: string;
+  separator?: string;
+  fields?: string[];
 }
 
 export interface DraftIssue {

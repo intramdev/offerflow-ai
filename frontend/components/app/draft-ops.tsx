@@ -93,6 +93,19 @@ export function summarizeOperation(op: AssistOperation): OpSummary {
         title: `Remove rule ${text(op.rule)}`,
         detail: null,
       };
+    case "field_split": {
+      const fields = Array.isArray(op.fields)
+        ? op.fields.map((f) => text(f)).join(" · ")
+        : "—";
+      const sep = op.separator === "\t" ? "tab" : text(op.separator);
+      return {
+        title: `Split on “${sep}”: ${fields}`,
+        detail:
+          Array.isArray(op.lines) && op.lines.length > 0
+            ? `Only ${linesLabel(op.lines)}.`
+            : "Whole document; lines with a different width stay unresolved.",
+      };
+    }
     default:
       return { title: `Unknown operation ${text(op.op)}`, detail: null };
   }
@@ -150,6 +163,19 @@ export function summarizeRule(rule: DraftRule): OpSummary {
         title: `${text(rule.field)} absent document-wide`,
         detail: null,
       };
+    case "field_split": {
+      const fields = Array.isArray(rule.fields)
+        ? rule.fields.map((f) => text(f)).join(" · ")
+        : "—";
+      const sep = rule.separator === "\t" ? "tab" : text(rule.separator);
+      return {
+        title: `Split on “${sep}”: ${fields}`,
+        detail:
+          Array.isArray(rule.lines) && rule.lines.length > 0
+            ? `Only ${linesLabel(rule.lines)}.`
+            : "Whole document; other widths stay unresolved.",
+      };
+    }
     default:
       return { title: `Rule ${text(rule.id)} (${text(rule.kind)})`, detail: null };
   }

@@ -342,6 +342,7 @@ def _table_to_sheet(
     ignored_columns: list | None = None,
     constant_sources: dict | None = None,
     message_fallback: bool = False,
+    raw_lines: list | None = None,
 ) -> ParsedSheet:
     """Run header scan plus row extraction over plain value rows.
 
@@ -352,8 +353,12 @@ def _table_to_sheet(
     from the detected map.
 
     With message_fallback (pasted chat-style text only), a headerless
-    single-column table becomes message rows — one per non-empty line —
-    instead of failing, so the interpretation lane can read each line.
+    table becomes message rows — one per source line, with the exact
+    original line text — instead of failing, so the interpretation
+    lane can read each line. raw_lines carries those exact lines
+    (blank lines stay in place so row numbers match the source);
+    separator-split cells are discarded because the message lane
+    re-reads the raw lines, never the guessed columns.
     """
     header_index = None
     headers: list = []
@@ -376,22 +381,31 @@ def _table_to_sheet(
     if header_index is None:
         if not message_fallback:
             raise HeaderNotFound("No header row found in the scanned rows.")
-        content_rows = [
-            row
-            for row in rows
-            if any(
-                value is not None and str(value).strip()
-                for value, _flag in row
-            )
-        ]
-        if not content_rows:
-            raise UnsupportedFile("No readable rows in the pasted text.")
-        if any(len(row) != 1 for row in content_rows):
-            raise UnsupportedFile(
-                "No header row found. Add a header row such as "
-                "Model, Price, Quantity — or paste one product per line "
-                "so each line can be read as a message."
-            )
+        if raw_lines is None:
+            content_rows = [
+                row
+                for row in rows
+                if any(
+                    value is not None and str(value).strip()
+                    for value, _flag in row
+                )
+            ]
+            if not content_rows:
+                raise UnsupportedFile("No readable rows in the pasted text.")
+            if any(len(row) != 1 for row in content_rows):
+                raise UnsupportedFile(
+                    "No header row found. Add a header row such as "
+                    "Model, Price, Quantity — or paste one product per line "
+                    "so each line can be read as a message."
+                )
+        else:
+            if not any(
+                isinstance(line, str) and line.strip() for line in raw_lines
+            ):
+                raise UnsupportedFile("No readable rows in the pasted text.")
+            # Rebuild from the exact source lines: whatever the
+            # delimiter sniff split stays out of the message lane.
+            rows = [[(line, False)] for line in raw_lines]
         headers = [MESSAGE_COLUMN]
         header_index = 0
         column_map = {MESSAGE_COLUMN: 0}
@@ -761,7 +775,7 @@ def _sniff_delimiter(sample_lines: list) -> str:
     Semicolon wins ties so European decimal commas never split a column.
     """
     candidates = []
-    for delimiter in (";", "\t", ","):
+    for delimiter in (";", "\t", "|", ","):
         counts = [line.count(delimiter) for line in sample_lines]
         if counts and all(count == counts[0] and count > 0 for count in counts):
             candidates.append(delimiter)
@@ -828,6 +842,9 @@ def parse_delimited(
         ignored_columns=ignored_columns,
         constant_sources=constant_sources,
         message_fallback=message_fallback,
+        # Split on "\n" exactly like the message lane's content
+        # lines, so fallback row numbers match the source lines.
+        raw_lines=text.split("\n"),
     )
 
 
@@ -935,8 +952,8 @@ def parse_upload(
 
     Callers run check_upload_safety first; this only refuses unknown
     extensions and legacy .doc with guidance. message_fallback (pasted
-    text only) lets headerless single-column delimited text become
-    message rows; spreadsheets and documents never fall back.
+    text only) lets headerless delimited text become message rows;
+    spreadsheets and documents never fall back.
     sheet_name selects one worksheet/table (see discover_sheets);
     delimited input has a single text section and must match it.
     """

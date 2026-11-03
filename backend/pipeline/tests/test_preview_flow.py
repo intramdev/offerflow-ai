@@ -765,7 +765,7 @@ class PreviewSheetTests(TestCase):
         self.assertEqual(paste.status_code, 201, paste.content)
         self.assertTrue(paste.data["message_lines"])
 
-    def test_tabular_csv_without_headers_stays_refusal(self):
+    def test_tabular_csv_without_headers_offers_message_import(self):
         response = self.client.post(
             "/api/pipeline/previews/",
             {
@@ -776,5 +776,7 @@ class PreviewSheetTests(TestCase):
             },
             format="multipart",
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("No header row", response.data["detail"])
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertTrue(response.data["message_candidate"])
+        self.assertEqual(response.data["text"], "a,b,c\n1,2,3\n")
+        self.assertIn("message", response.data["explanation"])

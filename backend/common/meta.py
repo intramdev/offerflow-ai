@@ -44,6 +44,43 @@ logger = logging.getLogger(__name__)
 BASE_URL_DEFAULT = "https://api.meta.ai/v1"
 KEY_PREFIX = "LLM_"
 
+#: Truncation bound for provider HTTP error bodies kept for diagnosis.
+ERROR_BODY_CHARS = 300
+
+
+def _status_detail(exc: APIStatusError) -> str:
+    """Safely extract a short provider error detail for diagnosis.
+
+    Prefers the body's own message field (typical ``{"error":
+    {"message": ...}}`` envelopes) so a large echoed request is not
+    stored; otherwise keeps truncated plain text. Response headers
+    are never read, so credentials cannot leak through this path.
+    """
+    try:
+        response = getattr(exc, "response", None)
+        text = getattr(response, "text", "") if response is not None else ""
+        if not isinstance(text, str):
+            text = ""
+    except Exception:
+        text = ""
+    text = " ".join(text.split())
+    if text.startswith("{"):
+        try:
+            envelope = json.loads(text)
+            if isinstance(envelope, dict):
+                error = envelope.get("error", envelope)
+                if isinstance(error, dict):
+                    message = error.get("message") or error.get("detail") or ""
+                else:
+                    message = str(error)
+                if isinstance(message, str) and message.strip():
+                    text = " ".join(message.split())
+        except (ValueError, AttributeError):
+            pass
+    if len(text) > ERROR_BODY_CHARS:
+        text = text[:ERROR_BODY_CHARS] + "…"
+    return text
+
 SYSTEM_PROMPT = (
     "You read supplier spreadsheet rows and copy their visible values into "
     "fields. A row may instead be one pasted chat message line under "
@@ -94,13 +131,15 @@ RESPONSE_SCHEMA = {
                     "is_product": {
                         "type": "boolean",
                         "description": (
-                            "False only when a pasted message line offers "
-                            "no product (header, title, date, or note). "
-                            "Omitted means true."
+                            "Always present: true for product rows, false "
+                            "only when a pasted message line offers no "
+                            "product (header, title, date, or note)."
                         ),
                     },
                 },
-                "required": ["index", "fields"],
+                # Strict-schema providers require every property key to
+                # be required; is_product must stay in this list.
+                "required": ["index", "fields", "is_product"],
                 "additionalProperties": False,
             },
         },
@@ -879,14 +918,18 @@ class MetaProvider:
                 status = int(getattr(exc, "status_code", 0) or 0)
             except (TypeError, ValueError):
                 status = 0
+            detail = _status_detail(exc)
             if status >= 500:
                 # A 5xx may follow a processed request: uncertain, not free.
                 mark_uncertain(reservation, f"{kind} HTTP {status}: {exc}")
             else:
                 release(reservation)
+            if detail:
+                logger.warning("Provider HTTP %s on %s: %s", status, kind, detail)
             raise ProviderError(
                 f"Provider error{f' ({status})' if status else ''} "
                 f"on {kind}; not retried."
+                + (f" Detail: {detail}" if detail else "")
             ) from exc
         except Exception as exc:
             # Unknown local failure after dispatch started: uncertain.
@@ -1047,6 +1090,7 @@ class MetaProvider:
                 status = int(getattr(exc, "status_code", 0) or 0)
             except (TypeError, ValueError):
                 status = 0
+            detail = _status_detail(exc)
             if status >= 500:
                 # A 5xx may follow a processed request: uncertain, not free.
                 mark_uncertain(
@@ -1054,9 +1098,18 @@ class MetaProvider:
                 )
             else:
                 release(reservation)
+            if detail:
+                logger.warning(
+                    "Provider HTTP %s at chunk %s/%s: %s",
+                    status,
+                    position,
+                    total,
+                    detail,
+                )
             raise ProviderError(
                 f"Provider error{f' ({status})' if status else ''} "
                 f"at chunk {position}/{total}; not retried."
+                + (f" Detail: {detail}" if detail else "")
             ) from exc
         except Exception as exc:
             # Unknown local failure after dispatch started: uncertain.

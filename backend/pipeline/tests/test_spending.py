@@ -410,6 +410,60 @@ class SpendingTests(TestCase):
         self.assertEqual(allowance.tokens_reserved, 0)
         self.assertEqual(allowance.in_flight, 0)
 
+    def _status_error(self, body):
+        from openai import APIStatusError
+
+        response = mock.Mock()
+        response.status_code = 400
+        response.text = body
+        response.headers = {}
+        return APIStatusError("400 bad request", response=response, body=None)
+
+    def test_status_error_keeps_provider_message_only(self):
+        self.allow(100000)
+        provider, _holder = self.provider(
+            self._status_error(
+                json.dumps(
+                    {
+                        "error": {
+                            "message": "strict schema: rows.0 missing required key",
+                            "code": "bad_schema",
+                            "echo": "x" * 500,
+                        }
+                    }
+                )
+            )
+        )
+        with self.assertRaises(ProviderError) as raised:
+            provider.interpret_table(
+                {"rows": [{"index": 1, "data": {"message": "Phone 1 - 5"}}]}
+            )
+        message = str(raised.exception)
+        self.assertIn("(400)", message)
+        self.assertIn("strict schema: rows.0 missing required key", message)
+        self.assertNotIn("bad_schema", message)
+        self.assertNotIn("x" * 100, message)
+        allowance = SpendAllowance.objects.get(organization_id=self.org.id)
+        self.assertEqual(allowance.tokens_spent, 0)
+        self.assertEqual(allowance.tokens_reserved, 0)
+
+    def test_status_error_truncates_plain_text_body(self):
+        from common.meta import ERROR_BODY_CHARS
+
+        self.allow(100000)
+        provider, _holder = self.provider(
+            self._status_error("plain failure: " + "y" * 500)
+        )
+        with self.assertRaises(ProviderError) as raised:
+            provider.interpret_table(
+                {"rows": [{"index": 1, "data": {"message": "Phone 1 - 5"}}]}
+            )
+        message = str(raised.exception)
+        detail = message.split("Detail: ", 1)[1]
+        self.assertLessEqual(len(detail), ERROR_BODY_CHARS + 1)
+        self.assertTrue(detail.endswith("…"))
+        self.assertNotIn("y" * 400, message)
+
 
 @override_settings(PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])
 class ReservationLifecycleTests(SpendingTests):

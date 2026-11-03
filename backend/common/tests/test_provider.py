@@ -79,3 +79,29 @@ class ProviderFactoryTests(SimpleTestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             provider = get_provider(organization_id=7)
         self.assertEqual(provider._config.model, "muse-spark-1.3-contributor")
+
+    def test_strict_schemas_require_every_property(self):
+        """Strict-mode providers reject optional keys (live 400)."""
+        from common import meta
+
+        def missing(node, path):
+            gaps = []
+            if isinstance(node, dict):
+                if node.get("type") == "object" and "properties" in node:
+                    for key in node["properties"]:
+                        if key not in node.get("required", []):
+                            gaps.append(f"{path}.{key}")
+                for key, value in node.items():
+                    gaps.extend(missing(value, f"{path}.{key}"))
+            elif isinstance(node, list):
+                for pos, value in enumerate(node):
+                    gaps.extend(missing(value, f"{path}[{pos}]"))
+            return gaps
+
+        schemas = [
+            name for name in dir(meta) if name.endswith("RESPONSE_SCHEMA")
+        ]
+        self.assertGreaterEqual(len(schemas), 5)
+        for name in schemas:
+            with self.subTest(schema=name):
+                self.assertEqual(missing(getattr(meta, name), name), [])

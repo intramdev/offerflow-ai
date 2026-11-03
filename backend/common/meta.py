@@ -635,7 +635,16 @@ CATEGORIZE_RESPONSE_SCHEMA = {
 
 
 class ProviderError(Exception):
-    """A paid provider call failed or its output was unusable."""
+    """A paid provider call failed or its output was unusable.
+
+    uncertain is True when the provider may have processed (and
+    charged) the call despite the failure: timeouts, dropped
+    connections, 5xx responses, and unexpected local failures after
+    dispatch. Callers must report those outcomes as unknown — never
+    as free — and must not retry them implicitly.
+    """
+
+    uncertain = False
 
 
 class ProposalUnusable(ProviderError):
@@ -1031,7 +1040,11 @@ class MetaProvider:
                     sensitive=(system, user_content),
                 ),
             )
-            raise ProviderError(f"Provider {kind} call timed out; not retried.") from exc
+            timed_out = ProviderError(
+                f"Provider {kind} call timed out; not retried."
+            )
+            timed_out.uncertain = True
+            raise timed_out from exc
         except APIConnectionError as exc:
             mark_uncertain(
                 reservation,
@@ -1040,7 +1053,11 @@ class MetaProvider:
                     sensitive=(system, user_content),
                 ),
             )
-            raise ProviderError(f"Provider error on {kind}; not retried.") from exc
+            dropped = ProviderError(
+                f"Provider error on {kind}; not retried."
+            )
+            dropped.uncertain = True
+            raise dropped from exc
         except APIStatusError as exc:
             try:
                 status = int(getattr(exc, "status_code", 0) or 0)
@@ -1060,11 +1077,13 @@ class MetaProvider:
                 release(reservation)
             if detail:
                 logger.warning("Provider HTTP %s on %s: %s", status, kind, detail)
-            raise ProviderError(
+            failed = ProviderError(
                 f"Provider error{f' ({status})' if status else ''} "
                 f"on {kind}; not retried."
                 + (f" Detail: {detail}" if detail else "")
-            ) from exc
+            )
+            failed.uncertain = status >= 500
+            raise failed from exc
         except Exception as exc:
             # Unknown local failure after dispatch started: uncertain.
             mark_uncertain(
@@ -1074,7 +1093,11 @@ class MetaProvider:
                     sensitive=(system, user_content),
                 ),
             )
-            raise ProviderError(f"Unexpected provider failure: {type(exc).__name__}.") from exc
+            unexpected = ProviderError(
+                f"Unexpected provider failure: {type(exc).__name__}."
+            )
+            unexpected.uncertain = True
+            raise unexpected from exc
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None)
         completion_tokens = getattr(usage, "completion_tokens", None)
@@ -1219,9 +1242,11 @@ class MetaProvider:
                     sensitive=(SYSTEM_PROMPT, user_content),
                 ),
             )
-            raise ProviderError(
+            timed_out = ProviderError(
                 f"Provider call timed out at chunk {position}/{total}; not retried."
-            ) from exc
+            )
+            timed_out.uncertain = True
+            raise timed_out from exc
         except APIConnectionError as exc:
             mark_uncertain(
                 reservation,
@@ -1230,9 +1255,11 @@ class MetaProvider:
                     sensitive=(SYSTEM_PROMPT, user_content),
                 ),
             )
-            raise ProviderError(
+            dropped = ProviderError(
                 f"Provider error at chunk {position}/{total}; not retried."
-            ) from exc
+            )
+            dropped.uncertain = True
+            raise dropped from exc
         except APIStatusError as exc:
             try:
                 status = int(getattr(exc, "status_code", 0) or 0)
@@ -1260,11 +1287,13 @@ class MetaProvider:
                     total,
                     detail,
                 )
-            raise ProviderError(
+            failed = ProviderError(
                 f"Provider error{f' ({status})' if status else ''} "
                 f"at chunk {position}/{total}; not retried."
                 + (f" Detail: {detail}" if detail else "")
-            ) from exc
+            )
+            failed.uncertain = status >= 500
+            raise failed from exc
         except Exception as exc:
             # Unknown local failure after dispatch started: uncertain.
             mark_uncertain(
@@ -1274,7 +1303,11 @@ class MetaProvider:
                     sensitive=(SYSTEM_PROMPT, user_content),
                 ),
             )
-            raise ProviderError(f"Unexpected provider failure: {type(exc).__name__}.") from exc
+            unexpected = ProviderError(
+                f"Unexpected provider failure: {type(exc).__name__}."
+            )
+            unexpected.uncertain = True
+            raise unexpected from exc
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None)
         completion_tokens = getattr(usage, "completion_tokens", None)

@@ -613,16 +613,24 @@ class AssistOperationsFlowTests(PreviewAssistTests):
         self.assertTrue(response.json()["retriable"])
 
 
+@override_settings(CELERY_TASK_ALWAYS_EAGER=True)
 class AssistIdempotencyTests(PreviewAssistTests):
     def _assist_keyed(self, key, content, idempotency_key):
-        return self.client.post(
-            f"/api/pipeline/previews/{key}/assist/",
-            {
-                "messages": [{"role": "user", "content": content}],
-                "idempotency_key": idempotency_key,
-            },
-            format="json",
-        )
+        # Eager + captured commits: the queued attempt runs inline, so
+        # these tests observe the same synchronous outcomes as before.
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.post(
+                f"/api/pipeline/previews/{key}/assist/",
+                {
+                    "messages": [{"role": "user", "content": content}],
+                    "idempotency_key": idempotency_key,
+                },
+                format="json",
+            )
+
+    def _status(self, key, idempotency_key):
+        url = f"/api/pipeline/previews/{key}/assist/status/"
+        return self.client.get(url, {"idempotency_key": idempotency_key})
 
     def test_same_key_replays_without_second_dispatch(self):
         AIProviderConfig.objects.create(model="admin-model")
@@ -638,14 +646,20 @@ class AssistIdempotencyTests(PreviewAssistTests):
             MetaProvider, "assist_preview", side_effect=_fake
         ):
             first = self._assist_keyed(preview, "Set the supplier.", "k-1")
+            status = self._status(preview, "k-1")
             second = self._assist_keyed(preview, "Set the supplier.", "k-1")
-        self.assertEqual(first.status_code, 200, first.content)
+        # First send queues the attempt (the eager test worker has
+        # already run it by the time the helper returns).
+        self.assertEqual(first.status_code, 202, first.content)
+        self.assertTrue(first.json()["accepted"])
+        self.assertEqual(first.json()["idempotency_key"], "k-1")
+        self.assertEqual(status.status_code, 200, status.content)
+        self.assertEqual(status.json()["status"], "completed")
         self.assertEqual(second.status_code, 200, second.content)
         self.assertEqual(len(calls), 1)
-        self.assertFalse(first.json()["replayed"])
         self.assertTrue(second.json()["replayed"])
         self.assertEqual(
-            second.json()["proposal"], first.json()["proposal"]
+            second.json()["proposal"], status.json()["proposal"]
         )
         self.assertEqual(UsageEvent.objects.count(), 1)
 
@@ -661,8 +675,9 @@ class AssistIdempotencyTests(PreviewAssistTests):
             MetaProvider, "assist_preview", side_effect=_fake
         ) as mocked:
             first = self._assist_keyed(preview, "Set the supplier.", "k-rev")
-        self.assertEqual(first.status_code, 200, first.content)
-        self.assertEqual(first.json()["base_revision"], 1)
+            status = self._status(preview, "k-rev")
+        self.assertEqual(first.status_code, 202, first.content)
+        self.assertEqual(status.json()["base_revision"], 1)
         manual = self._apply(
             preview, set_constants={"supplier": "Manual Co"}, drop_lines=[]
         )
@@ -743,8 +758,9 @@ class AssistIdempotencyTests(PreviewAssistTests):
             response = self._assist_keyed(
                 preview, "Set the supplier.", "k-stale"
             )
-        self.assertEqual(response.status_code, 200, response.content)
-        self.assertFalse(response.json()["replayed"])
+            status = self._status(preview, "k-stale")
+        self.assertEqual(response.status_code, 202, response.content)
+        self.assertEqual(status.json()["status"], "completed")
         row.refresh_from_db()
         self.assertEqual(row.state, "done")
         self.assertEqual(UsageEvent.objects.count(), 1)
@@ -761,7 +777,7 @@ class AssistIdempotencyTests(PreviewAssistTests):
         ):
             first = self._assist_keyed(preview, "Set the supplier.", "k-1")
             other = self._assist_keyed(preview, "Drop line 4.", "k-1")
-        self.assertEqual(first.status_code, 200, first.content)
+        self.assertEqual(first.status_code, 202, first.content)
         self.assertEqual(other.status_code, 400, other.content)
 
     def test_keys_are_tenant_scoped(self):
@@ -788,9 +804,8 @@ class AssistIdempotencyTests(PreviewAssistTests):
             response = self._assist_keyed(
                 preview, "Set the supplier.", "k-shared"
             )
-        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.status_code, 202, response.content)
         self.assertEqual(len(calls), 1)
-        self.assertFalse(response.json()["replayed"])
 
     def test_failed_attempt_allows_explicit_retry(self):
         AIProviderConfig.objects.create(model="admin-model")
@@ -808,10 +823,18 @@ class AssistIdempotencyTests(PreviewAssistTests):
             MetaProvider, "assist_preview", side_effect=_flaky
         ):
             failed = self._assist_keyed(preview, "Set the supplier.", "k-9")
+        # The queued attempt ran (and failed) in the eager test worker.
+        self.assertEqual(failed.status_code, 202, failed.content)
+        failed_state = self._status(preview, "k-9")
+        self.assertEqual(failed_state.json()["status"], "failed")
+        self.assertIn("Provider error", failed_state.json()["error"])
+        with self._paid_env(), mock.patch.object(
+            MetaProvider, "assist_preview", side_effect=_flaky
+        ):
             retry = self._assist_keyed(preview, "Set the supplier.", "k-9")
-        self.assertEqual(failed.status_code, 502, failed.content)
-        self.assertEqual(retry.status_code, 200, retry.content)
-        self.assertFalse(retry.json()["replayed"])
+            retry_state = self._status(preview, "k-9")
+        self.assertEqual(retry.status_code, 202, retry.content)
+        self.assertEqual(retry_state.json()["status"], "completed")
         self.assertEqual(len(attempts), 2)
         row = AssistIdempotency.objects.get(
             organization=self.org_a, key="k-9"
@@ -820,7 +843,8 @@ class AssistIdempotencyTests(PreviewAssistTests):
 
 
 @override_settings(
-    PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"]
+    PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"],
+    CELERY_TASK_ALWAYS_EAGER=True,
 )
 class AssistConcurrencyTests(TransactionTestCase):
     """A second request during a live dispatch conflicts, then replays."""
@@ -916,7 +940,7 @@ class AssistConcurrencyTests(TransactionTestCase):
             thread.join(timeout=60)
         self.assertEqual(conflict.status_code, 409, conflict.content)
         self.assertTrue(conflict.json()["retryable"])
-        self.assertEqual(errors, [("first", 200)])
+        self.assertEqual(errors, [("first", 202)])
         with paid, mock.patch.object(
             MetaProvider, "assist_preview", side_effect=_slow
         ):

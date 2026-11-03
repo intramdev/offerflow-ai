@@ -25,6 +25,7 @@ from pipeline.views import (
     FileListView,
     OfferListView,
     PreviewAssistApplyView,
+    PreviewAssistStatusView,
     PreviewAssistView,
     PreviewCancelView,
     PreviewCreateView,
@@ -75,6 +76,11 @@ urlpatterns = [
         "previews/<str:key>/assist/apply/",
         PreviewAssistApplyView.as_view(),
         name="preview-assist-apply",
+    ),
+    path(
+        "previews/<str:key>/assist/status/",
+        PreviewAssistStatusView.as_view(),
+        name="preview-assist-status",
     ),
     path(
         "previews/<str:key>/resume/",

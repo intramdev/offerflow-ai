@@ -783,26 +783,49 @@ export interface PreviewAssistReply {
   replayed?: boolean;
 }
 
+export interface PreviewAssistAccepted {
+  accepted: true;
+  idempotency_key: string;
+  status: "pending" | "completed" | "failed" | "unknown";
+}
+
+export type AssistPreviewBegin =
+  | { queued: true; acceptance: PreviewAssistAccepted }
+  | { queued: false; reply: PreviewAssistReply };
+
 export async function assistPreview(
   key: string,
   messages: AssistantTurn[],
   idempotencyKey?: string,
-): Promise<PreviewAssistReply> {
-  // Bounded client deadline, above the 60s provider timeout plus proxy
-  // and validation margin: a hung connection becomes a retryable
-  // error, and the retry reuses the idempotency key. When the first
-  // attempt completed, the retry replays its stored result without a
-  // second charge; after a failed or expired attempt the retry is an
-  // explicit new call that may spend again.
+): Promise<AssistPreviewBegin> {
+  // Keyed sends queue the attempt in the worker and return 202
+  // immediately: no browser/proxy connection is held across the
+  // provider call. The caller polls getAssistStatus with the same key
+  // until the attempt completes. A key whose attempt already finished
+  // replays its stored reply (200) instead of dispatching again. The
+  // bounded client deadline only guards a hung connection: recovery
+  // polls the status endpoint with the same key, so a completed
+  // result replays without a second charge; after a failed or
+  // expired attempt the recovery is an explicit new call that may
+  // spend again.
   try {
-    return await api<PreviewAssistReply>(`/api/pipeline/previews/${key}/assist/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(
-        idempotencyKey ? { messages, idempotency_key: idempotencyKey } : { messages },
-      ),
-      signal: AbortSignal.timeout(90000),
-    });
+    const body = await api<PreviewAssistReply | PreviewAssistAccepted>(
+      `/api/pipeline/previews/${key}/assist/`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          idempotencyKey
+            ? { messages, idempotency_key: idempotencyKey }
+            : { messages },
+        ),
+        signal: AbortSignal.timeout(90000),
+      },
+    );
+    if ("accepted" in body && body.accepted) {
+      return { queued: true, acceptance: body };
+    }
+    return { queued: false, reply: body as PreviewAssistReply };
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
       throw new Error(
@@ -811,6 +834,35 @@ export async function assistPreview(
     }
     throw err;
   }
+}
+
+export interface PreviewAssistStatus {
+  status: "pending" | "completed" | "failed" | "unknown";
+  idempotency_key: string;
+  conversation?: AssistantTurn[];
+  proposal?: PreviewAssistProposal;
+  base_revision?: number;
+  context_coverage?: PreviewAssistCoverage;
+  message?: string;
+  tokens?: number;
+  hint?: string;
+  refusal?: string;
+  error?: string;
+  retryable?: boolean;
+  attempts?: number;
+  replayed?: boolean;
+}
+
+export async function getAssistStatus(
+  key: string,
+  idempotencyKey: string,
+): Promise<PreviewAssistStatus> {
+  // Short-lived status reads stay far under the proxy connection
+  // lifetime; the poll loop retries them with backoff.
+  return api<PreviewAssistStatus>(
+    `/api/pipeline/previews/${key}/assist/status/?idempotency_key=${encodeURIComponent(idempotencyKey)}`,
+    { signal: AbortSignal.timeout(25000) },
+  );
 }
 
 export interface PreviewAssistApplied {

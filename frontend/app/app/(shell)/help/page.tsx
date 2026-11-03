@@ -255,7 +255,10 @@ export default function HelpPage() {
           only when you click{" "}<strong>Apply to preview</strong> — your
           own edits always win. If the preview changed elsewhere meanwhile,
           applying fails safely and asks you to review the newest rules
-          first.
+          first. Sending runs in the background as a queued job: if your
+          connection drops, the same message is recovered automatically
+          without paying twice, and refreshing the page offers to resume
+          it.
         </P>
       </Section>
 

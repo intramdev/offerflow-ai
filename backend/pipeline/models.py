@@ -865,12 +865,21 @@ class AssistantFlag(models.Model):
 class AssistIdempotency(models.Model):
     """One idempotent preview-assist request.
 
-    The browser generates one key per send. If the connection drops
-    after dispatch, retrying with the same key returns the stored
-    result instead of paying for a second model call; a key whose
-    first attempt is still running answers 409 instead of dispatching
-    again. Keys are tenant-scoped and bound to one exact request, so
-    a retry can never return another company's answer.
+    The browser generates one key per send. The send endpoint only
+    claims the key and queues the model call on the worker, so no
+    request holds a connection open while the provider thinks; the
+    browser polls for the stored result and resumes after any
+    disconnect. If the connection drops after dispatch, retrying with
+    the same key returns the stored result instead of paying for a
+    second model call; a key whose first attempt is still running
+    answers 409 instead of dispatching again. Keys are tenant-scoped
+    and bound to one exact request, so a retry can never return
+    another company's answer.
+
+    attempts counts explicit dispatches; claimed lets exactly one
+    worker execution run per attempt, so a redelivered task never
+    pays twice by itself. request carries the turns the worker
+    needs to run the attempt the sender queued.
     """
 
     organization = models.ForeignKey(
@@ -888,6 +897,9 @@ class AssistIdempotency(models.Model):
     )
     preview_key = models.CharField(max_length=64)
     request_hash = models.CharField(max_length=64)
+    request = models.JSONField(default=dict)
+    attempts = models.PositiveIntegerField(default=0)
+    claimed = models.BooleanField(default=False)
     state = models.CharField(
         max_length=8,
         choices=[

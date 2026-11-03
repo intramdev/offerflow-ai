@@ -313,6 +313,221 @@ def _fail_unresolvable_run(run_id: int) -> None:
     record_audit(run.organization_id, None, "run_failed", "run", run.id)
 
 
+@shared_task(name="pipeline.run_assist_turn", bind=True, max_retries=0)
+def run_assist_turn(self, record_id: int, organization_id: int) -> str:
+    """Run one queued keyed assist attempt, at most once per attempt.
+
+    The claimed flag admits exactly one execution: a redelivered task
+    (worker lost, broker retry) sees the claim and returns without
+    dispatching, so an uncertain charge is never repeated implicitly.
+    A retry after failure or reclaim is always an explicit new send
+    that resets the claim. The task never raises past this point:
+    every failure persists as a failed attempt the status endpoint
+    reports, with its booked spend.
+    """
+    import logging
+
+    from organizations.context import tenant_scope
+    from pipeline.models import AssistIdempotency
+
+    log = logging.getLogger(__name__)
+    with tenant_scope(organization_id, 0):
+        with transaction.atomic():
+            try:
+                record = AssistIdempotency.objects.select_for_update().get(
+                    pk=record_id, organization_id=organization_id
+                )
+            except AssistIdempotency.DoesNotExist:
+                return "missing"
+            if record.state != "pending" or record.claimed:
+                return "duplicate"
+            record.claimed = True
+            record.save(update_fields=["claimed", "updated_at"])
+        try:
+            return _execute_assist_attempt(record, organization_id)
+        except Exception as exc:
+            log.exception(
+                "Assist attempt %s failed unexpectedly: %s",
+                record_id,
+                type(exc).__name__,
+            )
+            _store_assist_failure(
+                record,
+                organization_id,
+                kind="provider",
+                summary=(
+                    "The assistant hit an unexpected error; retrying "
+                    "may work."
+                ),
+                spent_total=0,
+                base_revision=(record.request or {}).get("base_revision", 1),
+                retriable=True,
+            )
+            return "failed"
+
+
+def _store_assist_failure(
+    record, organization_id, *, kind, summary, spent_total, base_revision,
+    retriable,
+) -> None:
+    """Persist a failed attempt; a reclaimed key is left untouched."""
+    from pipeline.models import AssistIdempotency
+    from pipeline.previews import _failure_response
+
+    AssistIdempotency.objects.filter(
+        pk=record.pk,
+        organization_id=organization_id,
+        state="pending",
+    ).update(
+        state="failed",
+        response=_failure_response(
+            kind=kind,
+            summary=summary,
+            spent_total=spent_total,
+            base_revision=base_revision,
+            retriable=retriable,
+        ),
+        tokens=spent_total,
+    )
+
+
+def _execute_assist_attempt(record, organization_id: int) -> str:
+    """Run the queued attempt; returns ok, failed, or superseded."""
+    from django.core.exceptions import PermissionDenied, ValidationError
+
+    from common.meta import ProposalUnusable, ProviderError
+    from common.provider import ProviderNotConfigured, get_provider
+    from organizations.models import Organization
+    from organizations.services import authorize_organization_access
+    from pipeline.models import AssistIdempotency
+    from pipeline.previews import (
+        _adapter,
+        _load_preview,
+        _run_assist_attempt,
+    )
+    from pipeline.spending import BudgetRefused
+
+    queued = record.request or {}
+    turns = queued.get("turns") or []
+    base_revision = queued.get("base_revision", 1)
+    user = record.user
+    try:
+        if user is None:
+            raise PermissionDenied("That account is no longer available.")
+        authorize_organization_access(user, organization_id)
+        meta = _load_preview(record.preview_key)
+        if meta.get("organization_id") != organization_id:
+            raise ValidationError("Unknown or expired preview.")
+        content = _adapter().read_bytes(f"previews/{record.preview_key}.bin")
+        provider = get_provider(organization_id=organization_id)
+        if provider.is_simulated:
+            raise ProviderNotConfigured("The assistant needs the paid model.")
+        organization = Organization.objects.get(pk=organization_id)
+    except (
+        PermissionDenied,
+        ValidationError,
+        ProviderNotConfigured,
+        FileNotFoundError,
+    ) as exc:
+        message = (
+            "Your access to this preview changed, so the queued "
+            "request cannot run. Ask again from the current preview."
+            if isinstance(exc, PermissionDenied)
+            else (
+                "The assistant is not configured for this organization."
+                if isinstance(exc, ProviderNotConfigured)
+                else "This preview is no longer available."
+            )
+        )
+        _store_assist_failure(
+            record,
+            organization_id,
+            kind="missing",
+            summary=message,
+            spent_total=0,
+            base_revision=base_revision,
+            retriable=False,
+        )
+        return "failed"
+    if not turns:
+        _store_assist_failure(
+            record,
+            organization_id,
+            kind="validation",
+            summary="The queued request carries no conversation.",
+            spent_total=0,
+            base_revision=base_revision,
+            retriable=True,
+        )
+        return "failed"
+    spent = {"total": 0}
+    try:
+        reply = _run_assist_attempt(
+            organization=organization,
+            user=user,
+            meta=meta,
+            content=content,
+            turns=turns,
+            base_revision=base_revision,
+            provider=provider,
+            spent=spent,
+        )
+    # ProposalUnusable subclasses ProviderError: it must be caught
+    # first, or unusable proposals would be stored as provider
+    # failures instead of guidance the user can act on.
+    except ProposalUnusable as exc:
+        _store_assist_failure(
+            record,
+            organization_id,
+            kind="unusable",
+            summary=str(exc),
+            spent_total=spent["total"],
+            base_revision=base_revision,
+            retriable=True,
+        )
+        return "failed"
+    except ProviderError as exc:
+        if getattr(exc, "uncertain", False):
+            kind = "unknown"
+            summary = (
+                f"{exc} The provider may still have charged this "
+                "attempt; check the credits log before retrying."
+            )
+        elif isinstance(exc.__cause__, BudgetRefused):
+            kind = "budget"
+            summary = str(exc)
+        else:
+            kind = "provider"
+            summary = str(exc)
+        _store_assist_failure(
+            record,
+            organization_id,
+            kind=kind,
+            summary=summary,
+            spent_total=spent["total"],
+            base_revision=base_revision,
+            retriable=True,
+        )
+        return "failed"
+    except ValidationError as exc:
+        _store_assist_failure(
+            record,
+            organization_id,
+            kind="validation",
+            summary=str(exc),
+            spent_total=spent["total"],
+            base_revision=base_revision,
+            retriable=True,
+        )
+        return "failed"
+    updated = AssistIdempotency.objects.filter(
+        pk=record.pk,
+        organization_id=organization_id,
+        state="pending",
+    ).update(state="done", response=reply, tokens=reply.get("tokens", 0))
+    return "ok" if updated else "superseded"
+
+
 @shared_task(name="pipeline.process_import_run", bind=True, max_retries=0)
 def process_import_run(self, run_id: int):
     """Process one run exactly once per request; redeliveries are no-ops."""

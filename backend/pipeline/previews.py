@@ -1432,7 +1432,14 @@ def _assist_request_hash(preview_key: str, turns: list, base_revision) -> str:
 
 
 def _claim_assist_key(
-    *, organization, user, preview_key, request_hash, idempotency_key
+    *,
+    organization,
+    user,
+    preview_key,
+    request_hash,
+    idempotency_key,
+    turns,
+    base_revision,
 ):
     """Claim one idempotent attempt, or return the stored outcome.
 
@@ -1441,14 +1448,17 @@ def _claim_assist_key(
     dispatching. A live "pending" row raises AssistInFlight; a stale
     one is reclaimed for an explicit new attempt. A key bound to a
     different request fails loudly instead of returning the wrong
-    answer.
+    answer. The queued turns and base revision persist on the row so
+    the worker runs exactly the attempt the sender queued.
     """
+    from django.db.models import F
     from django.utils import timezone as dj_timezone
 
     from pipeline.models import AssistIdempotency
 
     if not _IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key or ""):
         raise ValidationError("idempotency_key is not a valid key.")
+    queued = {"turns": turns, "base_revision": base_revision}
     try:
         record, created = AssistIdempotency.objects.get_or_create(
             organization=organization,
@@ -1457,6 +1467,8 @@ def _claim_assist_key(
                 "user": user,
                 "preview_key": preview_key,
                 "request_hash": request_hash,
+                "request": queued,
+                "attempts": 1,
                 "state": "pending",
             },
         )
@@ -1485,10 +1497,14 @@ def _claim_assist_key(
         )
     record.user = user
     record.preview_key = preview_key
+    record.request = queued
+    record.attempts = F("attempts") + 1
+    record.claimed = False
     record.state = "pending"
     record.response = None
     record.tokens = 0
     record.save()
+    record.refresh_from_db()
     return record
 
 
@@ -1723,20 +1739,14 @@ def _clean_assist_operations(raw, *, message_lines, content, rules, policy):
     return [dict(op) for op in raw], ""
 
 
-def assist_preview(
-    *, key: str, user, conversation, idempotency_key: str | None = None
-) -> dict:
-    """One proposed-adjustment turn against a pending preview. Reads only.
+def _prepare_assist_turn(*, key: str, user, conversation) -> dict:
+    """Run the fast synchronous checks for one assist turn.
 
-    The model sees a bounded quote of the pending preview plus the
-    recent conversation, and may propose set-once values or pasted-line
-    drops. Every proposed value and line number is validated here; the
-    proposal applies only through apply_preview_assist after the user
-    confirms it in the chat. With idempotency_key, a retry after a
-    dropped connection replays the completed result instead of paying
-    for a second call, and a still-running attempt answers 409. A
-    retry after a failed or reclaimed attempt is an explicit new
-    call that may spend again.
+    Returns the organization, preview metadata, source bytes, cleaned
+    turns, base revision, and provider. Raises AssistRefused for
+    out-of-scope questions, PermissionDenied for banned accounts, and
+    ProviderNotConfigured when only the simulated provider exists —
+    all before any key is claimed or model time is spent.
     """
     from common.provider import ProviderNotConfigured, get_provider
     from organizations.models import UserPreference
@@ -1763,21 +1773,29 @@ def assist_preview(
     provider = get_provider(organization_id=organization.id)
     if provider.is_simulated:
         raise ProviderNotConfigured("The assistant needs the paid model.")
-    base_revision = meta.get("revision", 1)
-    record = None
-    if idempotency_key is not None:
-        record = _claim_assist_key(
-            organization=organization,
-            user=user,
-            preview_key=key,
-            request_hash=_assist_request_hash(key, turns, base_revision),
-            idempotency_key=idempotency_key,
-        )
-        if record.state == "done":
-            stored = dict(record.response or {})
-            stored["replayed"] = True
-            return stored
     content = _adapter().read_bytes(f"previews/{key}.bin")
+    return {
+        "organization": organization,
+        "meta": meta,
+        "content": content,
+        "turns": turns,
+        "base_revision": meta.get("revision", 1),
+        "provider": provider,
+    }
+
+
+def _run_assist_attempt(
+    *, organization, user, meta, content, turns, base_revision, provider, spent
+) -> dict:
+    """Execute one model attempt synchronously and return its reply.
+
+    Books chunk usage as it arrives, validates every proposed value,
+    and raises ProviderError, ProposalUnusable, or ValidationError on
+    failure. The caller persists the outcome; spent accumulates the
+    booked chunk tokens so failures still report their cost.
+    """
+    from common.meta import ProposalUnusable
+
     context = _assist_preview_context(
         meta=meta, content=content, organization=organization
     )
@@ -1785,7 +1803,6 @@ def assist_preview(
     provider_model = getattr(getattr(provider, "_config", None), "model", "")
     if not isinstance(provider_model, str):
         provider_model = ""
-    spent = {"total": 0}
 
     def _note_chunk(position, total, prompt_tokens, completion_tokens):
         from pipeline.jobs import record_usage
@@ -1807,43 +1824,31 @@ def assist_preview(
             user=user,
         )
 
-    from common.meta import ProviderError, ProposalUnusable
-
+    result = provider.assist_preview(
+        {"preview": context, "conversation": turns}, on_chunk=_note_chunk
+    )
     try:
-        result = provider.assist_preview(
-            {"preview": context, "conversation": turns}, on_chunk=_note_chunk
+        constants = _clean_assist_constants(
+            result.get("set_constants", {})
         )
-        try:
-            constants = _clean_assist_constants(
-                result.get("set_constants", {})
-            )
-            drops = _clean_assist_drops(
-                result.get("drop_lines", []),
-                message_lines=bool(meta.get("message_lines")),
-                content=content,
-            )
-            operations, operations_note = _clean_assist_operations(
-                result.get("operations", []),
-                message_lines=bool(meta.get("message_lines")),
-                content=content,
-                rules=meta.get("rules") or [],
-                policy=meta.get("document_policy", "stock"),
-            )
-        except ValidationError as error:
-            unusable = ProposalUnusable(
-                f"proposal failed validation ({error})"
-            )
-            unusable.tokens = spent["total"]
-            raise unusable from error
-    except (ProposalUnusable, ProviderError, ValidationError) as error:
-        if record is not None:
-            record.state = "failed"
-            record.response = None
-            record.tokens = spent["total"]
-            record.save(
-                update_fields=["state", "response", "tokens", "updated_at"]
-            )
-        raise
+        drops = _clean_assist_drops(
+            result.get("drop_lines", []),
+            message_lines=bool(meta.get("message_lines")),
+            content=content,
+        )
+        operations, operations_note = _clean_assist_operations(
+            result.get("operations", []),
+            message_lines=bool(meta.get("message_lines")),
+            content=content,
+            rules=meta.get("rules") or [],
+            policy=meta.get("document_policy", "stock"),
+        )
+    except ValidationError as error:
+        unusable = ProposalUnusable(
+            f"proposal failed validation ({error})"
+        )
+        unusable.tokens = spent["total"]
+        raise unusable from error
     usage = result.get("usage", {})
     if context["message_lines"]:
         context_coverage = {
@@ -1859,7 +1864,8 @@ def assist_preview(
             "total_rows": 0,
             "truncated": False,
         }
-    reply = {
+    return {
+        "state": "done",
         "message": result.get("message", "") + operations_note,
         "proposal": {
             "set_constants": constants,
@@ -1872,14 +1878,189 @@ def assist_preview(
         "tokens": usage.get("total_tokens", 0),
         "replayed": False,
     }
-    if record is not None:
-        record.state = "done"
-        record.response = reply
-        record.tokens = reply["tokens"]
-        record.save(
-            update_fields=["state", "response", "tokens", "updated_at"]
+
+
+def _failure_response(*, kind, summary, spent_total, base_revision, retriable):
+    """Build the stored response for a failed assist attempt."""
+    if kind == "unusable":
+        message = (
+            "I could not turn that into a safe preview change. "
+            "Tell me the exact value to set or the line numbers "
+            "to drop."
         )
-    return reply
+    elif kind == "missing":
+        message = (
+            "This preview is no longer available, so the request "
+            "cannot run. Start a new preview to ask again."
+        )
+    else:
+        message = summary
+    return {
+        "message": message,
+        "proposal": {
+            "set_constants": {},
+            "drop_lines": [],
+            "dropped_previews": [],
+            "operations": [],
+        },
+        "base_revision": base_revision,
+        "tokens": spent_total,
+        "error": summary,
+        "error_kind": kind,
+        "retriable": retriable,
+    }
+
+
+def assist_preview(
+    *, key: str, user, conversation, idempotency_key: str | None = None
+) -> tuple:
+    """One proposed-adjustment turn against a pending preview. Reads only.
+
+    Returns (payload, http_status). The model sees a bounded quote of
+    the pending preview plus the recent conversation, and may propose
+    set-once values or pasted-line drops. Every proposed value and
+    line number is validated; the proposal applies only through
+    apply_preview_assist after the user confirms it in the chat.
+
+    Keyless sends run inline and return the reply with 200, as
+    before. Keyed sends claim the key, queue one worker attempt, and
+    return 202 immediately, so no request holds a connection open
+    while the provider thinks; the client polls the status endpoint
+    for the stored result. A retry after a dropped connection
+    replays the completed result instead of paying for a second
+    call, a still-running attempt answers 409, and a retry after a
+    failed or reclaimed attempt is an explicit new call that may
+    spend again.
+    """
+    prepared = _prepare_assist_turn(
+        key=key, user=user, conversation=conversation
+    )
+    organization = prepared["organization"]
+    meta = prepared["meta"]
+    content = prepared["content"]
+    turns = prepared["turns"]
+    base_revision = prepared["base_revision"]
+    provider = prepared["provider"]
+    if idempotency_key is None:
+        spent = {"total": 0}
+        reply = _run_assist_attempt(
+            organization=organization,
+            user=user,
+            meta=meta,
+            content=content,
+            turns=turns,
+            base_revision=base_revision,
+            provider=provider,
+            spent=spent,
+        )
+        return reply, 200
+    record = _claim_assist_key(
+        organization=organization,
+        user=user,
+        preview_key=key,
+        request_hash=_assist_request_hash(key, turns, base_revision),
+        idempotency_key=idempotency_key,
+        turns=turns,
+        base_revision=base_revision,
+    )
+    if record.state == "done":
+        stored = dict(record.response or {})
+        stored["status"] = "completed"
+        stored["replayed"] = True
+        stored["attempts"] = record.attempts
+        return stored, 200
+    from django.db import transaction
+
+    from pipeline.jobs import run_assist_turn
+
+    transaction.on_commit(
+        lambda: run_assist_turn.delay(record.id, organization.id)
+    )
+    # Always 202 for a freshly queued attempt, even when an eager
+    # worker already ran it: one stable contract for the client,
+    # which polls the status endpoint for the stored outcome.
+    return (
+        {
+            "status": "pending",
+            "key": key,
+            "idempotency_key": idempotency_key,
+            "attempts": record.attempts,
+            "accepted": True,
+        },
+        202,
+    )
+
+
+def assist_turn_status(*, key: str, user, idempotency_key: str) -> dict:
+    """Report one keyed assist attempt: pending, completed, failed.
+
+    Unusable proposals surface as completed guidance (message plus an
+    empty proposal), exactly like the inline path, so polling never
+    traps the user in a retry loop. Uncertain charges surface as
+    unknown with explicit credits-log guidance instead of a plain
+    failure. Tenant-scoped and bound to the exact preview: unknown
+    keys and wrong previews answer 404, other organizations 403
+    (like the send path), so polling can never reveal another
+    company's request.
+    """
+    from pipeline.models import AssistIdempotency
+
+    meta = _load_preview(key)
+    organization = authorize_organization_access(user, meta["organization_id"])
+    if not _IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key or ""):
+        raise ValidationError("Unknown or expired assist request.")
+    try:
+        record = AssistIdempotency.objects.get(
+            organization=organization,
+            key=idempotency_key,
+            preview_key=key,
+        )
+    except AssistIdempotency.DoesNotExist:
+        raise ValidationError("Unknown or expired assist request.") from None
+    if record.state == "pending":
+        return {
+            "status": "pending",
+            "key": key,
+            "idempotency_key": idempotency_key,
+            "attempts": record.attempts,
+        }
+    if record.state == "failed":
+        stored = dict(record.response or {})
+        kind = stored.get("error_kind") or "provider"
+        if kind == "unusable":
+            return {
+                "status": "completed",
+                "key": key,
+                "idempotency_key": idempotency_key,
+                "attempts": record.attempts,
+                "message": stored.get("message", ""),
+                "proposal": stored.get("proposal")
+                or {
+                    "set_constants": {},
+                    "drop_lines": [],
+                    "dropped_previews": [],
+                    "operations": [],
+                },
+                "base_revision": stored.get("base_revision", 1),
+                "tokens": record.tokens,
+                "hint": stored.get("error"),
+                "replayed": True,
+            }
+        return {
+            "status": "unknown" if kind == "unknown" else "failed",
+            "key": key,
+            "idempotency_key": idempotency_key,
+            "attempts": record.attempts,
+            "tokens": record.tokens,
+            "error": stored.get("error") or "The assistant request failed.",
+            "error_kind": kind,
+            "retryable": bool(stored.get("retriable", True)),
+        }
+    stored = dict(record.response or {})
+    stored["status"] = "completed"
+    stored["replayed"] = True
+    stored["attempts"] = record.attempts
+    return stored
 
 
 def _ensure_draft(meta: dict) -> dict:

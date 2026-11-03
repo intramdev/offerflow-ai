@@ -706,7 +706,7 @@ class PreviewAssistView(APIView):
         serializer = PreviewAssistSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
-            result = assist_preview(
+            result, http_status = assist_preview(
                 key=key,
                 user=request.user,
                 conversation=serializer.validated_data["messages"],
@@ -762,6 +762,30 @@ class PreviewAssistView(APIView):
                 {"detail": str(error)},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
+        return Response(result, status=http_status)
+
+
+class PreviewAssistStatusView(APIView):
+    """Poll one keyed assist attempt: pending, done, or failed."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, key):
+        from pipeline.previews import assist_turn_status
+
+        try:
+            result = assist_turn_status(
+                key=key,
+                user=request.user,
+                idempotency_key=request.query_params.get("idempotency_key"),
+            )
+        except DjangoValidationError as error:
+            return Response(
+                {"detail": str(error)},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except DjangoPermissionDenied as error:
+            raise DRFPermissionDenied(str(error)) from error
         return Response(result)
 
 

@@ -14,9 +14,12 @@ import {
   applyPreviewAssist,
   askAssistant,
   assistPreview,
+  getAssistStatus,
   getAssistantStatus,
   type AssistantTurn,
+  type PreviewAssistReply,
   type PreviewAssistProposal,
+  type PreviewAssistStatus,
 } from "@/lib/api";
 import { cn } from "@/lib/cn";
 
@@ -40,6 +43,52 @@ function isEmptyProposal(proposal: PreviewAssistProposal): boolean {
     proposal.drop_lines.length === 0 &&
     (proposal.operations ?? []).length === 0
   );
+}
+
+interface InflightAssist {
+  key: string;
+  history: AssistantTurn[];
+  requestKey: string;
+  startedAt: number;
+}
+
+const INFLIGHT_STORAGE = "offerflow.assist.inflight";
+
+function readInflight(): InflightAssist | null {
+  try {
+    const raw = sessionStorage.getItem(INFLIGHT_STORAGE);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as InflightAssist;
+    if (
+      typeof parsed?.key !== "string" ||
+      typeof parsed?.requestKey !== "string" ||
+      !Array.isArray(parsed?.history)
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function storeInflight(entry: InflightAssist): void {
+  try {
+    sessionStorage.setItem(INFLIGHT_STORAGE, JSON.stringify(entry));
+  } catch {
+    // Private mode: recovery still works within the session.
+  }
+}
+
+function clearInflight(requestKey: string): void {
+  try {
+    const current = readInflight();
+    if (current?.requestKey === requestKey) {
+      sessionStorage.removeItem(INFLIGHT_STORAGE);
+    }
+  } catch {
+    // Ignore storage failures.
+  }
 }
 
 export function AssistantWidget() {
@@ -132,28 +181,99 @@ export function AssistantWidget() {
     return bubble;
   }
 
+  // Poll the status endpoint with backoff until the worker finishes
+  // the queued attempt. Each read is short-lived, so a slow provider
+  // no longer holds one browser/proxy connection open. Replays and
+  // polls are server-side reads: they cannot dispatch twice.
+  async function waitForAssistResult(
+    key: string,
+    requestKey: string,
+  ): Promise<PreviewAssistReply> {
+    const started = Date.now();
+    let delay = 1000;
+    for (;;) {
+      let status: PreviewAssistStatus;
+      try {
+        status = await getAssistStatus(key, requestKey);
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) {
+          throw new Error(
+            "The assistant request expired before it finished. Send again to start a new request.",
+          );
+        }
+        if (err instanceof ApiError && err.status === 403) {
+          throw err;
+        }
+        status = { status: "pending", idempotency_key: requestKey };
+      }
+      if (status.status === "completed" && status.proposal) {
+        return {
+          message: status.message ?? "",
+          proposal: status.proposal,
+          base_revision: status.base_revision ?? 0,
+          context_coverage: status.context_coverage,
+          tokens: status.tokens ?? 0,
+          hint: status.hint,
+          refusal: status.refusal,
+          replayed: true,
+        };
+      }
+      if (status.status === "failed") {
+        throw new Error(
+          status.error ??
+            "The assistant call failed. Retry to start a new attempt.",
+        );
+      }
+      if (status.status === "unknown") {
+        throw new Error(
+          status.error ??
+            "The assistant call outcome could not be determined. Check the credits log before retrying, since the first attempt may have been charged.",
+        );
+      }
+      if (Date.now() - started > 150000) {
+        throw new Error(
+          "The assistant hasn't answered yet. Retry to keep waiting for the same request.",
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(Math.round(delay * 1.5), 5000);
+    }
+  }
+
   async function assistWithRecovery(
     key: string,
     messages: AssistantTurn[],
     requestKey: string,
-  ) {
+  ): Promise<{ answer: PreviewAssistReply; interrupted: boolean }> {
+    let interrupted = false;
     try {
-      return await assistPreview(key, messages, requestKey);
+      const begun = await assistPreview(key, messages, requestKey);
+      if (!begun.queued) {
+        return { answer: begun.reply, interrupted: false };
+      }
     } catch (err) {
-      // Only a live first attempt (409) is worth polling: the same
-      // key can never dispatch twice, so polling cannot double-spend.
-      if (!(err instanceof ApiError) || err.status !== 409) throw err;
+      // Fail-closed before dispatch (validation, auth, unknown
+      // preview): no attempt exists, so there is nothing to poll.
+      if (
+        err instanceof ApiError &&
+        (err.status === 400 || err.status === 403 || err.status === 404)
+      ) {
+        throw err;
+      }
+      // A live attempt (409) polls like an accepted send. Any other
+      // failure — dropped proxy connection, timeout, 5xx — may have
+      // landed after the attempt was queued, so poll before giving
+      // up: a completed attempt replays without a second charge.
+      interrupted = !(err instanceof ApiError) || err.status !== 409;
     }
     setNotice("Still working — collecting the result…");
-    for (let attempt = 0; attempt < 10; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-      try {
-        return await assistPreview(key, messages, requestKey);
-      } catch (err) {
-        if (!(err instanceof ApiError) || err.status !== 409) throw err;
-      }
+    storeInflight({ key, history: messages, requestKey, startedAt: Date.now() });
+    try {
+      const answer = await waitForAssistResult(key, requestKey);
+      return { answer, interrupted };
+    } finally {
+      clearInflight(requestKey);
     }
-    throw new Error("The assistant is still working. Retry to collect the result.");
   }
 
   async function runAssist(
@@ -161,16 +281,27 @@ export function AssistantWidget() {
     history: AssistantTurn[],
     requestKey: string,
   ) {
-    const answer = await assistWithRecovery(key, history.slice(-6), requestKey);
+    const { answer, interrupted } = await assistWithRecovery(
+      key,
+      history.slice(-6),
+      requestKey,
+    );
     if (answer.refusal) {
       pushTurn("assistant", answer.refusal);
       return;
     }
     const bubble = pushTurn("assistant", answer.message, answer.tokens);
     const notes: string[] = [];
-    if (answer.replayed) {
+    if (interrupted || answer.replayed) {
       notes.push(
         "Recovered the completed result after the interruption — no second call was charged.",
+      );
+    }
+    const currentRevision =
+      session && session.key === key ? session.getRevision() : null;
+    if (currentRevision != null && answer.base_revision !== currentRevision) {
+      notes.push(
+        `The preview changed while the assistant was working (proposal targets revision ${answer.base_revision}, preview is at ${currentRevision}). Ask again so the proposal is recomputed.`,
       );
     }
     if (answer.hint) {
@@ -259,6 +390,62 @@ export function AssistantWidget() {
       setBusy(false);
     }
   }
+
+  // Reload/navigation during a queued attempt: the attempt keeps
+  // running server-side under its key, so a fresh mount rebuilds the
+  // conversation tail and resumes polling instead of dispatching
+  // again. The ref guard keeps StrictMode's double effect (and any
+  // repeat render) from starting a second poll loop.
+  const resumedRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (!sessionKey || keyCounter.current !== 0 || resumedRef.current) return;
+    const stored = readInflight();
+    if (!stored || stored.key !== sessionKey) return;
+    if (Date.now() - stored.startedAt > 10 * 60 * 1000) {
+      clearInflight(stored.requestKey);
+      return;
+    }
+    resumedRef.current = stored.requestKey;
+    const prior = stored.history.slice(0, -1);
+    const last = stored.history[stored.history.length - 1];
+    if (prior.length > 0) {
+      setTurns(
+        prior.map((turn) => {
+          keyCounter.current += 1;
+          return { ...turn, key: keyCounter.current };
+        }),
+      );
+    }
+    if (last && last.role === "user") {
+      pushTurn("user", last.content);
+    }
+    setError("");
+    setCanRetry(false);
+    setBusy(true);
+    setNotice("Resuming the interrupted assistant request…");
+    retryRef.current = {
+      key: stored.key,
+      history: stored.history,
+      requestKey: stored.requestKey,
+    };
+    void (async () => {
+      try {
+        await runAssist(stored.key, stored.history, stored.requestKey);
+        retryRef.current = null;
+      } catch (err) {
+        setCanRetry(true);
+        setError(
+          err instanceof ApiError || err instanceof Error
+            ? err.message
+            : "Could not reach the assistant.",
+        );
+      } finally {
+        setBusy(false);
+      }
+    })();
+    // runAssist/pushTurn are stable per render; the refs guard repeats.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionKey]);
 
   async function retrySend() {
     const retry = retryRef.current;
@@ -546,7 +733,10 @@ export function AssistantWidget() {
             <div ref={bottomRef} />
           </div>
           {notice ? (
-            <p className="border-t border-border px-4 py-2 text-xs text-muted-foreground">
+            <p
+              aria-live="polite"
+              className="border-t border-border px-4 py-2 text-xs text-muted-foreground"
+            >
               {notice}
             </p>
           ) : null}

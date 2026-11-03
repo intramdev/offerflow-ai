@@ -1,0 +1,150 @@
+{
+  "package": "OfferFlow AI public example datasets",
+  "version": "2026-11-03",
+  "data_origin": "synthetic only",
+  "scope": "manual acceptance inputs and supplemental fixtures",
+  "not_a_training_dataset": true,
+  "reference_must_stay_out_of_model_context": true,
+  "reviewed_code": [
+    "982f222",
+    "110bdc0",
+    "2dabe7e"
+  ],
+  "files": [
+    {
+      "path": ".gitignore",
+      "bytes": 193,
+      "sha256": "4a2dabc436ce5e091fb0f72384e5b490c70e845145c7af9c94d93105a0432716"
+    },
+    {
+      "path": "README.md",
+      "bytes": 4867,
+      "sha256": "c2d901620848edbe8ddcc706d5e040def3ba3ae0331646e9c480fc91b29e68f5"
+    },
+    {
+      "path": "TEST_CASES.csv",
+      "bytes": 2365,
+      "sha256": "913628aea6e43e16041d376ae8d41f28270d42601799f560d9be5b6e50084c00"
+    },
+    {
+      "path": "generators/make_upload_fixtures.py",
+      "bytes": 1674,
+      "sha256": "d4718726becc396bda51ce7cbbff65c8a96ef6b74084a945acf81f96dc86fec0"
+    },
+    {
+      "path": "inputs/generalization/01_sections.txt",
+      "bytes": 313,
+      "sha256": "ff0cc385258564a3647c2ac8a92419b17a35050c100902f9e9dbd4c63785a33b"
+    },
+    {
+      "path": "inputs/generalization/02_inline.txt",
+      "bytes": 161,
+      "sha256": "8c2d5d1939d4193902d8eb822744df883804c45a657b3bb6d851cc30c2d0beef"
+    },
+    {
+      "path": "inputs/generalization/03_multiline.txt",
+      "bytes": 252,
+      "sha256": "1d71d33b98569aedf227aa2da252c4c6e355aeb76677fa92cb08a1c8d511382d"
+    },
+    {
+      "path": "inputs/generalization/04_ambiguous.txt",
+      "bytes": 35,
+      "sha256": "8ab2005a34e5eeac5da5e8bf6aef61daf18f1ac2aabb268ed13abc5e07b98ecb"
+    },
+    {
+      "path": "inputs/generalization/05_explicit_currency.txt",
+      "bytes": 82,
+      "sha256": "c4d47d6b44a8db3fa65d692599a5fdd8522efd8053676ea053c7c2c8f0f21a57"
+    },
+    {
+      "path": "inputs/generalization/06_supplier_change.txt",
+      "bytes": 86,
+      "sha256": "ae637333f8b9c4a0a1d5edca88f8ddd93b9e16b616d77a3d25b2c2fa3beacbda"
+    },
+    {
+      "path": "inputs/header-detection/headers-row-1.csv",
+      "bytes": 118,
+      "sha256": "2428df08d12418a2a4f9a31a2879061f196b90ca2a66e01da4bbeffdc79abb1a"
+    },
+    {
+      "path": "inputs/header-detection/headers-row-10.csv",
+      "bytes": 189,
+      "sha256": "a2f4a0bf83b1693103fa05a78cfbed02216db30804b6445cc239d01a9a075e3e"
+    },
+    {
+      "path": "inputs/header-detection/headers-row-4.csv",
+      "bytes": 165,
+      "sha256": "72866c4b4c5353d032fbdbfb51f2d39bdb4b3840f79dd3bcf4345d58d9e728b6"
+    },
+    {
+      "path": "inputs/manual/01-northstar-sections.txt",
+      "bytes": 273,
+      "sha256": "553d8f278e114b1df82d28e06088c6390679810151612436e181cdfb53400078"
+    },
+    {
+      "path": "inputs/manual/02-harborlight-sections.txt",
+      "bytes": 252,
+      "sha256": "1783375bdf8d7e28817ed2a6659be10584eb4bf3bd74b8bb253b04ccd3003525"
+    },
+    {
+      "path": "inputs/manual/03-baltic-prose-stock.txt",
+      "bytes": 463,
+      "sha256": "6159d2191243b451c4c6a572f49584a0c3aeead1ca4ccafb7619c8e37900ad62"
+    },
+    {
+      "path": "inputs/manual/04-cedar-sections.txt",
+      "bytes": 221,
+      "sha256": "7d6b6944868385ad16bf7424321a956ed247fdfa26b87db81c0eb406ef29d3e0"
+    },
+    {
+      "path": "inputs/manual/05-office-price-conflict.csv",
+      "bytes": 204,
+      "sha256": "f7707a8ded7ddf99c69e9a5ef217548288fd00a32ba01bac883c5fe31a0f8f91"
+    },
+    {
+      "path": "inputs/manual/06-headerless-semicolon.txt",
+      "bytes": 81,
+      "sha256": "e8c891185fbf362b6b8413e2c85f96513583a90a938d57053c08e86ec8536031"
+    },
+    {
+      "path": "inputs/manual/07-headerless-reproducer.txt",
+      "bytes": 77,
+      "sha256": "85c203ebac27d8742d4ef474b12dd1b2899d4203ecb3635f35b8ff814d533434"
+    },
+    {
+      "path": "inputs/nordo/business_rules.txt",
+      "bytes": 1384,
+      "sha256": "e2a3320d89236611efc292f2e0ad4c97c23c924114ffd113de8a3a17785bc662"
+    },
+    {
+      "path": "inputs/nordo/price_list.csv",
+      "bytes": 1024,
+      "sha256": "501e30f077d26c1837d14b6379548a5a321448fb41c93b3c2a9037d2a0549d17"
+    },
+    {
+      "path": "inputs/nordo/price_list.xlsx",
+      "bytes": 4733,
+      "sha256": "8198982cfdefe8054577339f6b1da9cf28a9c6220e1029ff2a432a1a56aaff9e"
+    },
+    {
+      "path": "reference/generalization_expected.txt",
+      "bytes": 1943,
+      "sha256": "1e585f98f836b9844ac160e1b47f4c20326745e66b5e3f4e789592a3a2f0716b"
+    },
+    {
+      "path": "reference/manual_expected.json",
+      "bytes": 6593,
+      "sha256": "191530f21ef088f8510cebbec6f77d20a5410d7b8605ecbe518f84fe6c5f4cf5"
+    },
+    {
+      "path": "reference/nordo/expected_anomalies.csv",
+      "bytes": 1634,
+      "sha256": "cc800153a25279b28bf1c38ee4faaae8d304a36262fa8b75e848b15a6c9d5b29"
+    },
+    {
+      "path": "reference/nordo/expected_results.csv",
+      "bytes": 5291,
+      "sha256": "569dc83c9e8ef30f80a044e128c3079c2799d810b2fc11505d8235245735d102"
+    }
+  ]
+}

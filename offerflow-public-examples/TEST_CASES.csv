@@ -1,0 +1,12 @@
+case,input,purpose,evidence_status,expected
+01,inputs/manual/01-northstar-sections.txt,section headers and ambiguous terminal numbers,historical real-provider API acceptance; operator confirms roles,"Model, capacity, grade and price exact; quantity null"
+02,inputs/manual/02-harborlight-sections.txt,different supplier and grade names,real-provider API acceptance; result inspected in browser,No supplier or grade contamination
+03,inputs/manual/03-baltic-prose-stock.txt,"prose rows, EUR each and stock zero",real-provider API acceptance; result inspected in browser,Zero is not unknown; capacities remain distinct
+04,inputs/manual/04-cedar-sections.txt,full browser clarification/apply/resume/approve/export,independent browser acceptance with real Meta; older proxy failure reproduced,Correct four products; unknown stock preserved
+05,inputs/manual/05-office-price-conflict.csv,non-device domain and conflicting duplicate price,independent browser acceptance on domain/conflict fix,Explicit domain decision; price choice; no automatic approval
+06,inputs/manual/06-headerless-semicolon.txt,headerless semicolon fields and first-row preservation,independent browser acceptance after asynchronous-assist fix,Real Meta clarifies; explicit split; two correct exported products
+07,inputs/manual/07-headerless-reproducer.txt,original separator failure reproducer,historical failure; later API success reported; held-out browser case is 06,No automatic first-row/header loss
+headers,inputs/header-detection/,"header rows 1, 4 and 10",supplemental synthetic parser fixtures; not a new real-provider accuracy claim,Two variants retained
+generalization,inputs/generalization/,"inline, multiline, ambiguity, explicit currency and supplier change",supplemental fixtures; no blanket pass claim,See reference/generalization_expected.txt
+nordo,inputs/nordo/price_list.xlsx,"24 records, office supplies and conflicting SKU",original extraction verified; initial domain blockers reproduced; targeted fix validated on separate office case,24 source rows; 23 SKUs; NDO-007 conflict requires clarification
+upload,generators/make_upload_fixtures.py,"12 MB, 200 MB and over-limit upload boundaries","12 MB and over-limit checks passed; 200 MB preview initially failed on 110bdc0, then fresh browser upload and resume passed on 982f222",No model calls for large upload tests

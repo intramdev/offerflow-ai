@@ -1,0 +1,7 @@
+# Generated large boundary-test files: never add to Git.
+generated/
+**/synthetic-upload-12mb.csv
+**/synthetic-upload-exactly-200mb.csv
+**/synthetic-upload-over-limit.csv
+__pycache__/
+.DS_Store

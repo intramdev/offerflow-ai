@@ -1,0 +1,14 @@
+Supplier: Bluebird Synthetic
+Device: iPhone 15 Pro
+Storage: 256GB
+Condition: Grade A
+Color: Black
+Unit price: USD 615
+Available quantity: 4
+
+Device: iPhone 15 Pro
+Storage: 256GB
+Condition: Grade A
+Color: White
+Unit price: USD 620
+Available quantity: 6

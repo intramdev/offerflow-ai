@@ -1,0 +1,10 @@
+These are new synthetic acceptance fixtures, not model-accuracy results. Do not hard-code their supplier names or wording. Real-provider evaluation has not been run.
+
+01_sections: 5 products. Section counts 2/1/1/1. Prices 351, 507, 2299, 3084, 169 only after the user confirms that final numbers are USD unit prices. Quantities remain unknown. Preserve supplier grade code and label separately. Preserve Japan market specification and all three logistics locations. Available-from is not expiry. Ask about missing year if needed; do not invent it.
+02_inline: 2 products, quantities 8 and 3; EUR prices 410.50 and 295; preserve capacities, colors, grades and supplier.
+03_multiline: 2 products, not 14 products. Records span multiple lines; preserve all contributing source spans. Distinct colors must not merge. USD prices 615/620, quantities 4/6.
+04_ambiguous: ask what 349 represents and which currency applies; it could be price or quantity. Do not fabricate supplier, grade, quantity, or currency. A proposed organization default must be distinguished from source evidence.
+05_explicit_currency: JPY 42000 wins over any USD organization default. Quantity 5; 128 is capacity, never quantity. Do not convert until the explicit export/pricing stage.
+06_supplier_change: after importing another supplier's chat layout, propose Orchard Synthetic from this document, not the previous supplier's remembered constant. Do not persist dates, prices, quantities or document-specific grades as automatic supplier defaults.
+
+Additional required variations: reordering sections; deleting blank lines; a new grade header halfway through a model chunk; documents longer than the current context cap; a supplier change inside one document; missing attachments; conflicting currency statements; same file reused in another tenant; a confirmed correction persisting beyond six chat turns; unknown quantities under an explicitly confirmed price-only policy.

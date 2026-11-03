@@ -1,0 +1,6 @@
+Supplier export example — synthetic
+""
+""
+Model,Capacity,Color,Grade,Quantity,Price,Currency
+iPhone 13,128,Black,A,4,230,USD
+iPhone 13,256,Black,A,3,270,USD

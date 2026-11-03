@@ -1,0 +1,265 @@
+{
+  "01-northstar-sections": {
+    "supplier": "Northstar Test Supply",
+    "requires_confirmation": "Final numbers are USD unit prices; quantities absent; price-only policy.",
+    "rows": [
+      {
+        "model": "Phone 18 Pro",
+        "capacity_gb": 256,
+        "grade": "P1+ — Like New",
+        "unit_price": 417,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 15",
+        "capacity_gb": 128,
+        "grade": "P1+ — Like New",
+        "unit_price": 505,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 14",
+        "capacity_gb": 128,
+        "grade": "P1+ — Like New",
+        "unit_price": 195,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 18 Pro",
+        "capacity_gb": 256,
+        "grade": "P2+ — A GRADE Tested",
+        "unit_price": 61,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 15 Pro",
+        "capacity_gb": 128,
+        "grade": "P2+ — A GRADE Tested",
+        "unit_price": 37,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 14",
+        "capacity_gb": 128,
+        "grade": "P2+ — A GRADE Tested",
+        "unit_price": 2297,
+        "currency": "USD",
+        "quantity": null
+      }
+    ]
+  },
+  "02-harborlight-sections": {
+    "supplier": "Harborlight Test Trading",
+    "requires_confirmation": "Final numbers are USD unit prices; quantities absent; price-only policy.",
+    "rows": [
+      {
+        "model": "Phone 18 Pro",
+        "capacity_gb": 256,
+        "grade": "Q1 — Mint",
+        "unit_price": 429,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 15",
+        "capacity_gb": 128,
+        "grade": "Q1 — Mint",
+        "unit_price": 512,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 14",
+        "capacity_gb": 128,
+        "grade": "Q1 — Mint",
+        "unit_price": 199,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 18 Pro",
+        "capacity_gb": 256,
+        "grade": "Q2 — B GRADE Tested",
+        "unit_price": 64,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 15 Pro",
+        "capacity_gb": 128,
+        "grade": "Q2 — B GRADE Tested",
+        "unit_price": 39,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 14",
+        "capacity_gb": 128,
+        "grade": "Q2 — B GRADE Tested",
+        "unit_price": 2311,
+        "currency": "USD",
+        "quantity": null
+      }
+    ]
+  },
+  "03-baltic-prose-stock": {
+    "supplier": "Baltic Refurb Hub",
+    "requires_confirmation": "Out of stock means zero stock; preserve EUR and capacities.",
+    "rows": [
+      {
+        "model": "iPhone 13",
+        "capacity_gb": 128,
+        "grade": "Grade A",
+        "unit_price": 289,
+        "currency": "EUR",
+        "quantity": 12
+      },
+      {
+        "model": "iPhone 13",
+        "capacity_gb": 256,
+        "grade": "Grade A",
+        "unit_price": 339,
+        "currency": "EUR",
+        "quantity": 7
+      },
+      {
+        "model": "Galaxy S22",
+        "capacity_gb": 128,
+        "grade": "Grade B",
+        "unit_price": 245,
+        "currency": "EUR",
+        "quantity": 20
+      },
+      {
+        "model": "Galaxy S22",
+        "capacity_gb": 256,
+        "grade": "Grade B",
+        "unit_price": 269,
+        "currency": "EUR",
+        "quantity": 0
+      },
+      {
+        "model": "Redmi Note 12",
+        "capacity_gb": 128,
+        "grade": "Grade A",
+        "unit_price": 149,
+        "currency": "EUR",
+        "quantity": 33
+      },
+      {
+        "model": "G60",
+        "capacity_gb": 128,
+        "grade": "Grade C",
+        "unit_price": 119,
+        "currency": "EUR",
+        "quantity": 5
+      }
+    ]
+  },
+  "04-cedar-sections": {
+    "supplier": "Cedar Devices",
+    "requires_confirmation": "Final numbers are USD unit prices; quantities absent; price-only policy.",
+    "rows": [
+      {
+        "model": "Phone 17 Pro",
+        "capacity_gb": 256,
+        "grade": "P1+ Like New",
+        "unit_price": 431,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 14",
+        "capacity_gb": 128,
+        "grade": "P1+ Like New",
+        "unit_price": 203,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 17 Pro",
+        "capacity_gb": 256,
+        "grade": "P2+ A Grade Tested",
+        "unit_price": 73,
+        "currency": "USD",
+        "quantity": null
+      },
+      {
+        "model": "Phone 13 mini",
+        "capacity_gb": 128,
+        "grade": "P2+ A Grade Tested",
+        "unit_price": 119,
+        "currency": "USD",
+        "quantity": null
+      }
+    ]
+  },
+  "05-office-price-conflict": {
+    "supplier": "UI Office Conflict Probe",
+    "capacity_and_grade": "not applicable after explicit other-products decision",
+    "source_records": 3,
+    "initial_conflict_prices_eur": [
+      12,
+      13.5
+    ],
+    "default_action": "request operator/supplier confirmation, never choose automatically",
+    "synthetic_test_decision": 13.5,
+    "after_decision": "two releasable products, losing 12 EUR row excluded with provenance; organiser quantity remains 70, not 140"
+  },
+  "06-headerless-semicolon": {
+    "supplier": "UI Split Acceptance",
+    "supplier_source": "operator confirmation, absent from the source",
+    "confirmed_positions": [
+      "model",
+      "capacity",
+      "grade",
+      "price",
+      "quantity"
+    ],
+    "rows": [
+      {
+        "model": "iPhone 12 mini",
+        "capacity_gb": 64,
+        "grade": "Grade A",
+        "unit_price": 173,
+        "currency": "EUR",
+        "quantity": 9
+      },
+      {
+        "model": "Galaxy S23",
+        "capacity_gb": 256,
+        "grade": "Grade B",
+        "unit_price": 379,
+        "currency": "EUR",
+        "quantity": 6
+      }
+    ]
+  },
+  "07-headerless-reproducer": {
+    "supplier": null,
+    "supplier_source": "must be supplied or requested",
+    "rows": [
+      {
+        "model": "iPhone 13",
+        "capacity_gb": 128,
+        "grade": "Grade A",
+        "unit_price": 289,
+        "currency": "EUR",
+        "quantity": 12
+      },
+      {
+        "model": "iPhone 14",
+        "capacity_gb": 256,
+        "grade": "Grade B",
+        "unit_price": 339,
+        "currency": "EUR",
+        "quantity": 7
+      }
+    ]
+  }
+}

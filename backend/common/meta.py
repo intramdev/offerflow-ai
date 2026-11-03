@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 
 from openai import (
@@ -47,14 +48,86 @@ KEY_PREFIX = "LLM_"
 #: Truncation bound for provider HTTP error bodies kept for diagnosis.
 ERROR_BODY_CHARS = 300
 
+#: Marker replacing redacted spans in diagnostics.
+REDACTED = "[REDACTED]"
 
-def _status_detail(exc: APIStatusError) -> str:
+#: Credential-shaped values that must never survive into logs,
+#: API errors, or persisted spend records.
+_CREDENTIAL_PATTERNS = (
+    re.compile(r"(?i)\b(Bearer)\s+([A-Za-z0-9._~+/-]{6,})"),
+    re.compile(r"\bsk-[A-Za-z0-9]{8,}\b"),
+    re.compile(
+        r"(?i)\b(api[_-]?key|password|passwd|secret|token|authorization)"
+        r"\s*[:=]\s*(\S+)"
+    ),
+)
+
+#: Outbound spans at least this long are redacted verbatim when a
+#: provider error echoes them back. Shorter fragments stay, so field
+#: names quoted by the diagnostic (for example 'is_product') survive.
+ECHO_LINE_CHARS = 24
+
+
+def _redact_echoes(text: str, sensitive: tuple) -> str:
+    """Replace spans of ``text`` copied from outbound payloads.
+
+    Outbound content travels as compact JSON, so echoes are matched
+    by character n-gram rather than by line: any run of at least
+    ECHO_LINE_CHARS characters also present in the failed call's own
+    request is private source content quoted back, not diagnosis.
+    """
+    grams = set()
+    for payload in sensitive:
+        if not isinstance(payload, str):
+            continue
+        norm = " ".join(payload.split())
+        for i in range(len(norm) - ECHO_LINE_CHARS + 1):
+            grams.add(norm[i : i + ECHO_LINE_CHARS])
+    if not grams:
+        return text
+    masked = [False] * len(text)
+    for i in range(len(text) - ECHO_LINE_CHARS + 1):
+        if text[i : i + ECHO_LINE_CHARS] in grams:
+            for j in range(i, i + ECHO_LINE_CHARS):
+                masked[j] = True
+    out = []
+    i = 0
+    while i < len(text):
+        if masked[i]:
+            out.append(REDACTED)
+            while i < len(text) and masked[i]:
+                i += 1
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def _sanitize_diagnostic(text: str, *, sensitive: tuple = ()) -> str:
+    """Redact credentials and echoed outbound content from diagnostics.
+
+    ``sensitive`` carries the outbound texts of the failed call; any
+    of their spans echoed back by the provider is replaced, so private
+    source content cannot leak through logs, API errors, or persisted
+    spend notes. Credential-shaped values are redacted unconditionally.
+    """
+    if not isinstance(text, str):
+        text = str(text) if text is not None else ""
+    text = " ".join(text.split())
+    text = _CREDENTIAL_PATTERNS[0].sub(r"\1 " + REDACTED, text)
+    text = _CREDENTIAL_PATTERNS[1].sub(REDACTED, text)
+    text = _CREDENTIAL_PATTERNS[2].sub(r"\1=" + REDACTED, text)
+    return _redact_echoes(text, sensitive)
+
+
+def _status_detail(exc: APIStatusError, *, sensitive: tuple = ()) -> str:
     """Safely extract a short provider error detail for diagnosis.
 
     Prefers the body's own message field (typical ``{"error":
     {"message": ...}}`` envelopes) so a large echoed request is not
     stored; otherwise keeps truncated plain text. Response headers
-    are never read, so credentials cannot leak through this path.
+    are never read. Credentials and outbound content echoed back by
+    the provider are redacted before anything is logged or raised.
     """
     try:
         response = getattr(exc, "response", None)
@@ -77,6 +150,7 @@ def _status_detail(exc: APIStatusError) -> str:
                     text = " ".join(message.split())
         except (ValueError, AttributeError):
             pass
+    text = _sanitize_diagnostic(text, sensitive=sensitive)
     if len(text) > ERROR_BODY_CHARS:
         text = text[:ERROR_BODY_CHARS] + "…"
     return text
@@ -908,20 +982,38 @@ class MetaProvider:
             raise ProviderError(f"Provider rate limited {kind}; not retried.") from exc
         except APITimeoutError as exc:
             # The provider may have processed the call: uncertain, not free.
-            mark_uncertain(reservation, f"{kind} timed out: {exc}")
+            mark_uncertain(
+                reservation,
+                _sanitize_diagnostic(
+                    f"{kind} timed out: {exc}",
+                    sensitive=(system, user_content),
+                ),
+            )
             raise ProviderError(f"Provider {kind} call timed out; not retried.") from exc
         except APIConnectionError as exc:
-            mark_uncertain(reservation, f"{kind} connection failed: {exc}")
+            mark_uncertain(
+                reservation,
+                _sanitize_diagnostic(
+                    f"{kind} connection failed: {exc}",
+                    sensitive=(system, user_content),
+                ),
+            )
             raise ProviderError(f"Provider error on {kind}; not retried.") from exc
         except APIStatusError as exc:
             try:
                 status = int(getattr(exc, "status_code", 0) or 0)
             except (TypeError, ValueError):
                 status = 0
-            detail = _status_detail(exc)
+            detail = _status_detail(exc, sensitive=(system, user_content))
             if status >= 500:
                 # A 5xx may follow a processed request: uncertain, not free.
-                mark_uncertain(reservation, f"{kind} HTTP {status}: {exc}")
+                mark_uncertain(
+                    reservation,
+                    _sanitize_diagnostic(
+                        f"{kind} HTTP {status}: {exc}",
+                        sensitive=(system, user_content),
+                    ),
+                )
             else:
                 release(reservation)
             if detail:
@@ -933,7 +1025,13 @@ class MetaProvider:
             ) from exc
         except Exception as exc:
             # Unknown local failure after dispatch started: uncertain.
-            mark_uncertain(reservation, f"unexpected {type(exc).__name__}: {exc}")
+            mark_uncertain(
+                reservation,
+                _sanitize_diagnostic(
+                    f"unexpected {type(exc).__name__}: {exc}",
+                    sensitive=(system, user_content),
+                ),
+            )
             raise ProviderError(f"Unexpected provider failure: {type(exc).__name__}.") from exc
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None)
@@ -1073,14 +1171,22 @@ class MetaProvider:
         except APITimeoutError as exc:
             # The provider may have processed the call: uncertain, not free.
             mark_uncertain(
-                reservation, f"chunk {position}/{total} timed out: {exc}"
+                reservation,
+                _sanitize_diagnostic(
+                    f"chunk {position}/{total} timed out: {exc}",
+                    sensitive=(SYSTEM_PROMPT, user_content),
+                ),
             )
             raise ProviderError(
                 f"Provider call timed out at chunk {position}/{total}; not retried."
             ) from exc
         except APIConnectionError as exc:
             mark_uncertain(
-                reservation, f"chunk {position}/{total} connection failed: {exc}"
+                reservation,
+                _sanitize_diagnostic(
+                    f"chunk {position}/{total} connection failed: {exc}",
+                    sensitive=(SYSTEM_PROMPT, user_content),
+                ),
             )
             raise ProviderError(
                 f"Provider error at chunk {position}/{total}; not retried."
@@ -1090,11 +1196,17 @@ class MetaProvider:
                 status = int(getattr(exc, "status_code", 0) or 0)
             except (TypeError, ValueError):
                 status = 0
-            detail = _status_detail(exc)
+            detail = _status_detail(
+                exc, sensitive=(SYSTEM_PROMPT, user_content)
+            )
             if status >= 500:
                 # A 5xx may follow a processed request: uncertain, not free.
                 mark_uncertain(
-                    reservation, f"chunk {position}/{total} HTTP {status}: {exc}"
+                    reservation,
+                    _sanitize_diagnostic(
+                        f"chunk {position}/{total} HTTP {status}: {exc}",
+                        sensitive=(SYSTEM_PROMPT, user_content),
+                    ),
                 )
             else:
                 release(reservation)
@@ -1113,7 +1225,13 @@ class MetaProvider:
             ) from exc
         except Exception as exc:
             # Unknown local failure after dispatch started: uncertain.
-            mark_uncertain(reservation, f"unexpected {type(exc).__name__}: {exc}")
+            mark_uncertain(
+                reservation,
+                _sanitize_diagnostic(
+                    f"unexpected {type(exc).__name__}: {exc}",
+                    sensitive=(SYSTEM_PROMPT, user_content),
+                ),
+            )
             raise ProviderError(f"Unexpected provider failure: {type(exc).__name__}.") from exc
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None)

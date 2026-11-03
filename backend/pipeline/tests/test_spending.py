@@ -410,14 +410,18 @@ class SpendingTests(TestCase):
         self.assertEqual(allowance.tokens_reserved, 0)
         self.assertEqual(allowance.in_flight, 0)
 
-    def _status_error(self, body):
+    def _status_error(self, body, status=400):
         from openai import APIStatusError
 
         response = mock.Mock()
-        response.status_code = 400
+        response.status_code = status
         response.text = body
         response.headers = {}
-        return APIStatusError("400 bad request", response=response, body=None)
+        # The real SDK exception string carries the body text, which is
+        # exactly what mark_uncertain must sanitize before persisting.
+        return APIStatusError(
+            f"Error code: {status} - {body}", response=response, body=None
+        )
 
     def test_status_error_keeps_provider_message_only(self):
         self.allow(100000)
@@ -463,6 +467,80 @@ class SpendingTests(TestCase):
         self.assertLessEqual(len(detail), ERROR_BODY_CHARS + 1)
         self.assertTrue(detail.endswith("…"))
         self.assertNotIn("y" * 400, message)
+
+    def test_status_error_redacts_credentials(self):
+        self.allow(100000)
+        provider, _holder = self.provider(
+            self._status_error(
+                json.dumps(
+                    {
+                        "error": {
+                            "message": (
+                                "rejected credential "
+                                "Bearer abcdefgh1234567890 "
+                                "api_key=hunter2-secret "
+                                "sk-abcdefgh12345678 done"
+                            )
+                        }
+                    }
+                )
+            )
+        )
+        with self.assertRaises(ProviderError) as raised:
+            provider.interpret_table(
+                {"rows": [{"index": 1, "data": {"message": "Phone 1 - 5"}}]}
+            )
+        message = str(raised.exception)
+        self.assertIn("rejected credential", message)
+        self.assertIn("done", message)
+        self.assertEqual(message.count("[REDACTED]"), 3)
+        for secret in ("abcdefgh1234567890", "hunter2-secret", "sk-abcdefgh12345678"):
+            self.assertNotIn(secret, message)
+        # The configured key itself must never surface in diagnostics.
+        self.assertNotIn("9_testsecret", message)
+
+    def test_status_error_redacts_echoed_source_content(self):
+        self.allow(100000)
+        source = "Acme Confidential Supply price 417 USD"
+        provider, _holder = self.provider(
+            self._status_error(
+                json.dumps(
+                    {"error": {"message": f"invalid row: {source} rejected"}}
+                )
+            )
+        )
+        with self.assertRaises(ProviderError) as raised:
+            provider.interpret_table(
+                {"rows": [{"index": 1, "data": {"message": source}}]}
+            )
+        message = str(raised.exception)
+        self.assertIn("invalid row:", message)
+        self.assertIn("rejected", message)
+        self.assertIn("[REDACTED]", message)
+        self.assertNotIn(source, message)
+        self.assertNotIn("Confidential", message)
+
+    def test_uncertain_note_redacts_echo_and_credentials(self):
+        from pipeline.models import SpendReservation
+
+        self.allow(100000)
+        source = "Acme Confidential Supply price 417 USD"
+        provider, _holder = self.provider(
+            self._status_error(
+                f"backend blew up on {source} Bearer abcdefgh1234567890",
+                status=503,
+            )
+        )
+        with self.assertRaises(ProviderError):
+            provider.interpret_table(
+                {"rows": [{"index": 1, "data": {"message": source}}]}
+            )
+        row = SpendReservation.objects.get()
+        self.assertEqual(row.state, SpendReservation.State.UNCERTAIN)
+        reason = row.detail["uncertain_reason"]
+        self.assertIn("[REDACTED]", reason)
+        self.assertNotIn("Confidential", reason)
+        self.assertNotIn("abcdefgh1234567890", reason)
 
 
 @override_settings(PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"])

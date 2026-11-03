@@ -13,7 +13,7 @@ import {
   type HeaderOption,
 } from "@/components/app/field-mapper";
 import { useOrg } from "@/components/app/org-context";
-import { formatDate, type DateTimeFormat } from "@/lib/format";
+import { formatDate, formatMoney, type DateTimeFormat } from "@/lib/format";
 import { selectFxPair, type FxPairStatus } from "@/lib/fx";
 import { StatusBadge } from "@/components/app/status-badge";
 import { Badge } from "@/components/ui/badge";
@@ -746,7 +746,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
                     <TableCell>{line.grade}</TableCell>
                     <TableCell>{line.supplier}</TableCell>
                     <TableCell>{line.quantity ?? ""}</TableCell>
-                    <TableCell>{line.unit_price}</TableCell>
+                    <TableCell>{formatMoney(line.unit_price)}</TableCell>
                     <TableCell>{line.currency}</TableCell>
                     <TableCell>{line.rule ?? "—"}</TableCell>
                   </TableRow>

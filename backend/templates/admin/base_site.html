@@ -2,6 +2,19 @@
 
 {% block title %}OfferFlow AI backend · {{ title }}{% endblock %}
 
+{% block footer %}
+<div id="of-legal-footer">
+  <p>© 2026 IN.TRA.M s.r.o. · Developed by Gian Paolo Cipicchia</p>
+  <p class="of-legal-links">
+    <a href="{{ frontend_base_url }}/privacy">Privacy policy</a>
+    <a href="{{ frontend_base_url }}/terms">Terms of service</a>
+    <a href="{{ frontend_base_url }}/source">Source &amp; licenses</a>
+  </p>
+  <p>Built for the Meta Global AI Developer Hackathon · AGPL-3.0-only</p>
+  <p>Independent entry: Meta is not affiliated with this app and accepts no responsibility for it.</p>
+</div>
+{% endblock %}
+
 {% block branding %}
 <div id="of-branding">
   <svg id="of-logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">
@@ -94,6 +107,28 @@
   }
   .button.default, input[type="submit"].default, .submit-row input.default {
     background: var(--of-deep);
+  }
+  /* Legal footer mirrors the frontend shell footer. Django admin theme
+     variables keep it readable in both light and dark themes. */
+  #of-legal-footer {
+    border-top: 1px solid var(--hairline-color);
+    color: var(--body-quiet-color);
+    font-size: 0.75rem;
+    margin-top: 2rem;
+    padding: 1rem 1rem 1.5rem;
+    text-align: center;
+  }
+  #of-legal-footer p {
+    margin: 0.2rem 0;
+  }
+  #of-legal-footer .of-legal-links {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0.25rem 1.25rem;
+  }
+  #of-legal-footer a:link, #of-legal-footer a:visited {
+    color: var(--link-fg);
   }
 </style>
 {% endblock %}

@@ -265,6 +265,35 @@ future work is also described that way in the demo and submission —
 the original proposal's broader ambitions (visual inputs, autonomous
 long-running workflow) are acknowledged gaps, not delivered claims.
 
+## Messaging roadmap (planned, no release date)
+
+Today OfferFlow accepts pasted message text and supported file uploads,
+and generates message text and files for manual sending. There is no
+live Telegram bot and no direct Telegram or WhatsApp integration.
+Everything below is planned work with no promised release date.
+
+- Consent-based intake from explicitly connected chats, through
+  supported platform APIs and permissions only.
+- Identify suppliers and separate individual offers, preserving
+  timestamps and source references.
+- Evaluate offer dates against configured list-validity rules, asking
+  for clarification when dates or expiry are ambiguous. Chat-specific
+  expiry handling does not exist yet.
+- Route incoming offers through the existing preview, clarification,
+  validation, and human-approval workflow.
+- Support conversational requests to prepare corrections, pricing
+  changes, and customer quotes within the user's organization and
+  permissions.
+- Require explicit approval before sending quotes or modifying
+  external systems.
+- Include duplicate handling, audit records, usage controls,
+  retention, deletion, and connection revocation.
+- Evaluate Telegram intake first. WhatsApp depends on supported
+  platform access and messaging rules; there is no unrestricted
+  access to chat history.
+- Exported chat/ZIP imports, PDF/image understanding, and
+  cross-source reconciliation are separate future capabilities.
+
 ## Development and data
 
 Examples and tests use synthetic data only. This repository contains the

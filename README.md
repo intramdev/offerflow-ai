@@ -1,5 +1,7 @@
 # OfferFlow AI
 
+[Watch the 3-minute demo](https://youtu.be/7LZeB7Ih5No)
+
 **Beta — version 0.4.0.** Simulated-first and fully usable with no model
 key; paid Muse features activate per company with credits.
 
